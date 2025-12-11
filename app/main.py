@@ -11,7 +11,7 @@ import time
 
 from app.config import settings
 from app.database import check_db_connection
-from app.routers import auth_router, dashboard_router, webhooks_router
+from app.routers import auth_router, dashboard_router, webhooks_router, gee_router, reports_router
 
 
 @asynccontextmanager
@@ -122,3 +122,5 @@ if __name__ == "__main__":
         port=settings.port,
         reload=settings.debug
     )
+app.include_router(gee_router)
+app.include_router(reports_router)
