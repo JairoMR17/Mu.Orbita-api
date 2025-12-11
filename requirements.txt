@@ -28,3 +28,6 @@ aiofiles==23.2.1
 
 # CORS
 starlette==0.35.1
+reportlab
+matplotlib
+earthengine-api
