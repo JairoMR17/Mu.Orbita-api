@@ -1,10 +1,6 @@
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, Any
-import json
-import tempfile
-import os
 
 router = APIRouter(prefix="/api/v1", tags=["Reports"])
 
@@ -23,9 +19,8 @@ class PDFRequest(BaseModel):
 @router.post("/generate-pdf")
 async def generate_pdf(request: PDFRequest):
     try:
-        from services.generate_pdf_report import generate_report
+        from app.services.generate_pdf_report import generate_report
         
-        # Crear directorio temporal
         output_path = f"/tmp/Informe_{request.job_id}.pdf"
         
         data = request.dict()

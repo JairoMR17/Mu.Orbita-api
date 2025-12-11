@@ -2,10 +2,6 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 import json
-import sys
-import os
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'services'))
 
 router = APIRouter(prefix="/api/v1/gee", tags=["GEE"])
 
@@ -24,7 +20,7 @@ class GEERequest(BaseModel):
 @router.post("/execute")
 async def execute_gee(request: GEERequest):
     try:
-        from services.gee_automation import main as gee_main
+        from app.services.gee_automation import main as gee_main
         
         result = gee_main(
             mode=request.mode,
