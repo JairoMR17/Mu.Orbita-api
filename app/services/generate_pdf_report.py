@@ -1,757 +1,769 @@
-#!/usr/bin/env python3
 """
-Mu.Orbita Professional PDF Report Generator v2.1
-Genera informes agronómicos profesionales con diseño corporativo,
-gráficos de series temporales y visualizaciones de KPIs.
+Mu.Orbita PDF Report Generator v2.0
+=====================================
+Generador profesional de informes PDF con:
+- Gráficos de series temporales
+- Mapas de calor (NDVI, NDWI)
+- Narrativa de análisis IA
+- Diseño profesional corregido
 
-MODIFICACIÓN v2.1: Soporte para --data-file para evitar problemas con JSON en CLI
+Autor: Mu.Orbita
+Fecha: 2025-12-16
 """
 
-import os
+import io
+import base64
 import json
-import sys
-import argparse
 from datetime import datetime
-from io import BytesIO
+from typing import Optional, Dict, List, Any
 
-# PDF Generation
+# ReportLab imports
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm, cm
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT, TA_JUSTIFY
+from reportlab.lib.units import mm, cm
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    Image, PageBreak, HRFlowable, KeepTogether
+    Image, PageBreak, KeepTogether, ListFlowable, ListItem
 )
 from reportlab.pdfgen import canvas
-from reportlab.graphics.shapes import Drawing, Rect, String, Line
-from reportlab.graphics.charts.lineplots import LinePlot
+from reportlab.graphics.shapes import Drawing, Rect
+from reportlab.graphics.charts.linecharts import HorizontalLineChart
 from reportlab.graphics.charts.legends import Legend
-from reportlab.graphics.widgets.markers import makeMarker
+from reportlab.graphics import renderPDF
 
-# For charts
+# Matplotlib para gráficos más sofisticados
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg')  # Backend sin GUI
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from matplotlib.patches import Rectangle
+from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 
-# ============================================================================
-# CORPORATE COLORS (extracted from logo)
-# ============================================================================
-COLORS = {
-    'primary_brown': colors.HexColor('#5D4037'),      # Marrón chocolate
-    'secondary_gold': colors.HexColor('#C9A962'),     # Dorado
-    'accent_cream': colors.HexColor('#F5F0E6'),       # Crema claro
-    'background': colors.HexColor('#FDFBF7'),         # Fondo casi blanco
-    'text_dark': colors.HexColor('#3E2723'),          # Texto oscuro
-    'text_light': colors.HexColor('#8D6E63'),         # Texto secundario
-    'success': colors.HexColor('#4CAF50'),            # Verde éxito
-    'warning': colors.HexColor('#FF9800'),            # Naranja advertencia
-    'danger': colors.HexColor('#F44336'),             # Rojo peligro
-    'info': colors.HexColor('#2196F3'),               # Azul info
-    'white': colors.white,
-    'light_gray': colors.HexColor('#E8E4DF'),
+# ============================================
+# CONFIGURACIÓN DE COLORES CORPORATIVOS
+# ============================================
+
+COLORS_MUORBITA = {
+    'primary': '#8B7355',      # Marrón tierra (cabecera)
+    'secondary': '#228B22',    # Verde bosque (vigor)
+    'accent': '#4169E1',       # Azul (agua)
+    'warning': '#DAA520',      # Dorado (precaución)
+    'danger': '#CC4444',       # Rojo (estrés)
+    'text': '#3E2B1D',         # Marrón oscuro texto
+    'light_bg': '#F9F7F2',     # Fondo claro
+    'border': '#E6DDD0',       # Borde suave
+    'white': '#FFFFFF',
 }
 
-# Matplotlib colors
-MPL_COLORS = {
-    'primary': '#5D4037',
-    'secondary': '#C9A962',
-    'accent': '#8D6E63',
-    'ndvi': '#2E7D32',
-    'ndwi': '#1565C0',
-    'evi': '#FF6F00',
-    'grid': '#E0E0E0',
-}
+# Convertir hex a RGB para ReportLab
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) / 255 for i in (0, 2, 4))
 
-# ============================================================================
-# CUSTOM STYLES
-# ============================================================================
-def create_styles():
-    """Create custom paragraph styles for the report"""
+
+# ============================================
+# ESTILOS DE PÁRRAFO PERSONALIZADOS
+# ============================================
+
+def get_custom_styles():
+    """Crear estilos personalizados para el PDF"""
     styles = getSampleStyleSheet()
     
-    # Title style
+    # Título principal
     styles.add(ParagraphStyle(
-        name='ReportTitle',
+        name='MuTitle',
         parent=styles['Title'],
         fontName='Helvetica-Bold',
-        fontSize=28,
-        textColor=COLORS['primary_brown'],
+        fontSize=24,
+        textColor=colors.HexColor(COLORS_MUORBITA['primary']),
         spaceAfter=6*mm,
-        alignment=TA_CENTER,
+        alignment=TA_CENTER
     ))
     
-    # Subtitle
+    # Subtítulo
     styles.add(ParagraphStyle(
-        name='ReportSubtitle',
+        name='MuSubtitle',
         parent=styles['Normal'],
         fontName='Helvetica',
-        fontSize=11,
-        textColor=COLORS['text_light'],
-        spaceAfter=12*mm,
-        alignment=TA_CENTER,
-        leading=14,
+        fontSize=12,
+        textColor=colors.HexColor('#666666'),
+        spaceAfter=8*mm,
+        alignment=TA_CENTER
     ))
     
-    # Section headers
+    # Encabezado de sección
     styles.add(ParagraphStyle(
-        name='SectionHeader',
-        parent=styles['Heading1'],
-        fontName='Helvetica-Bold',
-        fontSize=14,
-        textColor=COLORS['primary_brown'],
-        spaceBefore=8*mm,
-        spaceAfter=4*mm,
-        borderPadding=(0, 0, 2*mm, 0),
-    ))
-    
-    # Subsection headers
-    styles.add(ParagraphStyle(
-        name='SubsectionHeader',
+        name='MuSectionHeader',
         parent=styles['Heading2'],
         fontName='Helvetica-Bold',
-        fontSize=11,
-        textColor=COLORS['secondary_gold'],
-        spaceBefore=5*mm,
-        spaceAfter=3*mm,
+        fontSize=14,
+        textColor=colors.HexColor(COLORS_MUORBITA['primary']),
+        spaceBefore=8*mm,
+        spaceAfter=4*mm,
+        borderPadding=3,
+        leftIndent=0
     ))
     
-    # Body text
+    # Texto normal
     styles.add(ParagraphStyle(
-        name='CustomBody',
+        name='MuBody',
         parent=styles['Normal'],
         fontName='Helvetica',
         fontSize=10,
-        textColor=COLORS['text_dark'],
+        textColor=colors.HexColor(COLORS_MUORBITA['text']),
         leading=14,
-        spaceAfter=3*mm,
         alignment=TA_JUSTIFY,
+        spaceAfter=3*mm
     ))
     
-    # KPI value large
+    # Texto pequeño
     styles.add(ParagraphStyle(
-        name='KPIValue',
-        parent=styles['Normal'],
-        fontName='Helvetica-Bold',
-        fontSize=24,
-        textColor=COLORS['primary_brown'],
-        alignment=TA_CENTER,
-    ))
-    
-    # KPI label
-    styles.add(ParagraphStyle(
-        name='KPILabel',
-        parent=styles['Normal'],
-        fontName='Helvetica',
-        fontSize=9,
-        textColor=COLORS['text_light'],
-        alignment=TA_CENTER,
-    ))
-    
-    # Footer
-    styles.add(ParagraphStyle(
-        name='Footer',
+        name='MuSmall',
         parent=styles['Normal'],
         fontName='Helvetica',
         fontSize=8,
-        textColor=COLORS['text_light'],
-        alignment=TA_CENTER,
+        textColor=colors.HexColor('#666666'),
+        leading=10
     ))
     
-    # Recommendation text
+    # KPI grande
     styles.add(ParagraphStyle(
-        name='RecommendationText',
-        parent=styles['Normal'],
+        name='MuKPIValue',
+        fontName='Helvetica-Bold',
+        fontSize=28,
+        textColor=colors.HexColor(COLORS_MUORBITA['primary']),
+        alignment=TA_CENTER,
+        leading=32
+    ))
+    
+    # Etiqueta KPI
+    styles.add(ParagraphStyle(
+        name='MuKPILabel',
         fontName='Helvetica',
-        fontSize=10,
-        textColor=COLORS['text_dark'],
-        leading=13,
-        leftIndent=5*mm,
+        fontSize=9,
+        textColor=colors.HexColor('#666666'),
+        alignment=TA_CENTER,
+        spaceAfter=2*mm
+    ))
+    
+    # Interpretación KPI
+    styles.add(ParagraphStyle(
+        name='MuKPIInterpretation',
+        fontName='Helvetica-Bold',
+        fontSize=9,
+        alignment=TA_CENTER
     ))
     
     return styles
 
 
-# ============================================================================
-# CHART GENERATORS
-# ============================================================================
-def create_ndvi_timeseries_chart(timeseries_data, width=16, height=6):
-    """
-    Create a professional NDVI time series chart
-    Returns a BytesIO object with the PNG image
-    """
-    fig, ax = plt.subplots(figsize=(width/2.54, height/2.54), dpi=150)
-    
-    # Style
-    ax.set_facecolor('#FDFBF7')
-    fig.patch.set_facecolor('#FDFBF7')
-    
-    if timeseries_data and len(timeseries_data) > 0:
-        dates = [d['date'] for d in timeseries_data]
-        ndvi = [d.get('NDVI_mean', d.get('ndvi_mean', 0)) or 0 for d in timeseries_data]
-        ndwi = [d.get('NDWI_mean', d.get('ndwi_mean', 0)) or 0 for d in timeseries_data]
-        evi = [d.get('EVI_mean', d.get('evi_mean', 0)) or 0 for d in timeseries_data]
-        
-        # Convert dates
-        try:
-            dates = [datetime.strptime(d, '%Y-%m-%d') if isinstance(d, str) else d for d in dates]
-        except:
-            dates = list(range(len(ndvi)))
-        
-        # Plot lines
-        ax.plot(dates, ndvi, color=MPL_COLORS['ndvi'], linewidth=2, label='NDVI', marker='o', markersize=4)
-        ax.plot(dates, ndwi, color=MPL_COLORS['ndwi'], linewidth=2, label='NDWI', marker='s', markersize=4)
-        ax.plot(dates, evi, color=MPL_COLORS['evi'], linewidth=2, label='EVI', marker='^', markersize=4)
-        
-        # Reference lines
-        ax.axhline(y=0.6, color=MPL_COLORS['ndvi'], linestyle='--', alpha=0.3, linewidth=1)
-        ax.axhline(y=0.35, color='#F44336', linestyle='--', alpha=0.3, linewidth=1)
-        
-        # Annotations
-        ax.text(dates[-1], 0.6, ' Vigor alto', fontsize=8, color=MPL_COLORS['ndvi'], alpha=0.7, va='center')
-        ax.text(dates[-1], 0.35, ' Estrés', fontsize=8, color='#F44336', alpha=0.7, va='center')
-        
+# ============================================
+# FUNCIONES DE INTERPRETACIÓN
+# ============================================
+
+def interpret_ndvi(value: float) -> tuple:
+    """Interpretar valor NDVI y devolver (texto, color)"""
+    if value < 0.20:
+        return "Suelo desnudo", COLORS_MUORBITA['danger']
+    elif value < 0.35:
+        return "Estrés severo", COLORS_MUORBITA['danger']
+    elif value < 0.45:
+        return "Vigor bajo", COLORS_MUORBITA['warning']
+    elif value < 0.60:
+        return "Vigor moderado", COLORS_MUORBITA['secondary']
     else:
-        # No data - show placeholder
-        ax.text(0.5, 0.5, 'Datos de serie temporal no disponibles', 
-                ha='center', va='center', fontsize=12, color=MPL_COLORS['accent'],
-                transform=ax.transAxes)
-    
-    # Styling
-    ax.set_ylabel('Valor del Índice', fontsize=10, color=MPL_COLORS['primary'])
-    ax.set_xlabel('Fecha', fontsize=10, color=MPL_COLORS['primary'])
-    ax.tick_params(colors=MPL_COLORS['primary'], labelsize=8)
-    ax.grid(True, linestyle='-', alpha=0.3, color=MPL_COLORS['grid'])
-    ax.legend(loc='upper left', framealpha=0.9, fontsize=9)
-    ax.set_ylim(-0.1, 1.0)
-    
-    # Format x-axis dates
-    if timeseries_data and len(timeseries_data) > 0:
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
-        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
-        plt.xticks(rotation=45, ha='right')
-    
-    plt.tight_layout()
-    
-    # Save to BytesIO
-    img_buffer = BytesIO()
-    plt.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight', 
-                facecolor='#FDFBF7', edgecolor='none')
-    plt.close()
-    img_buffer.seek(0)
-    
-    return img_buffer
+        return "Vigor alto", COLORS_MUORBITA['secondary']
 
 
-def create_kpi_gauge(value, min_val=0, max_val=1, label='', thresholds=None, width=4, height=3):
-    """
-    Create a simple horizontal gauge chart for KPI visualization
-    """
-    if thresholds is None:
-        thresholds = [(0.35, '#F44336'), (0.6, '#FF9800'), (1.0, '#4CAF50')]
-    
-    fig, ax = plt.subplots(figsize=(width, height), dpi=100)
-    ax.set_facecolor('#FDFBF7')
-    fig.patch.set_facecolor('#FDFBF7')
-    
-    # Draw background bar
-    ax.barh(0, max_val - min_val, height=0.3, left=min_val, color='#E0E0E0', alpha=0.5)
-    
-    # Draw threshold regions
-    prev_thresh = min_val
-    for thresh, color in thresholds:
-        ax.barh(0, thresh - prev_thresh, height=0.3, left=prev_thresh, color=color, alpha=0.3)
-        prev_thresh = thresh
-    
-    # Draw value indicator
-    if value is not None and not np.isnan(value):
-        ax.barh(0, value - min_val, height=0.3, left=min_val, color=MPL_COLORS['primary'], alpha=0.9)
-        ax.axvline(x=value, color=MPL_COLORS['secondary'], linewidth=3)
-        ax.text(value, 0.25, f'{value:.2f}', ha='center', va='bottom', fontsize=14, 
-                fontweight='bold', color=MPL_COLORS['primary'])
-    
-    ax.set_xlim(min_val, max_val)
-    ax.set_ylim(-0.3, 0.5)
-    ax.axis('off')
-    ax.set_title(label, fontsize=11, color=MPL_COLORS['primary'], pad=10)
-    
-    plt.tight_layout()
-    
-    img_buffer = BytesIO()
-    plt.savefig(img_buffer, format='png', dpi=100, bbox_inches='tight',
-                facecolor='#FDFBF7', edgecolor='none')
-    plt.close()
-    img_buffer.seek(0)
-    
-    return img_buffer
+def interpret_ndwi(value: float) -> tuple:
+    """Interpretar valor NDWI y devolver (texto, color)"""
+    if value < 0.0:
+        return "Déficit severo", COLORS_MUORBITA['danger']
+    elif value < 0.10:
+        return "Déficit moderado", COLORS_MUORBITA['warning']
+    elif value < 0.20:
+        return "Estado aceptable", COLORS_MUORBITA['warning']
+    else:
+        return "Estado óptimo", COLORS_MUORBITA['secondary']
 
 
-def create_risk_indicator(risk_level, label=''):
-    """
-    Create a traffic light style risk indicator
-    risk_level: 'low', 'medium', 'high', 'unknown'
-    """
-    fig, ax = plt.subplots(figsize=(2, 0.8), dpi=100)
-    ax.set_facecolor('#FDFBF7')
-    fig.patch.set_facecolor('#FDFBF7')
-    
-    colors_map = {
-        'low': ('#4CAF50', 'Bajo'),
-        'medium': ('#FF9800', 'Moderado'),
-        'high': ('#F44336', 'Alto'),
-        'unknown': ('#9E9E9E', 'N/D'),
+def interpret_stress_pct(value: float) -> tuple:
+    """Interpretar porcentaje de área con estrés"""
+    if value > 50:
+        return "Crítico", COLORS_MUORBITA['danger']
+    elif value > 25:
+        return "Moderado", COLORS_MUORBITA['warning']
+    else:
+        return "Bajo", COLORS_MUORBITA['secondary']
+
+
+def interpret_heterogeneity(value: float) -> tuple:
+    """Interpretar heterogeneidad (P90-P10)"""
+    if value < 0.15:
+        return "Homogéneo", COLORS_MUORBITA['secondary']
+    elif value < 0.25:
+        return "Heterogeneidad moderada", COLORS_MUORBITA['warning']
+    else:
+        return "Heterogeneidad alta", COLORS_MUORBITA['danger']
+
+
+def get_risk_level_color(level: str) -> str:
+    """Obtener color según nivel de riesgo"""
+    levels = {
+        'Bajo': COLORS_MUORBITA['secondary'],
+        'Moderado': COLORS_MUORBITA['warning'],
+        'Alto': COLORS_MUORBITA['danger'],
+        'Crítico': COLORS_MUORBITA['danger']
     }
+    return levels.get(level, COLORS_MUORBITA['text'])
+
+
+# ============================================
+# GENERACIÓN DE GRÁFICOS CON MATPLOTLIB
+# ============================================
+
+def generate_time_series_chart(time_series: List[Dict], width_px=600, height_px=250) -> bytes:
+    """
+    Generar gráfico de serie temporal NDVI/NDWI con matplotlib.
+    Retorna imagen PNG en bytes.
+    """
+    if not time_series or len(time_series) < 2:
+        # Generar gráfico placeholder
+        fig, ax = plt.subplots(figsize=(width_px/100, height_px/100), dpi=100)
+        ax.text(0.5, 0.5, 'Datos de serie temporal no disponibles', 
+                ha='center', va='center', fontsize=12, color='#888888')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis('off')
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
     
-    color, text = colors_map.get(risk_level, colors_map['unknown'])
+    # Parsear datos
+    dates = []
+    ndvi_values = []
+    ndwi_values = []
+    evi_values = []
     
-    # Draw circle indicator
-    circle = plt.Circle((0.15, 0.5), 0.3, color=color, alpha=0.9)
-    ax.add_patch(circle)
+    for point in time_series:
+        try:
+            date_str = point.get('date', '')
+            if date_str:
+                dates.append(datetime.strptime(date_str, '%Y-%m-%d'))
+                ndvi_values.append(point.get('ndvi', 0))
+                ndwi_values.append(point.get('ndwi', 0))
+                evi_values.append(point.get('evi', 0))
+        except:
+            continue
     
-    # Add text
-    ax.text(0.5, 0.5, text, fontsize=10, va='center', ha='left', color=MPL_COLORS['primary'])
+    if len(dates) < 2:
+        # Fallback
+        fig, ax = plt.subplots(figsize=(width_px/100, height_px/100), dpi=100)
+        ax.text(0.5, 0.5, 'Datos insuficientes para serie temporal', 
+                ha='center', va='center', fontsize=12, color='#888888')
+        ax.axis('off')
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
     
-    ax.set_xlim(0, 1.5)
-    ax.set_ylim(0, 1)
+    # Crear gráfico
+    fig, ax = plt.subplots(figsize=(width_px/100, height_px/100), dpi=100)
+    
+    # Líneas de índices
+    ax.plot(dates, ndvi_values, color='#228B22', linewidth=2, label='NDVI (Vigor)', marker='o', markersize=4)
+    ax.plot(dates, ndwi_values, color='#4169E1', linewidth=2, label='NDWI (Agua)', marker='s', markersize=4)
+    if any(v > 0 for v in evi_values):
+        ax.plot(dates, evi_values, color='#DAA520', linewidth=2, label='EVI (Productividad)', marker='^', markersize=4)
+    
+    # Zonas de referencia
+    ax.axhspan(0.6, 1.0, alpha=0.1, color='green', label='_nolegend_')
+    ax.axhspan(0.35, 0.6, alpha=0.1, color='yellow', label='_nolegend_')
+    ax.axhspan(0, 0.35, alpha=0.1, color='red', label='_nolegend_')
+    
+    # Líneas de umbral
+    ax.axhline(y=0.60, color='green', linestyle='--', linewidth=0.8, alpha=0.5)
+    ax.axhline(y=0.35, color='red', linestyle='--', linewidth=0.8, alpha=0.5)
+    
+    # Formato
+    ax.set_xlabel('Fecha', fontsize=10)
+    ax.set_ylabel('Valor del Índice', fontsize=10)
+    ax.set_title('Evolución Temporal de Índices', fontsize=12, fontweight='bold', color='#8B7355')
+    
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.xticks(rotation=45, ha='right')
+    
+    ax.set_ylim(-0.2, 1.0)
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Exportar a bytes
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', facecolor='white', dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def generate_ndvi_histogram(ndvi_mean: float, ndvi_p10: float, ndvi_p90: float, 
+                           width_px=300, height_px=200) -> bytes:
+    """Generar histograma simplificado de distribución NDVI"""
+    fig, ax = plt.subplots(figsize=(width_px/100, height_px/100), dpi=100)
+    
+    # Simular distribución basada en percentiles
+    mu = ndvi_mean
+    sigma = (ndvi_p90 - ndvi_p10) / 3.29  # ~3.29 sigmas entre P10 y P90
+    x = np.linspace(max(0, mu - 3*sigma), min(1, mu + 3*sigma), 100)
+    y = (1/(sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+    
+    # Colorear por zonas
+    colors_zones = np.where(x < 0.35, '#CC4444', np.where(x < 0.60, '#DAA520', '#228B22'))
+    
+    for i in range(len(x)-1):
+        ax.fill_between(x[i:i+2], y[i:i+2], color=colors_zones[i], alpha=0.6)
+    
+    ax.axvline(x=ndvi_mean, color='#3E2B1D', linestyle='-', linewidth=2, label=f'Media: {ndvi_mean:.2f}')
+    ax.axvline(x=ndvi_p10, color='#888888', linestyle='--', linewidth=1, label=f'P10: {ndvi_p10:.2f}')
+    ax.axvline(x=ndvi_p90, color='#888888', linestyle='--', linewidth=1, label=f'P90: {ndvi_p90:.2f}')
+    
+    ax.set_xlabel('NDVI', fontsize=9)
+    ax.set_ylabel('Densidad', fontsize=9)
+    ax.set_title('Distribución NDVI', fontsize=10, fontweight='bold', color='#8B7355')
+    ax.legend(loc='upper right', fontsize=7)
+    ax.set_xlim(0, 1)
+    
+    plt.tight_layout()
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', facecolor='white', dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def generate_placeholder_map(title: str, mean_value: float, colormap: str = 'RdYlGn',
+                            width_px=280, height_px=200) -> bytes:
+    """
+    Generar mapa placeholder cuando no hay datos geoespaciales.
+    En producción, esto se reemplazaría con la renderización real del GeoTIFF.
+    """
+    fig, ax = plt.subplots(figsize=(width_px/100, height_px/100), dpi=100)
+    
+    # Simular datos espaciales
+    np.random.seed(42)
+    data = np.random.normal(mean_value, 0.1, (20, 20))
+    data = np.clip(data, 0, 1)
+    
+    # Crear mapa de calor
+    cmap = plt.colormaps.get_cmap(colormap)
+    im = ax.imshow(data, cmap=cmap, vmin=0, vmax=1, aspect='auto')
+    
+    # Colorbar
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(labelsize=7)
+    
+    ax.set_title(f'{title}\nMedia: {mean_value:.2f}', fontsize=9, fontweight='bold', color='#8B7355')
     ax.axis('off')
     
     plt.tight_layout()
     
-    img_buffer = BytesIO()
-    plt.savefig(img_buffer, format='png', dpi=100, bbox_inches='tight',
-                facecolor='#FDFBF7', edgecolor='none')
-    plt.close()
-    img_buffer.seek(0)
-    
-    return img_buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', facecolor='white', dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
 
 
-# ============================================================================
-# PDF DOCUMENT BUILDER
-# ============================================================================
-class MuOrbitaReportGenerator:
-    """Professional PDF report generator for Mu.Orbita"""
+# ============================================
+# CLASE PRINCIPAL DEL GENERADOR PDF
+# ============================================
+
+class MuOrbitaPDFGenerator:
+    """Generador de informes PDF profesionales para Mu.Orbita"""
     
-    def __init__(self, output_path, logo_path=None):
-        self.output_path = output_path
-        self.logo_path = logo_path
-        self.styles = create_styles()
+    def __init__(self, data: Dict[str, Any]):
+        self.data = data
+        self.styles = get_custom_styles()
+        self.buffer = io.BytesIO()
         self.width, self.height = A4
         self.margin = 15*mm
         
-    def _header_footer(self, canvas, doc):
-        """Add header and footer to each page"""
+    def _create_header_footer(self, canvas, doc):
+        """Añadir cabecera y pie de página"""
         canvas.saveState()
         
-        # Header line
-        canvas.setStrokeColor(COLORS['secondary_gold'])
-        canvas.setLineWidth(0.5)
-        canvas.line(self.margin, self.height - 12*mm, 
-                   self.width - self.margin, self.height - 12*mm)
+        # === CABECERA ===
+        # Banda de color
+        canvas.setFillColor(colors.HexColor(COLORS_MUORBITA['primary']))
+        canvas.rect(0, self.height - 25*mm, self.width, 25*mm, fill=True, stroke=False)
         
-        # Footer
+        # Logo/Nombre
+        canvas.setFillColor(colors.white)
+        canvas.setFont('Helvetica-Bold', 20)
+        canvas.drawString(self.margin, self.height - 17*mm, "Mu.Orbita")
+        
+        # Slogan
+        canvas.setFont('Helvetica', 9)
+        canvas.drawString(self.margin, self.height - 22*mm, "Precision from Orbit — Sustainability from Data")
+        
+        # Fecha en la derecha
+        canvas.drawRightString(self.width - self.margin, self.height - 17*mm, 
+                               datetime.now().strftime('%d/%m/%Y'))
+        
+        # === PIE DE PÁGINA ===
+        canvas.setFillColor(colors.HexColor('#888888'))
         canvas.setFont('Helvetica', 8)
-        canvas.setFillColor(COLORS['text_light'])
         
-        # Page number
-        page_num = canvas.getPageNumber()
-        canvas.drawCentredString(self.width/2, 10*mm, f"Página {page_num}")
+        # Línea separadora
+        canvas.setStrokeColor(colors.HexColor(COLORS_MUORBITA['border']))
+        canvas.line(self.margin, 12*mm, self.width - self.margin, 12*mm)
         
-        # Copyright
-        canvas.drawString(self.margin, 10*mm, "© 2025 Mu.Orbita")
-        canvas.drawRightString(self.width - self.margin, 10*mm, "info@muorbita.com")
+        # Textos del pie
+        canvas.drawString(self.margin, 7*mm, f"© 2025 Mu.Orbita")
+        canvas.drawCentredString(self.width/2, 7*mm, f"Página {doc.page}")
+        canvas.drawRightString(self.width - self.margin, 7*mm, "info@muorbita.com")
         
         canvas.restoreState()
     
-    def generate(self, data):
-        """Generate the complete PDF report"""
-        doc = SimpleDocTemplate(
-            self.output_path,
-            pagesize=A4,
-            leftMargin=self.margin,
-            rightMargin=self.margin,
-            topMargin=20*mm,
-            bottomMargin=20*mm
-        )
+    def _build_info_table(self) -> Table:
+        """Crear tabla de información del análisis"""
+        data = self.data
         
-        story = []
+        # Formatear Job ID (mostrar completo o versión más legible)
+        job_id = data.get('job_id', 'N/A')
+        if len(job_id) > 35:
+            # Mostrar versión corta pero legible
+            job_id_display = f"{job_id[:20]}...{job_id[-10:]}"
+        else:
+            job_id_display = job_id
         
-        # ===== HEADER / TITLE =====
-        story.append(Paragraph("Mu.Orbita", self.styles['ReportTitle']))
-        story.append(Paragraph(
-            "Precision from Orbit — Sustainability from Data",
-            self.styles['ReportSubtitle']
-        ))
-        
-        # ===== METADATA TABLE =====
-        client_name = data.get('client_name', 'Cliente')
-        crop_type = data.get('crop_type', 'Cultivo')
-        analysis_type = data.get('analysis_type', 'baseline').upper()
-        area = self._fmt(data.get('area_hectares', 0), 1)
-        start_date = data.get('start_date', 'N/A')
-        end_date = data.get('end_date', 'N/A')
-        job_id = data.get('job_id', 'UNKNOWN')
-        
-        # Truncate job_id for display
-        job_id_display = job_id[:12] + '...' if len(job_id) > 12 else job_id
-        
-        metadata = [
-            ['Cliente', client_name, 'Cultivo', crop_type.capitalize()],
-            ['Tipo Análisis', analysis_type, 'Área Total', f'{area} ha'],
-            ['Período', f'{start_date} — {end_date}', 'Job ID', job_id_display],
+        table_data = [
+            [Paragraph('<b>Cliente</b>', self.styles['MuSmall']), 
+             Paragraph(data.get('client_name', 'N/A'), self.styles['MuBody']),
+             Paragraph('<b>Cultivo</b>', self.styles['MuSmall']),
+             Paragraph(data.get('crop_type', 'N/A').capitalize(), self.styles['MuBody'])],
+            
+            [Paragraph('<b>Tipo Análisis</b>', self.styles['MuSmall']),
+             Paragraph(data.get('analysis_type', 'BASELINE').upper(), self.styles['MuBody']),
+             Paragraph('<b>Área Total</b>', self.styles['MuSmall']),
+             Paragraph(f"{data.get('area_hectares', 0):.1f} ha", self.styles['MuBody'])],
+            
+            [Paragraph('<b>Período</b>', self.styles['MuSmall']),
+             Paragraph(f"{data.get('start_date', 'N/A')} — {data.get('end_date', 'N/A')}", self.styles['MuBody']),
+             Paragraph('<b>Job ID</b>', self.styles['MuSmall']),
+             Paragraph(job_id_display, self.styles['MuSmall'])],  # Fuente pequeña para Job ID
         ]
         
-        meta_table = Table(metadata, colWidths=[35*mm, 55*mm, 35*mm, 55*mm])
-        meta_table.setStyle(TableStyle([
-            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-            ('FONTNAME', (2, 0), (2, -1), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('TEXTCOLOR', (0, 0), (0, -1), COLORS['secondary_gold']),
-            ('TEXTCOLOR', (2, 0), (2, -1), COLORS['secondary_gold']),
-            ('TEXTCOLOR', (1, 0), (1, -1), COLORS['text_dark']),
-            ('TEXTCOLOR', (3, 0), (3, -1), COLORS['text_dark']),
-            ('BACKGROUND', (0, 0), (-1, -1), COLORS['accent_cream']),
+        col_widths = [25*mm, 55*mm, 25*mm, 55*mm]
+        table = Table(table_data, colWidths=col_widths)
+        
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor(COLORS_MUORBITA['light_bg'])),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor(COLORS_MUORBITA['text'])),
             ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('TOPPADDING', (0, 0), (-1, -1), 3*mm),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 3*mm),
-            ('LEFTPADDING', (0, 0), (-1, -1), 3*mm),
-            ('GRID', (0, 0), (-1, -1), 0.5, COLORS['light_gray']),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor(COLORS_MUORBITA['border'])),
+            ('BOX', (0, 0), (-1, -1), 1, colors.HexColor(COLORS_MUORBITA['primary'])),
         ]))
-        story.append(meta_table)
-        story.append(Spacer(1, 8*mm))
         
-        # ===== KPI SUMMARY =====
-        story.append(Paragraph("■ Indicadores Clave de Rendimiento", self.styles['SectionHeader']))
+        return table
+    
+    def _build_kpi_cards(self) -> Table:
+        """Crear tarjetas de KPIs principales"""
+        data = self.data
         
-        ndvi_mean = data.get('ndvi_mean', 0) or 0
-        ndwi_mean = data.get('ndwi_mean', 0) or 0
-        evi_mean = data.get('evi_mean', 0) or 0
-        stress_pct = data.get('stress_area_pct', 0) or 0
+        # KPI 1: NDVI
+        ndvi_mean = data.get('ndvi_mean', 0)
+        ndvi_interp, ndvi_color = interpret_ndvi(ndvi_mean)
         
-        # Interpret values
-        def interpret_ndvi(v):
-            if v >= 0.6: return "Vigor alto"
-            elif v >= 0.45: return "Vigor moderado"
-            elif v >= 0.35: return "Vigor bajo"
-            else: return "Estrés severo"
+        # KPI 2: NDWI
+        ndwi_mean = data.get('ndwi_mean', 0)
+        ndwi_interp, ndwi_color = interpret_ndwi(ndwi_mean)
         
-        def interpret_ndwi(v):
-            if v >= 0.2: return "Óptimo"
-            elif v >= 0.1: return "Déficit leve"
-            else: return "Déficit severo"
+        # KPI 3: EVI
+        evi_mean = data.get('evi_mean', 0)
         
-        kpi_data = [
-            [
-                Paragraph(f"<font size='24'><b>{self._fmt(ndvi_mean, 2)}</b></font>", self.styles['KPIValue']),
-                Paragraph(f"<font size='24'><b>{self._fmt(ndwi_mean, 2)}</b></font>", self.styles['KPIValue']),
-                Paragraph(f"<font size='24'><b>{self._fmt(evi_mean, 2)}</b></font>", self.styles['KPIValue']),
-                Paragraph(f"<font size='24'><b>{self._fmt(stress_pct, 1) if stress_pct else 'N/A'}</b></font><font size='12'> %</font>", self.styles['KPIValue']),
-            ],
-            [
-                Paragraph("NDVI Medio", self.styles['KPILabel']),
-                Paragraph("NDWI Medio", self.styles['KPILabel']),
-                Paragraph("EVI Medio", self.styles['KPILabel']),
-                Paragraph("Área Estrés", self.styles['KPILabel']),
-            ],
-            [
-                Paragraph(f"<font size='9' color='#8D6E63'>{interpret_ndvi(ndvi_mean)}</font>", self.styles['KPILabel']),
-                Paragraph(f"<font size='9' color='#8D6E63'>{interpret_ndwi(ndwi_mean)}</font>", self.styles['KPILabel']),
-                Paragraph(f"<font size='9' color='#8D6E63'>Productividad</font>", self.styles['KPILabel']),
-                Paragraph(f"<font size='9' color='#8D6E63'>NDVI &lt; 0.35</font>", self.styles['KPILabel']),
-            ],
-        ]
+        # KPI 4: Área con estrés
+        stress_pct = data.get('stress_area_pct', 0)
+        stress_interp, stress_color = interpret_stress_pct(stress_pct)
         
-        kpi_table = Table(kpi_data, colWidths=[45*mm, 45*mm, 45*mm, 45*mm])
-        kpi_table.setStyle(TableStyle([
+        def make_kpi_cell(value: str, label: str, interpretation: str, color: str):
+            """Crear celda de KPI"""
+            return [
+                Paragraph(f'<font color="{color}" size="24"><b>{value}</b></font>', 
+                         ParagraphStyle('kpi', alignment=TA_CENTER)),
+                Paragraph(f'<font size="8" color="#666666">{label}</font>', 
+                         ParagraphStyle('label', alignment=TA_CENTER, spaceBefore=2*mm)),
+                Paragraph(f'<font size="9" color="{color}"><b>{interpretation}</b></font>', 
+                         ParagraphStyle('interp', alignment=TA_CENTER, spaceBefore=1*mm)),
+            ]
+        
+        # Construir tabla de KPIs
+        kpi_data = [[
+            make_kpi_cell(f"{ndvi_mean:.2f}", "NDVI Medio", ndvi_interp, ndvi_color),
+            make_kpi_cell(f"{ndwi_mean:.2f}", "NDWI Medio", ndwi_interp, ndwi_color),
+            make_kpi_cell(f"{evi_mean:.2f}", "EVI Medio", "Productividad", COLORS_MUORBITA['warning']),
+            make_kpi_cell(f"{stress_pct:.1f}%", "Área Estrés", stress_interp, stress_color),
+        ]]
+        
+        # Aplanar para que cada celda sea una mini-tabla
+        flat_data = []
+        row = []
+        for kpi in kpi_data[0]:
+            mini_table = Table([[k] for k in kpi], colWidths=[38*mm])
+            mini_table.setStyle(TableStyle([
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('TOPPADDING', (0, 0), (-1, -1), 3),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ]))
+            row.append(mini_table)
+        flat_data.append(row)
+        
+        table = Table(flat_data, colWidths=[42*mm, 42*mm, 42*mm, 42*mm])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor(COLORS_MUORBITA['light_bg'])),
+            ('BOX', (0, 0), (-1, -1), 1, colors.HexColor(COLORS_MUORBITA['border'])),
+            ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor(COLORS_MUORBITA['border'])),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('BACKGROUND', (0, 0), (-1, -1), COLORS['background']),
-            ('BOX', (0, 0), (-1, -1), 1, COLORS['light_gray']),
-            ('LINEAFTER', (0, 0), (-2, -1), 0.5, COLORS['light_gray']),
-            ('TOPPADDING', (0, 0), (-1, 0), 4*mm),
-            ('BOTTOMPADDING', (0, -1), (-1, -1), 3*mm),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
         ]))
-        story.append(kpi_table)
-        story.append(Spacer(1, 8*mm))
         
-        # ===== TIMESERIES CHART =====
-        story.append(Paragraph("■ Evolución Temporal de Índices", self.styles['SectionHeader']))
+        return table
+    
+    def _build_vegetation_detail_table(self) -> Table:
+        """Tabla detallada de índices vegetativos"""
+        data = self.data
         
-        timeseries = data.get('timeseries', [])
-        chart_img = create_ndvi_timeseries_chart(timeseries)
-        img = Image(chart_img, width=170*mm, height=60*mm)
-        story.append(img)
-        story.append(Spacer(1, 6*mm))
+        ndvi_interp, _ = interpret_ndvi(data.get('ndvi_mean', 0))
+        ndwi_interp, _ = interpret_ndwi(data.get('ndwi_mean', 0))
         
-        # ===== DETAILED INDICES TABLE =====
-        story.append(Paragraph("■ Detalle de Índices Vegetativos", self.styles['SectionHeader']))
+        header_style = ParagraphStyle('header', fontName='Helvetica-Bold', fontSize=9, 
+                                       textColor=colors.white, alignment=TA_CENTER)
+        cell_style = ParagraphStyle('cell', fontName='Helvetica', fontSize=9, alignment=TA_CENTER)
         
-        indices_data = [
-            ['Métrica', 'Valor', 'P10', 'P50', 'P90', 'Interpretación'],
-            ['NDVI (Vigor)', 
-             self._fmt(ndvi_mean), 
-             self._fmt(data.get('ndvi_p10')), 
-             self._fmt(data.get('ndvi_p50')),
-             self._fmt(data.get('ndvi_p90')),
-             interpret_ndvi(ndvi_mean)],
-            ['NDWI (Agua)', 
-             self._fmt(ndwi_mean),
-             self._fmt(data.get('ndwi_p10')),
-             '—',
-             self._fmt(data.get('ndwi_p90')),
-             interpret_ndwi(ndwi_mean)],
-            ['EVI (Productiv.)', 
-             self._fmt(evi_mean),
-             self._fmt(data.get('evi_p10')),
-             '—',
-             self._fmt(data.get('evi_p90')),
-             '—'],
-            ['NDCI (Clorofila)', 
-             self._fmt(data.get('ndci_mean')),
-             '—', '—', '—', '—'],
-            ['SAVI (Aj. Suelo)', 
-             self._fmt(data.get('savi_mean')),
-             '—', '—', '—', '—'],
-        ]
-        
-        indices_table = Table(indices_data, colWidths=[35*mm, 22*mm, 22*mm, 22*mm, 22*mm, 40*mm])
-        indices_table.setStyle(TableStyle([
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('BACKGROUND', (0, 0), (-1, 0), COLORS['secondary_gold']),
-            ('TEXTCOLOR', (0, 0), (-1, 0), COLORS['white']),
-            ('BACKGROUND', (0, 1), (-1, -1), COLORS['background']),
-            ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('GRID', (0, 0), (-1, -1), 0.5, COLORS['light_gray']),
-            ('TOPPADDING', (0, 0), (-1, -1), 2*mm),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 2*mm),
-        ]))
-        story.append(indices_table)
-        
-        # ===== PAGE BREAK =====
-        story.append(PageBreak())
-        
-        # ===== RISK ASSESSMENT =====
-        story.append(Paragraph("■■ Evaluación de Riesgos", self.styles['SectionHeader']))
-        
-        # Calculate risk levels
-        water_risk = 'high' if ndwi_mean < 0.1 else ('medium' if ndwi_mean < 0.2 else 'low')
-        vigor_risk = 'high' if ndvi_mean < 0.35 else ('medium' if ndvi_mean < 0.45 else 'low')
-        heterogeneity = data.get('heterogeneity', 0) or 0
-        hetero_risk = 'high' if heterogeneity > 0.25 else ('medium' if heterogeneity > 0.15 else 'low')
-        
-        risk_data = [
-            ['Tipo de Riesgo', 'Nivel', 'Indicador', 'Acción Sugerida'],
-            ['Estrés Hídrico', self._risk_cell(water_risk), f'NDWI: {self._fmt(ndwi_mean)}', 
-             'Verificar riego' if water_risk == 'high' else 'Monitorear'],
-            ['Déficit de Vigor', self._risk_cell(vigor_risk), f'NDVI: {self._fmt(ndvi_mean)}',
-             'Inspección' if vigor_risk == 'high' else 'Monitorear'],
-            ['Heterogeneidad', self._risk_cell(hetero_risk) if heterogeneity else self._risk_cell('unknown'), 
-             f'P90-P10: {self._fmt(heterogeneity) if heterogeneity else "N/D"}',
-             'VRA recomendado' if hetero_risk == 'high' else 'Homogéneo'],
-        ]
-        
-        risk_table = Table(risk_data, colWidths=[40*mm, 30*mm, 45*mm, 55*mm])
-        risk_table.setStyle(TableStyle([
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('BACKGROUND', (0, 0), (-1, 0), COLORS['primary_brown']),
-            ('TEXTCOLOR', (0, 0), (-1, 0), COLORS['white']),
-            ('BACKGROUND', (0, 1), (-1, -1), COLORS['background']),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('GRID', (0, 0), (-1, -1), 0.5, COLORS['light_gray']),
-            ('TOPPADDING', (0, 0), (-1, -1), 2.5*mm),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5*mm),
-            ('LEFTPADDING', (0, 0), (-1, -1), 2*mm),
-        ]))
-        story.append(risk_table)
-        story.append(Spacer(1, 8*mm))
-        
-        # ===== RECOMMENDATIONS =====
-        story.append(Paragraph("■ Recomendaciones Prioritarias", self.styles['SectionHeader']))
-        
-        recommendations = self._generate_recommendations(data)
-        
-        for i, rec in enumerate(recommendations, 1):
-            # Priority color
-            priority_colors = {'Alta': '#F44336', 'Media': '#FF9800', 'Baja': '#4CAF50'}
-            priority_color = priority_colors.get(rec['priority'], '#9E9E9E')
+        table_data = [
+            [Paragraph('Métrica', header_style), 
+             Paragraph('Valor', header_style),
+             Paragraph('P10', header_style), 
+             Paragraph('P50', header_style),
+             Paragraph('P90', header_style), 
+             Paragraph('Interpretación', header_style)],
             
-            rec_header = Paragraph(
-                f"<font size='11'><b>{i}. {rec['action']}</b></font> "
-                f"<font size='9' color='{priority_color}'>● Prioridad: {rec['priority']}</font> "
-                f"<font size='9' color='#8D6E63'>| Plazo: {rec['deadline']}</font>",
-                self.styles['CustomBody']
-            )
-            story.append(rec_header)
+            [Paragraph('NDVI (Vigor)', cell_style),
+             Paragraph(f"{data.get('ndvi_mean', 0):.2f}", cell_style),
+             Paragraph(f"{data.get('ndvi_p10', 0):.2f}", cell_style),
+             Paragraph(f"{data.get('ndvi_p50', 0):.2f}", cell_style),
+             Paragraph(f"{data.get('ndvi_p90', 0):.2f}", cell_style),
+             Paragraph(ndvi_interp, cell_style)],
             
-            rec_details = Paragraph(
-                f"<font size='9' color='#5D4037'>"
-                f"<b>Trigger:</b> {rec['trigger']}<br/>"
-                f"<b>Zona:</b> {rec['zone']}<br/>"
-                f"<b>Justificación:</b> {rec['justification']}"
-                f"</font>",
-                self.styles['RecommendationText']
-            )
-            story.append(rec_details)
-            story.append(Spacer(1, 4*mm))
-        
-        # ===== TECHNICAL ANNEX =====
-        story.append(Paragraph("■ Anexo Técnico", self.styles['SectionHeader']))
-        
-        # Data sources
-        story.append(Paragraph("<b>Fuentes de Datos</b>", self.styles['SubsectionHeader']))
-        sources_text = f"""
-        • Sentinel-2 (SR Harmonized): {data.get('images_processed', 'N/A')} escenas procesadas<br/>
-        • Última imagen válida: {data.get('latest_image_date', 'N/A')}<br/>
-        • MODIS LST: Temperatura superficial media {self._fmt(data.get('lst_mean_c'), 1)} ºC<br/>
-        • Resolución espacial: 10 m (Sentinel-2), 1 km (MODIS)
-        """
-        story.append(Paragraph(sources_text, self.styles['CustomBody']))
-        
-        # Thresholds reference
-        story.append(Paragraph("<b>Umbrales de Referencia</b>", self.styles['SubsectionHeader']))
-        
-        thresh_data = [
-            ['Índice', 'Óptimo', 'Moderado', 'Estrés'],
-            ['NDVI', '> 0.60', '0.45 - 0.60', '< 0.35'],
-            ['NDWI', '> 0.20', '0.10 - 0.20', '< 0.10'],
-            ['EVI', '> 0.40', '0.25 - 0.40', '< 0.25'],
+            [Paragraph('NDWI (Agua)', cell_style),
+             Paragraph(f"{data.get('ndwi_mean', 0):.2f}", cell_style),
+             Paragraph(f"{data.get('ndwi_p10', 0):.2f}", cell_style),
+             Paragraph('—', cell_style),
+             Paragraph(f"{data.get('ndwi_p90', 0):.2f}", cell_style),
+             Paragraph(ndwi_interp, cell_style)],
+            
+            [Paragraph('EVI (Productiv.)', cell_style),
+             Paragraph(f"{data.get('evi_mean', 0):.2f}", cell_style),
+             Paragraph(f"{data.get('evi_p10', 0):.2f}", cell_style),
+             Paragraph('—', cell_style),
+             Paragraph(f"{data.get('evi_p90', 0):.2f}", cell_style),
+             Paragraph('—', cell_style)],
+            
+            [Paragraph('NDCI (Clorofila)', cell_style),
+             Paragraph(f"{data.get('ndci_mean', 0):.2f}", cell_style),
+             Paragraph('—', cell_style),
+             Paragraph('—', cell_style),
+             Paragraph('—', cell_style),
+             Paragraph('—', cell_style)],
+            
+            [Paragraph('SAVI (Aj. Suelo)', cell_style),
+             Paragraph(f"{data.get('savi_mean', 0):.2f}", cell_style),
+             Paragraph('—', cell_style),
+             Paragraph('—', cell_style),
+             Paragraph('—', cell_style),
+             Paragraph('—', cell_style)],
         ]
         
-        thresh_table = Table(thresh_data, colWidths=[30*mm, 40*mm, 40*mm, 40*mm])
-        thresh_table.setStyle(TableStyle([
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 8),
-            ('BACKGROUND', (0, 0), (-1, 0), COLORS['secondary_gold']),
-            ('TEXTCOLOR', (0, 0), (-1, 0), COLORS['white']),
-            ('BACKGROUND', (1, 1), (1, -1), colors.HexColor('#E8F5E9')),
-            ('BACKGROUND', (2, 1), (2, -1), colors.HexColor('#FFF3E0')),
-            ('BACKGROUND', (3, 1), (3, -1), colors.HexColor('#FFEBEE')),
+        col_widths = [32*mm, 22*mm, 18*mm, 18*mm, 18*mm, 52*mm]
+        table = Table(table_data, colWidths=col_widths)
+        
+        table.setStyle(TableStyle([
+            # Header
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(COLORS_MUORBITA['primary'])),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            # Body
+            ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+            ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor(COLORS_MUORBITA['text'])),
+            # Grid
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor(COLORS_MUORBITA['border'])),
+            ('BOX', (0, 0), (-1, -1), 1, colors.HexColor(COLORS_MUORBITA['primary'])),
+            # Alignment
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('GRID', (0, 0), (-1, -1), 0.5, COLORS['light_gray']),
-            ('TOPPADDING', (0, 0), (-1, -1), 1.5*mm),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 1.5*mm),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            # Padding
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            # Alternating rows
+            ('BACKGROUND', (0, 2), (-1, 2), colors.HexColor('#F5F5F5')),
+            ('BACKGROUND', (0, 4), (-1, 4), colors.HexColor('#F5F5F5')),
         ]))
-        story.append(thresh_table)
         
-        # ===== FOOTER DISCLAIMER =====
-        story.append(Spacer(1, 10*mm))
-        story.append(HRFlowable(width="100%", thickness=0.5, color=COLORS['light_gray']))
-        story.append(Spacer(1, 3*mm))
-        
-        disclaimer = Paragraph(
-            '<font size="8" color="#8D6E63">'
-            '<i>Este informe ha sido generado automáticamente mediante análisis de imágenes satelitales. '
-            'Las recomendaciones deben ser validadas por un técnico agrónomo antes de su implementación. '
-            'Los datos satelitales están sujetos a disponibilidad y condiciones atmosféricas.</i>'
-            '</font>',
-            self.styles['Footer']
-        )
-        story.append(disclaimer)
-        
-        # Build PDF
-        doc.build(story, onFirstPage=self._header_footer, onLaterPages=self._header_footer)
-        
-        return self.output_path
+        return table
     
-    def _fmt(self, value, decimals=2):
-        """Format numeric value"""
-        if value is None or value == '' or value == 'N/A':
-            return 'N/A'
-        try:
-            return f"{float(value):.{decimals}f}"
-        except:
-            return str(value)
-    
-    def _risk_cell(self, risk_level):
-        """Create colored risk indicator text"""
-        colors_map = {
-            'low': ('🟢', 'Bajo'),
-            'medium': ('🟡', 'Moderado'),
-            'high': ('🔴', 'Alto'),
-            'unknown': ('⚪', 'N/D'),
-        }
-        icon, text = colors_map.get(risk_level, colors_map['unknown'])
-        return f"■ {text}"
-    
-    def _generate_recommendations(self, data):
-        """Generate default recommendations based on data analysis"""
-        recommendations = []
+    def _build_risk_table(self) -> Table:
+        """Tabla de evaluación de riesgos"""
+        data = self.data
         
-        ndvi_val = data.get('ndvi_mean')
-        ndwi_val = data.get('ndwi_mean')
+        # Evaluar riesgos
+        ndwi_mean = data.get('ndwi_mean', 0)
+        ndvi_mean = data.get('ndvi_mean', 0)
+        heterogeneity = data.get('ndvi_p90', 0) - data.get('ndvi_p10', 0)
+        
+        # Nivel de estrés hídrico
+        if ndwi_mean < 0:
+            hydric_level, hydric_action = "Alto", "Verificar riego urgente"
+        elif ndwi_mean < 0.10:
+            hydric_level, hydric_action = "Moderado", "Monitorizar riego"
+        else:
+            hydric_level, hydric_action = "Bajo", "Mantener régimen actual"
+        
+        # Nivel de déficit de vigor
+        if ndvi_mean < 0.35:
+            vigor_level, vigor_action = "Alto", "Inspección de campo urgente"
+        elif ndvi_mean < 0.45:
+            vigor_level, vigor_action = "Moderado", "Planificar inspección"
+        else:
+            vigor_level, vigor_action = "Bajo", "Sin acción requerida"
+        
+        # Heterogeneidad
+        hetero_interp, _ = interpret_heterogeneity(heterogeneity)
+        if heterogeneity > 0.25:
+            hetero_action = "Considerar VRA"
+        elif heterogeneity > 0.15:
+            hetero_action = "Evaluar zonificación"
+        else:
+            hetero_action = "Sin acción requerida"
+        
+        header_style = ParagraphStyle('header', fontName='Helvetica-Bold', fontSize=9, 
+                                       textColor=colors.white, alignment=TA_CENTER)
+        cell_style = ParagraphStyle('cell', fontName='Helvetica', fontSize=9, alignment=TA_CENTER)
+        
+        def get_level_indicator(level: str) -> Paragraph:
+            color = get_risk_level_color(level)
+            return Paragraph(f'<font color="{color}">■</font> {level}', cell_style)
+        
+        table_data = [
+            [Paragraph('Tipo de Riesgo', header_style),
+             Paragraph('Nivel', header_style),
+             Paragraph('Indicador', header_style),
+             Paragraph('Acción Sugerida', header_style)],
+            
+            [Paragraph('Estrés Hídrico', cell_style),
+             get_level_indicator(hydric_level),
+             Paragraph(f'NDWI: {ndwi_mean:.2f}', cell_style),
+             Paragraph(hydric_action, cell_style)],
+            
+            [Paragraph('Déficit de Vigor', cell_style),
+             get_level_indicator(vigor_level),
+             Paragraph(f'NDVI: {ndvi_mean:.2f}', cell_style),
+             Paragraph(vigor_action, cell_style)],
+            
+            [Paragraph('Heterogeneidad', cell_style),
+             get_level_indicator('Bajo' if heterogeneity < 0.15 else ('Moderado' if heterogeneity < 0.25 else 'Alto')),
+             Paragraph(f'P90-P10: {heterogeneity:.2f}', cell_style),
+             Paragraph(hetero_action, cell_style)],
+        ]
+        
+        col_widths = [40*mm, 30*mm, 35*mm, 55*mm]
+        table = Table(table_data, colWidths=col_widths)
+        
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(COLORS_MUORBITA['primary'])),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor(COLORS_MUORBITA['border'])),
+            ('BOX', (0, 0), (-1, -1), 1, colors.HexColor(COLORS_MUORBITA['primary'])),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        
+        return table
+    
+    def _build_recommendations(self) -> List:
+        """Generar sección de recomendaciones prioritarias"""
+        data = self.data
+        elements = []
+        
+        ndwi_mean = data.get('ndwi_mean', 0)
+        ndvi_mean = data.get('ndvi_mean', 0)
         stress_pct = data.get('stress_area_pct', 0)
         
-        # Recommendation 1: Based on NDWI (water stress)
-        if ndwi_val and ndwi_val < 0.1:
+        recommendations = []
+        
+        # Recomendación 1: Basada en NDWI
+        if ndwi_mean < 0:
             recommendations.append({
-                'action': 'Verificar sistema de riego',
+                'title': 'Verificar sistema de riego',
                 'priority': 'Alta',
                 'deadline': '3-5 días',
-                'trigger': f'NDWI = {ndwi_val:.2f} indica déficit hídrico severo',
+                'trigger': f'NDWI = {ndwi_mean:.2f} indica déficit hídrico severo',
                 'zone': 'Toda la parcela',
-                'justification': 'Estrés hídrico puede reducir producción hasta 30%'
+                'justification': 'Estrés hídrico severo puede reducir producción hasta 30%'
             })
-        elif ndwi_val and ndwi_val < 0.2:
+        elif ndwi_mean < 0.10:
             recommendations.append({
-                'action': 'Ajustar frecuencia de riego',
+                'title': 'Ajustar programación de riego',
                 'priority': 'Media',
                 'deadline': '7 días',
-                'trigger': f'NDWI = {ndwi_val:.2f} indica déficit moderado',
-                'zone': 'Zonas con NDWI < 0.15',
+                'trigger': f'NDWI = {ndwi_mean:.2f} indica déficit hídrico moderado',
+                'zone': 'Zonas con menor NDWI',
                 'justification': 'Prevenir escalada de estrés hídrico'
             })
-        else:
-            recommendations.append({
-                'action': 'Mantener programa de riego actual',
-                'priority': 'Baja',
-                'deadline': '14 días',
-                'trigger': 'Estado hídrico dentro de parámetros óptimos',
-                'zone': 'Toda la parcela',
-                'justification': 'Continuar monitoreo regular'
-            })
         
-        # Recommendation 2: Based on NDVI (vigor)
-        if ndvi_val and ndvi_val < 0.35:
+        # Recomendación 2: Basada en NDVI
+        if ndvi_mean < 0.35:
             recommendations.append({
-                'action': 'Inspección de campo urgente',
+                'title': 'Inspección de campo urgente',
                 'priority': 'Alta',
                 'deadline': '3 días',
-                'trigger': f'NDVI = {ndvi_val:.2f} indica estrés severo',
-                'zone': 'Áreas con NDVI < 0.35',
+                'trigger': f'NDVI = {ndvi_mean:.2f} indica estrés severo',
+                'zone': f'Áreas con NDVI < 0.35 ({stress_pct:.1f}% del área)',
                 'justification': 'Descartar plagas, enfermedades o fallo de riego'
             })
-        elif ndvi_val and ndvi_val < 0.45:
+        elif ndvi_mean < 0.45:
             recommendations.append({
-                'action': 'Evaluación nutricional',
+                'title': 'Planificar inspección visual',
                 'priority': 'Media',
-                'deadline': '7-10 días',
-                'trigger': f'NDVI = {ndvi_val:.2f} por debajo del óptimo',
-                'zone': 'Zonas de bajo vigor',
-                'justification': 'Vigor reducido puede indicar deficiencia nutricional'
-            })
-        else:
-            recommendations.append({
-                'action': 'Monitoreo estándar de vigor',
-                'priority': 'Baja',
-                'deadline': '14 días',
-                'trigger': 'Vigor vegetativo dentro de rango normal',
-                'zone': 'Toda la parcela',
-                'justification': 'Cultivo en buen estado vegetativo'
+                'deadline': '7 días',
+                'trigger': f'NDVI = {ndvi_mean:.2f} indica vigor bajo',
+                'zone': 'Zonas con menor vigor',
+                'justification': 'Identificar causas de bajo rendimiento vegetativo'
             })
         
-        # Recommendation 3: Based on stress area
-        if stress_pct and stress_pct > 20:
+        # Recomendación 3: VRA si hay heterogeneidad o estrés amplio
+        if stress_pct > 50:
             recommendations.append({
-                'action': 'Zonificación para aplicación variable',
+                'title': 'Zonificación para aplicación variable (VRA)',
                 'priority': 'Media',
                 'deadline': '10 días',
                 'trigger': f'{stress_pct:.1f}% del área presenta estrés',
@@ -760,132 +772,346 @@ class MuOrbitaReportGenerator:
             })
         else:
             recommendations.append({
-                'action': 'Preparar próximo ciclo de monitoreo',
+                'title': 'Mantener monitorización quincenal',
                 'priority': 'Baja',
                 'deadline': '14 días',
-                'trigger': 'Análisis baseline completado',
+                'trigger': 'Situación bajo control',
                 'zone': 'Toda la parcela',
-                'justification': 'Establecer comparativa para seguimiento bisemanal'
+                'justification': 'Detección temprana de cambios en vigor'
             })
         
-        return recommendations
+        # Formatear recomendaciones
+        for i, rec in enumerate(recommendations[:3], 1):
+            priority_color = {
+                'Alta': COLORS_MUORBITA['danger'],
+                'Media': COLORS_MUORBITA['warning'],
+                'Baja': COLORS_MUORBITA['secondary']
+            }.get(rec['priority'], COLORS_MUORBITA['text'])
+            
+            rec_text = f"""
+            <b>{i}. {rec['title']}</b> <font color="{priority_color}">● Prioridad: {rec['priority']}</font> | Plazo: {rec['deadline']}<br/>
+            <font size="9">
+            <b>Trigger:</b> {rec['trigger']}<br/>
+            <b>Zona:</b> {rec['zone']}<br/>
+            <b>Justificación:</b> {rec['justification']}
+            </font>
+            """
+            
+            elements.append(Paragraph(rec_text, self.styles['MuBody']))
+            elements.append(Spacer(1, 3*mm))
+        
+        return elements
+    
+    def _build_ai_analysis_section(self) -> List:
+        """Construir sección de análisis IA (narrativa)"""
+        elements = []
+        
+        markdown_analysis = self.data.get('markdown_analysis', '')
+        
+        if not markdown_analysis:
+            # Generar análisis automático basado en los datos
+            data = self.data
+            ndvi_mean = data.get('ndvi_mean', 0)
+            ndwi_mean = data.get('ndwi_mean', 0)
+            stress_pct = data.get('stress_area_pct', 0)
+            heterogeneity = data.get('ndvi_p90', 0) - data.get('ndvi_p10', 0)
+            
+            ndvi_interp, _ = interpret_ndvi(ndvi_mean)
+            ndwi_interp, _ = interpret_ndwi(ndwi_mean)
+            hetero_interp, _ = interpret_heterogeneity(heterogeneity)
+            
+            analysis_text = f"""
+            <b>Interpretación Integrada:</b><br/><br/>
+            
+            El cultivo presenta valores de vigor vegetativo clasificados como <b>{ndvi_interp.lower()}</b> 
+            (NDVI medio de {ndvi_mean:.2f}). El estado hídrico indica <b>{ndwi_interp.lower()}</b> 
+            con un NDWI de {ndwi_mean:.2f}. El <b>{stress_pct:.1f}%</b> del área total 
+            ({data.get('stress_area_ha', 0):.1f} ha de {data.get('area_hectares', 0):.1f} ha) 
+            muestra signos de estrés significativo (NDVI &lt; 0.35).<br/><br/>
+            
+            La heterogeneidad intra-parcela es <b>{hetero_interp.lower()}</b> 
+            (rango P10-P90: {heterogeneity:.2f}), lo que 
+            {"sugiere considerar aplicación variable de insumos" if heterogeneity > 0.15 else "indica un estado relativamente uniforme del cultivo"}.
+            <br/><br/>
+            
+            <b>Contexto estacional:</b> Para esta época del año, los valores observados 
+            {"requieren atención inmediata" if ndvi_mean < 0.35 else "deben monitorizarse de cerca" if ndvi_mean < 0.45 else "están dentro de parámetros aceptables"}.
+            """
+            
+            elements.append(Paragraph(analysis_text, self.styles['MuBody']))
+        else:
+            # Parsear markdown básico
+            lines = markdown_analysis.split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    elements.append(Spacer(1, 2*mm))
+                elif line.startswith('## '):
+                    elements.append(Paragraph(line[3:], self.styles['MuSectionHeader']))
+                elif line.startswith('### '):
+                    elements.append(Paragraph(f"<b>{line[4:]}</b>", self.styles['MuBody']))
+                elif line.startswith('- '):
+                    elements.append(Paragraph(f"• {line[2:]}", self.styles['MuBody']))
+                elif line.startswith('**') and line.endswith('**'):
+                    elements.append(Paragraph(f"<b>{line[2:-2]}</b>", self.styles['MuBody']))
+                else:
+                    elements.append(Paragraph(line, self.styles['MuBody']))
+        
+        return elements
+    
+    def _build_technical_annex(self) -> List:
+        """Construir anexo técnico"""
+        elements = []
+        data = self.data
+        
+        annex_text = f"""
+        <b>Fuentes de Datos</b><br/>
+        • Sentinel-2 (SR Harmonized): {data.get('images_processed', 0)} escenas procesadas<br/>
+        • Última imagen válida: {data.get('latest_image_date', 'N/A')}<br/>
+        • MODIS LST: Temperatura superficial media {data.get('lst_mean_c', 0):.1f} ºC<br/>
+        • Resolución espacial: 10 m (Sentinel-2), 1 km (MODIS)<br/><br/>
+        
+        <b>Umbrales de Referencia</b><br/>
+        • NDVI &gt; 0.60: Vigor alto | 0.45-0.60: Moderado | &lt; 0.35: Estrés<br/>
+        • NDWI &gt; 0.20: Óptimo | 0.10-0.20: Moderado | &lt; 0.10: Déficit<br/>
+        • EVI &gt; 0.40: Productividad alta | 0.25-0.40: Moderada | &lt; 0.25: Baja<br/><br/>
+        
+        <b>Procesamiento</b><br/>
+        • Motor: Google Earth Engine<br/>
+        • Máscaras de nube: QA60 + SCL (Sentinel-2)<br/>
+        • Estadísticas: Media, P10, P50, P90, desviación estándar
+        """
+        
+        elements.append(Paragraph(annex_text, self.styles['MuSmall']))
+        
+        return elements
+    
+    def generate(self) -> bytes:
+        """Generar el PDF completo y retornar como bytes"""
+        
+        doc = SimpleDocTemplate(
+            self.buffer,
+            pagesize=A4,
+            leftMargin=self.margin,
+            rightMargin=self.margin,
+            topMargin=30*mm,  # Espacio para cabecera
+            bottomMargin=20*mm  # Espacio para pie
+        )
+        
+        elements = []
+        
+        # === PÁGINA 1: Resumen ===
+        
+        # Título
+        elements.append(Spacer(1, 5*mm))
+        elements.append(Paragraph("Informe de Análisis Agrícola", self.styles['MuTitle']))
+        elements.append(Paragraph("Análisis Baseline — Diagnóstico Inicial", self.styles['MuSubtitle']))
+        
+        # Tabla de información
+        elements.append(self._build_info_table())
+        elements.append(Spacer(1, 8*mm))
+        
+        # Sección: Indicadores Clave
+        elements.append(Paragraph("■ Indicadores Clave de Rendimiento", self.styles['MuSectionHeader']))
+        elements.append(self._build_kpi_cards())
+        elements.append(Spacer(1, 8*mm))
+        
+        # Sección: Serie Temporal (gráfico)
+        elements.append(Paragraph("■ Evolución Temporal de Índices", self.styles['MuSectionHeader']))
+        
+        time_series = self.data.get('time_series', [])
+        chart_bytes = generate_time_series_chart(time_series)
+        chart_image = Image(io.BytesIO(chart_bytes), width=160*mm, height=60*mm)
+        elements.append(chart_image)
+        elements.append(Spacer(1, 5*mm))
+        
+        # Sección: Detalle de Índices
+        elements.append(Paragraph("■ Detalle de Índices Vegetativos", self.styles['MuSectionHeader']))
+        elements.append(self._build_vegetation_detail_table())
+        elements.append(Spacer(1, 8*mm))
+        
+        # === PÁGINA 2: Mapas y Análisis ===
+        elements.append(PageBreak())
+        
+        # Sección: Mapas de Color
+        elements.append(Paragraph("■ Mapas de Vigor y Estado Hídrico", self.styles['MuSectionHeader']))
+        
+        # Generar mapas placeholder (en producción, usar datos reales)
+        ndvi_map_bytes = generate_placeholder_map("NDVI (Vigor)", self.data.get('ndvi_mean', 0.3), 'RdYlGn')
+        ndwi_map_bytes = generate_placeholder_map("NDWI (Agua)", max(0, self.data.get('ndwi_mean', 0)), 'Blues')
+        
+        maps_table = Table([
+            [Image(io.BytesIO(ndvi_map_bytes), width=75*mm, height=55*mm),
+             Image(io.BytesIO(ndwi_map_bytes), width=75*mm, height=55*mm)]
+        ], colWidths=[80*mm, 80*mm])
+        maps_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(maps_table)
+        elements.append(Spacer(1, 5*mm))
+        
+        # Histograma de distribución
+        elements.append(Paragraph("■ Distribución de Valores NDVI", self.styles['MuSectionHeader']))
+        histogram_bytes = generate_ndvi_histogram(
+            self.data.get('ndvi_mean', 0.3),
+            self.data.get('ndvi_p10', 0.2),
+            self.data.get('ndvi_p90', 0.4)
+        )
+        elements.append(Image(io.BytesIO(histogram_bytes), width=100*mm, height=65*mm))
+        elements.append(Spacer(1, 5*mm))
+        
+        # Sección: Análisis IA
+        elements.append(Paragraph("■ Análisis Agronómico", self.styles['MuSectionHeader']))
+        elements.extend(self._build_ai_analysis_section())
+        elements.append(Spacer(1, 8*mm))
+        
+        # === PÁGINA 3: Riesgos y Recomendaciones ===
+        elements.append(PageBreak())
+        
+        # Sección: Evaluación de Riesgos
+        elements.append(Paragraph("■ Evaluación de Riesgos", self.styles['MuSectionHeader']))
+        elements.append(self._build_risk_table())
+        elements.append(Spacer(1, 8*mm))
+        
+        # Sección: Recomendaciones
+        elements.append(Paragraph("■ Recomendaciones Prioritarias", self.styles['MuSectionHeader']))
+        elements.extend(self._build_recommendations())
+        elements.append(Spacer(1, 8*mm))
+        
+        # Sección: Anexo Técnico
+        elements.append(Paragraph("■ Anexo Técnico", self.styles['MuSectionHeader']))
+        elements.extend(self._build_technical_annex())
+        
+        # Disclaimer final
+        elements.append(Spacer(1, 10*mm))
+        disclaimer = """
+        <i><font size="8" color="#888888">
+        Este informe ha sido generado automáticamente mediante análisis de imágenes satelitales. 
+        Las recomendaciones deben ser validadas por un técnico agrónomo antes de su implementación. 
+        Los datos satelitales están sujetos a disponibilidad y condiciones atmosféricas.
+        </font></i>
+        """
+        elements.append(Paragraph(disclaimer, self.styles['MuSmall']))
+        
+        # Construir PDF
+        doc.build(elements, onFirstPage=self._create_header_footer, 
+                  onLaterPages=self._create_header_footer)
+        
+        self.buffer.seek(0)
+        return self.buffer.getvalue()
 
 
-# ============================================================================
-# MAIN FUNCTION
-# ============================================================================
-def generate_report(data, output_path, logo_path=None):
+# ============================================
+# FUNCIÓN PRINCIPAL PARA INTEGRACIÓN API
+# ============================================
+
+def generate_muorbita_report(data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Main function to generate a Mu.Orbita professional report
+    Función principal para generar el informe PDF.
     
     Args:
-        data: dict with all KPIs and metadata
-        output_path: path for the output PDF
-        logo_path: optional path to logo image
-    
+        data: Diccionario con todos los datos del análisis
+        
     Returns:
-        path to generated PDF
+        Dict con pdf_base64, filename, y metadata
     """
-    generator = MuOrbitaReportGenerator(output_path, logo_path)
-    return generator.generate(data)
-
-
-# ============================================================================
-# CLI INTERFACE
-# ============================================================================
-def main():
-    parser = argparse.ArgumentParser(
-        description='Mu.Orbita Professional PDF Report Generator'
-    )
-    parser.add_argument(
-        '--job-id', 
-        required=True, 
-        help='Job ID for the report'
-    )
-    parser.add_argument(
-        '--output', 
-        required=True, 
-        help='Output path for the PDF file'
-    )
-    parser.add_argument(
-        '--data', 
-        default=None,
-        help='JSON string with report data (use --data-file for large data)'
-    )
-    parser.add_argument(
-        '--data-file', 
-        default=None,
-        help='Path to JSON file with report data (preferred over --data)'
-    )
-    parser.add_argument(
-        '--data-stdin',
-        action='store_true',
-        help='Read JSON data from stdin (preferred method from n8n)'
-    )
-    parser.add_argument(
-        '--logo', 
-        default=None,
-        help='Optional path to logo image'
-    )
-    
-    args = parser.parse_args()
-    
-    # Load data from stdin, file, or string
-    if args.data_stdin:
-        try:
-            stdin_data = sys.stdin.read()
-            data = json.loads(stdin_data)
-        except Exception as e:
-            print(json.dumps({
-                'success': False,
-                'error': f'Error reading from stdin: {str(e)}'
-            }))
-            sys.exit(1)
-    elif args.data_file:
-        try:
-            with open(args.data_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception as e:
-            print(json.dumps({
-                'success': False,
-                'error': f'Error reading data file: {str(e)}'
-            }))
-            sys.exit(1)
-    elif args.data:
-        try:
-            data = json.loads(args.data)
-        except Exception as e:
-            print(json.dumps({
-                'success': False,
-                'error': f'Error parsing JSON data: {str(e)}'
-            }))
-            sys.exit(1)
-    else:
-        print(json.dumps({
-            'success': False,
-            'error': 'Either --data, --data-file, or --data-stdin is required'
-        }))
-        sys.exit(1)
-    
-    # Ensure job_id is in data
-    if 'job_id' not in data:
-        data['job_id'] = args.job_id
-    
-    # Generate report
     try:
-        output_path = generate_report(data, args.output, args.logo)
-        print(json.dumps({
+        generator = MuOrbitaPDFGenerator(data)
+        pdf_bytes = generator.generate()
+        
+        # Codificar en base64
+        pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
+        
+        # Generar nombre de archivo
+        job_id = data.get('job_id', 'UNKNOWN')
+        filename = f"Informe_MUORBITA_{job_id}.pdf"
+        
+        return {
             'success': True,
-            'output_path': output_path,
-            'job_id': args.job_id
-        }))
+            'pdf_base64': pdf_base64,
+            'filename': filename,
+            'pdf_size': len(pdf_bytes),
+            'job_id': job_id,
+            'generated_at': datetime.now().isoformat()
+        }
+        
     except Exception as e:
-        print(json.dumps({
+        return {
             'success': False,
-            'error': str(e)
-        }))
-        sys.exit(1)
+            'error': str(e),
+            'job_id': data.get('job_id', 'UNKNOWN')
+        }
 
 
-if __name__ == '__main__':
-    main()
+# ============================================
+# TEST LOCAL
+# ============================================
+
+if __name__ == "__main__":
+    # Datos de prueba (simular datos reales)
+    test_data = {
+        "job_id": "MUORBITA_1765867180435_D49461765",
+        "client_name": "Nuria Canamaque",
+        "crop_type": "olivar",
+        "analysis_type": "BASELINE",
+        "start_date": "2025-06-16",
+        "end_date": "2025-12-16",
+        "area_hectares": 24.8,
+        "images_processed": 68,
+        "latest_image_date": "2025-12-06",
+        
+        "ndvi_mean": 0.30,
+        "ndvi_p10": 0.23,
+        "ndvi_p50": 0.28,
+        "ndvi_p90": 0.38,
+        "ndvi_stddev": 0.05,
+        "ndvi_zscore": -0.01,
+        
+        "ndwi_mean": -0.01,
+        "ndwi_p10": -0.05,
+        "ndwi_p90": 0.04,
+        
+        "evi_mean": 0.29,
+        "evi_p10": 0.25,
+        "evi_p90": 0.34,
+        
+        "ndci_mean": 0.11,
+        "savi_mean": 0.25,
+        
+        "stress_area_ha": 20.4,
+        "stress_area_pct": 82.3,
+        
+        "lst_mean_c": 32.6,
+        "lst_min_c": 25.0,
+        "lst_max_c": 40.0,
+        
+        "heterogeneity": 0.15,
+        
+        # Serie temporal de ejemplo
+        "time_series": [
+            {"date": "2025-06-20", "ndvi": 0.45, "ndwi": 0.15, "evi": 0.38},
+            {"date": "2025-07-05", "ndvi": 0.52, "ndwi": 0.18, "evi": 0.42},
+            {"date": "2025-07-20", "ndvi": 0.48, "ndwi": 0.12, "evi": 0.40},
+            {"date": "2025-08-05", "ndvi": 0.42, "ndwi": 0.08, "evi": 0.35},
+            {"date": "2025-08-20", "ndvi": 0.38, "ndwi": 0.05, "evi": 0.32},
+            {"date": "2025-09-05", "ndvi": 0.35, "ndwi": 0.02, "evi": 0.30},
+            {"date": "2025-09-20", "ndvi": 0.32, "ndwi": -0.01, "evi": 0.28},
+            {"date": "2025-10-05", "ndvi": 0.30, "ndwi": -0.02, "evi": 0.27},
+            {"date": "2025-10-20", "ndvi": 0.31, "ndwi": 0.00, "evi": 0.28},
+            {"date": "2025-11-05", "ndvi": 0.30, "ndwi": -0.01, "evi": 0.29},
+            {"date": "2025-12-06", "ndvi": 0.30, "ndwi": -0.01, "evi": 0.29},
+        ],
+        
+        "markdown_analysis": ""  # Vacío para usar análisis automático
+    }
+    
+    result = generate_muorbita_report(test_data)
+    
+    if result['success']:
+        # Guardar PDF de prueba
+        with open(f"/tmp/{result['filename']}", 'wb') as f:
+            f.write(base64.b64decode(result['pdf_base64']))
+        print(f"✅ PDF generado: {result['filename']} ({result['pdf_size']} bytes)")
+    else:
+        print(f"❌ Error: {result['error']}")
