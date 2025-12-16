@@ -332,8 +332,9 @@ def execute_analysis(args):
             scale=20,
             maxPixels=1e9
         )).set('date', ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'))
+    )
 
-    # ⭐ NUEVO: Obtener series temporales como lista para el PDF
+    # Obtener series temporales como lista para el PDF
     time_series = []
     try:
         ts_list = ts_features.toList(500).getInfo()
@@ -351,7 +352,6 @@ def execute_analysis(args):
         print(f"Warning: Could not get time series: {e}")
         time_series = []
 
-    )
     
     task_ts = ee.batch.Export.table.toDrive(
         collection=ee.FeatureCollection(ts_features),
