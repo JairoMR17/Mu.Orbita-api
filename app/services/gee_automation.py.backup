@@ -332,25 +332,6 @@ def execute_analysis(args):
             scale=20,
             maxPixels=1e9
         )).set('date', ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'))
-
-    # ⭐ NUEVO: Obtener series temporales como lista para el PDF
-    time_series = []
-    try:
-        ts_list = ts_features.toList(500).getInfo()
-        for feature in ts_list:
-            props = feature.get('properties', {})
-            if props.get('date'):
-                time_series.append({
-                    'date': props.get('date', ''),
-                    'ndvi': round(props.get('NDVI', 0) or 0, 3),
-                    'ndwi': round(props.get('NDWI', 0) or 0, 3),
-                    'evi': round(props.get('EVI', 0) or 0, 3)
-                })
-        time_series.sort(key=lambda x: x['date'])
-    except Exception as e:
-        print(f"Warning: Could not get time series: {e}")
-        time_series = []
-
     )
     
     task_ts = ee.batch.Export.table.toDrive(
@@ -371,7 +352,6 @@ def execute_analysis(args):
         'tasks': tasks,
         'task_count': len(tasks),
         'drive_folder': drive_folder,
-        'time_series': time_series,
         'message': f'Analysis complete. {len(tasks)} export tasks started.'
     }
     
