@@ -1,6 +1,6 @@
 """
 Mu.Orbita PDF Report Generator v2.0
-=====================================
+====================================
 Generador profesional de informes PDF con:
 - Gráficos de series temporales
 - Mapas de calor (NDVI, NDWI)
