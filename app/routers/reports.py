@@ -89,7 +89,7 @@ async def generate_pdf(request: Request):
         # Validar con Pydantic
         pdf_request = PDFRequest(**data)
         
-        from app.services.generate_pdf_report import generate_report
+        from app.services.generate_pdf_report import generate_muorbita_report
         
         output_path = f"/tmp/Informe_{pdf_request.job_id}.pdf"
         
@@ -103,7 +103,7 @@ async def generate_pdf(request: Request):
             report_data['time_series'] = data['time_series']
         
         # Generar el PDF
-        generate_report(report_data, output_path)
+        result = generate_muorbita_report(report_data)
         
         # Leer y convertir a base64
         with open(output_path, 'rb') as f:
