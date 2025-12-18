@@ -1,15 +1,13 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import BaseModel
-from typing import Optional, Any
+from pydantic import BaseModel, Field
+from typing import Optional, Any, List, Dict
 import base64
 
 router = APIRouter(prefix="/api/v1", tags=["Reports"])
 
-
 class PDFRequest(BaseModel):
     """Modelo de datos para generación de informes PDF"""
-    
     # Identificación
     job_id: str
     client_name: Optional[str] = "Cliente"
@@ -23,7 +21,7 @@ class PDFRequest(BaseModel):
     images_processed: Optional[int] = 0
     latest_image_date: Optional[str] = ""
     
-    # NDVI (Índice de Vegetación)
+    # NDVI
     ndvi_mean: Optional[float] = 0
     ndvi_p10: Optional[float] = 0
     ndvi_p50: Optional[float] = 0
@@ -31,12 +29,12 @@ class PDFRequest(BaseModel):
     ndvi_stddev: Optional[float] = 0
     ndvi_zscore: Optional[float] = 0
     
-    # NDWI (Índice de Agua)
+    # NDWI
     ndwi_mean: Optional[float] = 0
     ndwi_p10: Optional[float] = 0
     ndwi_p90: Optional[float] = 0
     
-    # EVI (Índice de Vegetación Mejorado)
+    # EVI
     evi_mean: Optional[float] = 0
     evi_p10: Optional[float] = 0
     evi_p90: Optional[float] = 0
@@ -49,7 +47,7 @@ class PDFRequest(BaseModel):
     stress_area_ha: Optional[float] = 0
     stress_area_pct: Optional[float] = 0
     
-    # Temperatura (LST)
+    # Temperatura
     lst_mean_c: Optional[float] = 0
     lst_min_c: Optional[float] = 0
     lst_max_c: Optional[float] = 0
@@ -57,33 +55,57 @@ class PDFRequest(BaseModel):
     # Heterogeneidad
     heterogeneity: Optional[float] = 0
     
-    # Contenido del informe
+    # Contenido
     html_report: Optional[str] = ""
     markdown_analysis: Optional[str] = ""
     
-    # Series temporales (opcional)
-    timeseries: Optional[list] = None
+    # Series temporales - acepta ambos nombres
+    time_series: Optional[List[Dict]] = Field(default=None, alias="timeseries")
+    
+    class Config:
+        populate_by_name = True
 
 
 @router.post("/generate-pdf")
-async def generate_pdf(request: PDFRequest):
+async def generate_pdf(request: Request):
     """
-    Genera un informe PDF profesional a partir de los datos de análisis satelital.
-    
-    Retorna el PDF en base64 para que n8n pueda adjuntarlo a emails.
+    Genera un informe PDF profesional.
+    Acepta datos directamente o anidados en 'body'.
     """
     try:
+        # Obtener JSON del request
+        raw_data = await request.json()
+        
+        # Si los datos vienen anidados en 'body', extraerlos
+        if 'body' in raw_data and isinstance(raw_data['body'], dict):
+            data = raw_data['body']
+        else:
+            data = raw_data
+        
+        # Normalizar time_series/timeseries
+        if 'time_series' in data and 'timeseries' not in data:
+            data['timeseries'] = data['time_series']
+        
+        # Validar con Pydantic
+        pdf_request = PDFRequest(**data)
+        
         from app.services.generate_pdf_report import generate_report
         
-        output_path = f"/tmp/Informe_{request.job_id}.pdf"
+        output_path = f"/tmp/Informe_{pdf_request.job_id}.pdf"
         
-        # Convertir request a dict para el generador
-        data = request.dict()
+        # Convertir a dict para el generador
+        report_data = pdf_request.model_dump(by_alias=False)
+        
+        # Asegurar que time_series esté disponible
+        if pdf_request.time_series:
+            report_data['time_series'] = pdf_request.time_series
+        elif 'time_series' in data:
+            report_data['time_series'] = data['time_series']
         
         # Generar el PDF
-        generate_report(data, output_path)
+        generate_report(report_data, output_path)
         
-        # Leer el PDF y convertir a base64
+        # Leer y convertir a base64
         with open(output_path, 'rb') as f:
             pdf_bytes = f.read()
         
@@ -91,22 +113,21 @@ async def generate_pdf(request: PDFRequest):
         
         return {
             "success": True,
-            "job_id": request.job_id,
+            "job_id": pdf_request.job_id,
             "pdf_path": output_path,
             "pdf_base64": pdf_base64,
-            "filename": f"Informe_MUORBITA_{request.job_id}.pdf",
+            "filename": f"Informe_MUORBITA_{pdf_request.job_id}.pdf",
             "message": "PDF generado correctamente"
         }
         
     except Exception as e:
         import traceback
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=f"Error generando PDF: {str(e)}\n{traceback.format_exc()}"
         )
 
 
 @router.get("/health")
 async def health_check():
-    """Endpoint de health check para el servicio de reportes"""
     return {"status": "ok", "service": "reports"}
