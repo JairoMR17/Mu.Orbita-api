@@ -93,16 +93,16 @@ async def get_dashboard_summary(
             days_until_next = 0
     
     return DashboardSummary(
-    client_name=current_client.client_name,
-    total_parcels=total_parcels,
-    total_hectares=float(total_hectares),
-    total_reports=total_reports,
-    avg_ndvi=float(avg_ndvi) if avg_ndvi else None,
-    ndvi_trend="stable",
-    last_analysis_date=last_analysis_date,  # ✅ Usa la variable que calculamos arriba
-    days_until_next_report=days_until_next,
-    alerts_count=alerts_count
-)
+        client_name=current_client.client_name,
+        total_parcels=total_parcels,
+        total_hectares=float(total_hectares),
+        total_reports=total_reports,
+        avg_ndvi=float(avg_ndvi) if avg_ndvi else None,
+        ndvi_trend="stable",  # TODO: calcular tendencia real
+        last_analysis_date=last_job.completed_at if last_job else None,
+        days_until_next_report=days_until_next,
+        alerts_count=alerts_count
+    )
 
 
 # ============================================================================
