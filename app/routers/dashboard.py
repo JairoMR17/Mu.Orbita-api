@@ -59,8 +59,8 @@ async def get_dashboard_summary(
         Job.status == "completed"
     ).order_by(desc(Job.completed_at)).first()
     
-    # NDVI promedio últimos 30 días
-    thirty_days_ago = date.today() - timedelta(days=30)
+    # NDVI promedio últimos 90 días
+    ninety_days_ago = date.today() - timedelta(days=90)
     parcel_ids = db.query(Parcel.id).filter(
         Parcel.client_id == current_client.id,
         Parcel.is_active == True
@@ -71,7 +71,7 @@ async def get_dashboard_summary(
     if parcel_ids:
         avg_ndvi = db.query(func.avg(Kpi.ndvi_mean)).filter(
             Kpi.parcel_id.in_(parcel_ids),
-            Kpi.observation_date >= thirty_days_ago
+            Kpi.observation_date >= ninety_days_ago
         ).scalar()
     
     # Contar alertas (parcelas con estrés)
