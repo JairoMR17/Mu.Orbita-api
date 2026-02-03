@@ -300,6 +300,30 @@ async def get_me(
     return current_client
 
 
+@router.put("/me", response_model=ClientResponse)
+async def update_profile(
+    request: dict,
+    current_client: Client = Depends(get_current_client),
+    db: Session = Depends(get_db)
+):
+    """
+    Actualiza datos del perfil del cliente autenticado.
+    Campos permitidos: client_name, company, phone
+    """
+    # Campos permitidos para actualizar
+    allowed_fields = ['client_name', 'company', 'phone']
+    
+    for field in allowed_fields:
+        if field in request and request[field] is not None:
+            setattr(current_client, field, request[field])
+    
+    current_client.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(current_client)
+    
+    return current_client
+
+
 @router.post("/change-password", response_model=MessageResponse)
 async def change_password(
     request: PasswordChangeRequest,
