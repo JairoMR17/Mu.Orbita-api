@@ -276,8 +276,8 @@ class ReportResponse(BaseModel):
     period_end: Optional[date] = None
     generated_at: datetime
     sent_at: Optional[datetime] = None
-    ndvi_current: Optional[str] = None
-    ndvi_change: Optional[str] = None
+    ndvi_current: Optional[float] = None  # ← Cambiar str → float
+    ndvi_change: Optional[float] = None   # ← Cambiar str → float
     main_findings: Optional[List[str]] = None
     priority_actions: Optional[List[str]] = None
     
