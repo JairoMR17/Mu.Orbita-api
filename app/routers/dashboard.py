@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
 from typing import List, Optional
 from datetime import date, datetime, timedelta
+from app.models.gee_image import GEEImage
 import httpx
 
 from app.database import get_db
@@ -580,3 +581,139 @@ async def get_alerts(
             ))
     
     return alerts
+
+
+# ============================================================================
+# MAP DATA - Datos para capas satelitales (AÑADIR AL FINAL DE dashboard.py)
+# ============================================================================
+
+from app.models.gee_image import GEEImage
+
+@router.get("/parcels/{parcel_id}/map-data")
+async def get_parcel_map_data(
+    parcel_id: str,
+    current_client: Client = Depends(get_current_active_client),
+    db: Session = Depends(get_db)
+):
+    """
+    Obtiene datos completos para renderizar el mapa con capas satelitales.
+    Incluye: geometría, bounds, KPIs, y URLs de imágenes PNG.
+    """
+    # Verificar parcela
+    parcel = db.query(Parcel).filter(
+        Parcel.id == parcel_id,
+        Parcel.client_id == current_client.id
+    ).first()
+    
+    if not parcel:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Parcela no encontrada"
+        )
+    
+    # Obtener último job completado para esta parcela
+    last_job = db.query(Job).filter(
+        Job.client_id == current_client.id,
+        Job.status == "completed"
+    ).order_by(desc(Job.completed_at)).first()
+    
+    # Calcular bounds del ROI
+    bounds = None
+    if parcel.roi_geojson and "coordinates" in parcel.roi_geojson:
+        coords = parcel.roi_geojson["coordinates"][0]
+        if coords:
+            lats = [c[1] for c in coords]
+            lons = [c[0] for c in coords]
+            bounds = {
+                "south": min(lats),
+                "west": min(lons),
+                "north": max(lats),
+                "east": max(lons)
+            }
+    
+    # Obtener último KPI
+    latest_kpi = db.query(Kpi).filter(
+        Kpi.parcel_id == parcel.id
+    ).order_by(desc(Kpi.observation_date)).first()
+    
+    # Obtener URLs de imágenes si hay job
+    images = {}
+    job_id = None
+    if last_job:
+        job_id = last_job.job_id
+        
+        # Buscar imágenes registradas para este job
+        gee_images = db.query(GEEImage).filter(
+            GEEImage.job_id == job_id,
+            GEEImage.gdrive_folder == "WEB"
+        ).all()
+        
+        for img in gee_images:
+            images[img.index_type] = f"/api/images/{job_id}/{img.filename}"
+    
+    # Construir respuesta
+    return {
+        "parcel_id": parcel_id,
+        "parcel_name": parcel.parcel_name,
+        "job_id": job_id,
+        
+        "farm": {
+            "type": "Feature",
+            "geometry": parcel.roi_geojson,
+            "properties": {
+                "name": parcel.parcel_name,
+                "hectareas": float(parcel.hectares) if parcel.hectares else None,
+                "tipo_cultivo": parcel.crop_type,
+                "ubicacion": parcel.location_name or parcel.municipality
+            }
+        },
+        
+        "bounds": bounds,
+        
+        "kpis": {
+            "ndvi_mean": float(latest_kpi.ndvi_mean) if latest_kpi and latest_kpi.ndvi_mean else None,
+            "ndvi_p10": float(latest_kpi.ndvi_p10) if latest_kpi and latest_kpi.ndvi_p10 else None,
+            "ndvi_p90": float(latest_kpi.ndvi_p90) if latest_kpi and latest_kpi.ndvi_p90 else None,
+            "ndwi_mean": float(latest_kpi.ndwi_mean) if latest_kpi and latest_kpi.ndwi_mean else None,
+            "stress_area_pct": float(latest_kpi.stress_area_pct) if latest_kpi and latest_kpi.stress_area_pct else None,
+            "observation_date": latest_kpi.observation_date.isoformat() if latest_kpi and latest_kpi.observation_date else None,
+            # Bounds también en kpis para compatibilidad con frontend
+            "bounds_south": bounds["south"] if bounds else None,
+            "bounds_west": bounds["west"] if bounds else None,
+            "bounds_north": bounds["north"] if bounds else None,
+            "bounds_east": bounds["east"] if bounds else None,
+        } if latest_kpi or bounds else None,
+        
+        "images": images if images else None,
+        
+        "has_satellite_layers": len(images) > 0
+    }
+
+
+@router.get("/map-data")
+async def get_client_map_data(
+    current_client: Client = Depends(get_current_active_client),
+    db: Session = Depends(get_db)
+):
+    """
+    Obtiene datos del mapa para la primera parcela activa del cliente.
+    Útil para el dashboard principal.
+    """
+    # Obtener primera parcela activa
+    parcel = db.query(Parcel).filter(
+        Parcel.client_id == current_client.id,
+        Parcel.is_active == True
+    ).first()
+    
+    if not parcel:
+        return {
+            "error": "No hay parcelas activas",
+            "has_satellite_layers": False
+        }
+    
+    # Reutilizar el endpoint de parcela específica
+    return await get_parcel_map_data(
+        parcel_id=str(parcel.id),
+        current_client=current_client,
+        db=db
+    )
