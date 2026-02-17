@@ -466,7 +466,66 @@ async def download_report(
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url=report.pdf_url)
 
+# ============================================================================
+# REPORTS - Guardar Link en BD (llamado desde n8n)
+# ============================================================================
 
+from pydantic import BaseModel
+
+class ReportLinkCreate(BaseModel):
+    job_id_string: str
+    client_email: str
+    report_type: str = "baseline"
+    pdf_url: Optional[str] = None
+    pdf_drive_id: Optional[str] = None
+
+
+@router.post("/reports")
+async def create_report_link(
+    data: ReportLinkCreate,
+    db: Session = Depends(get_db)
+):
+    """
+    Crea registro de reporte con link de Google Drive (llamado desde n8n)
+    """
+    # Buscar job por job_id string
+    job = db.query(Job).filter(Job.job_id == data.job_id_string).first()
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job no encontrado: {data.job_id_string}"
+        )
+    
+    # Buscar client por email
+    client = db.query(Client).filter(Client.email == data.client_email).first()
+    if not client:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Cliente no encontrado: {data.client_email}"
+        )
+    
+    # Crear registro en reports
+    new_report = Report(
+        job_id=job.id,
+        client_id=client.id,
+        report_type=data.report_type,
+        pdf_url=data.pdf_url,
+        status="completed"
+    )
+    
+    db.add(new_report)
+    db.commit()
+    db.refresh(new_report)
+    
+    return {
+        "success": True,
+        "report_id": str(new_report.id),
+        "pdf_url": data.pdf_url
+    }
+
+# ============================================================================
+# ALERTS
+# ============================================================================
 # ============================================================================
 # ALERTS
 # ============================================================================
