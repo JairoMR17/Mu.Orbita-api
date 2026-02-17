@@ -11,7 +11,7 @@ import time
 
 from app.config import settings
 from app.database import check_db_connection
-from app.routers import auth_router, dashboard_router, webhooks_router, gee_router, reports_router
+from app.routers import auth_router, dashboard_router, webhooks_router, gee_router, reports_router, images_router
 
 
 @asynccontextmanager
@@ -111,6 +111,7 @@ async def health_check():
 app.include_router(auth_router, prefix=f"/api/{settings.api_version}")
 app.include_router(dashboard_router, prefix=f"/api/{settings.api_version}")
 app.include_router(webhooks_router, prefix=f"/api/{settings.api_version}")
+app.include_router(images_router)
 
 
 # Para desarrollo local
