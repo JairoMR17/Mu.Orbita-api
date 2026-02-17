@@ -480,7 +480,7 @@ class ReportLinkCreate(BaseModel):
     pdf_drive_id: Optional[str] = None
 
 
-@router.post("/reports")
+@router.post("/reports/register")
 async def create_report_link(
     data: ReportLinkCreate,
     db: Session = Depends(get_db)
@@ -523,9 +523,6 @@ async def create_report_link(
         "pdf_url": data.pdf_url
     }
 
-# ============================================================================
-# ALERTS
-# ============================================================================
 # ============================================================================
 # ALERTS
 # ============================================================================
