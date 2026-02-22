@@ -14,22 +14,6 @@ from app.config import settings
 from app.database import check_db_connection
 from app.routers import auth_router, dashboard_router, webhooks_router, gee_router, reports_router, images_router
 
-@app.post("/api/v1/generate-pngs")
-async def generate_pngs_endpoint(request: Request):
-    """Genera las 7 imágenes PNG para el dashboard."""
-    try:
-        data = await request.json()
-        result = generate_dashboard_pngs(data)
-        
-        if result['success']:
-            return JSONResponse(content=result)
-        else:
-            return JSONResponse(content=result, status_code=500)
-    except Exception as e:
-        return JSONResponse(
-            content={"success": False, "error": str(e)},
-            status_code=500
-        )
 
 @app.post("/api/v1/images/register")
 async def register_image(request: Request):
