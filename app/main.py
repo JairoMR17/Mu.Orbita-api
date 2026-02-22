@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import time
-from services.muorbita_png_generator import generate_dashboard_pngs
+
 
 from app.config import settings
 from app.database import check_db_connection
