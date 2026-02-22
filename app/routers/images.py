@@ -3,17 +3,26 @@ MU.ORBITA - Router de Imágenes Satelitales
 Redirige peticiones de imágenes a Google Drive
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from sqlalchemy.orm import Session
 from typing import Optional
 import re
+from app.services.muorbita_png_generator import generate_dashboard_pngs
 
 from app.database import get_db
 from app.models.gee_image import GEEImage
 
 router = APIRouter(prefix="/api/images", tags=["Satellite Images"])
 
+@router.post("/generate-pngs")
+async def generate_pngs_endpoint(request: Request):
+    """Genera las 7 imágenes PNG para el dashboard."""
+    data = await request.json()
+    result = generate_dashboard_pngs(data)
+    if result['success']:
+        return JSONResponse(content=result)
+    return JSONResponse(content=result, status_code=500)
 
 def extract_gdrive_id(url: str) -> Optional[str]:
     """Extrae el file ID de una URL de Google Drive"""
