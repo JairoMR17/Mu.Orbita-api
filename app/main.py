@@ -9,64 +9,11 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import time
 
-
 from app.config import settings
 from app.database import check_db_connection
 from app.routers import auth_router, dashboard_router, webhooks_router, gee_router, reports_router, images_router
 
 
-@app.post("/api/v1/images/register")
-async def register_image(request: Request):
-    """Registra un PNG del dashboard en la base de datos."""
-    try:
-        data = await request.json()
-        
-        query = """
-            INSERT INTO job_images 
-                (job_id, image_name, image_type, drive_file_id, 
-                 drive_url, drive_download_url, filename, size, uploaded_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING id
-        """
-        result = await db.execute(query, 
-            data['job_id'], data['image_name'], data['image_type'],
-            data['drive_file_id'], data['drive_url'], data['drive_download_url'],
-            data['filename'], data.get('size', 0), 
-            data.get('uploaded_at', datetime.now().isoformat())
-        )
-        
-        return {"success": True, "image_id": result}
-    except Exception as e:
-        return JSONResponse(
-            content={"success": False, "error": str(e)}, 
-            status_code=500
-        )
-
-@app.get("/api/v1/images/{job_id}")
-async def get_job_images(job_id: str):
-    """Devuelve todos los PNGs de un job para el dashboard."""
-    try:
-        query = """
-            SELECT image_name, image_type, drive_url, 
-                   drive_download_url, filename, size
-            FROM job_images 
-            WHERE job_id = $1 
-            ORDER BY image_name
-        """
-        rows = await db.fetch_all(query, job_id)
-        
-        return {
-            "success": True,
-            "job_id": job_id,
-            "images": [dict(r) for r in rows],
-            "count": len(rows)
-        }
-    except Exception as e:
-        return JSONResponse(
-            content={"success": False, "error": str(e)}, 
-            status_code=500
-        )
-        
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -165,6 +112,8 @@ app.include_router(auth_router, prefix=f"/api/{settings.api_version}")
 app.include_router(dashboard_router, prefix=f"/api/{settings.api_version}")
 app.include_router(webhooks_router, prefix=f"/api/{settings.api_version}")
 app.include_router(images_router)
+app.include_router(gee_router)
+app.include_router(reports_router)
 
 
 # Para desarrollo local
@@ -176,5 +125,3 @@ if __name__ == "__main__":
         port=settings.port,
         reload=settings.debug
     )
-app.include_router(gee_router)
-app.include_router(reports_router)
