@@ -1,6 +1,7 @@
 """
 Mu.Orbita API - Webhooks Router
 Endpoints para recibir datos de n8n
+VERSIÓN 3.2 - Con soporte para contexto fenológico
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, Header
@@ -123,15 +124,47 @@ async def webhook_job_started(
     return MessageResponse(message=f"Job {job_id} registrado")
 
 
+# ============================================================
+# MODELO ACTUALIZADO PARA JOB-COMPLETED CON CAMPOS FENOLÓGICOS
+# ============================================================
+
+class WebhookJobCompletedV2(BaseModel):
+    """
+    Payload para webhook job-completed v3.2 con campos fenológicos.
+    """
+    job_id: str
+    status: str
+    pdf_url: Optional[str] = None
+    google_drive_folder_id: Optional[str] = None
+    error_message: Optional[str] = None
+    
+    # KPIs básicos
+    ndvi_mean: Optional[float] = None
+    ndvi_p10: Optional[float] = None
+    ndvi_p90: Optional[float] = None
+    ndwi_mean: Optional[float] = None
+    stress_area_ha: Optional[float] = None
+    stress_area_pct: Optional[float] = None
+    
+    # === NUEVOS CAMPOS FENOLÓGICOS (v3.2) ===
+    doy: Optional[int] = None  # Día del año
+    pheno_phase: Optional[str] = None  # Fase fenológica actual
+    pheno_status: Optional[str] = None  # adelantado/normal/retrasado/critico/sin_datos
+    ndvi_expected: Optional[float] = None  # NDVI esperado según curva
+    ndvi_deviation_pct: Optional[float] = None  # % desviación vs esperado
+    ndvi_zscore_seasonal: Optional[float] = None  # Z-score vs mismo período histórico
+
+
 @router.post("/job-completed", response_model=MessageResponse)
 async def webhook_job_completed(
-    payload: WebhookJobCompleted,
+    payload: WebhookJobCompletedV2,
     db: Session = Depends(get_db),
     _: bool = Depends(verify_webhook)
 ):
     """
     n8n notifica que un job ha terminado.
-    Actualiza el job con los resultados, o lo crea si no existe.
+    Actualiza el job con los resultados, incluyendo contexto fenológico.
+    VERSIÓN 3.2
     """
     job = db.query(Job).filter(Job.job_id == payload.job_id).first()
     
@@ -146,7 +179,7 @@ async def webhook_job_completed(
         db.commit()
         db.refresh(job)
     
-    # Actualizar job
+    # Actualizar campos básicos
     job.status = payload.status
     job.completed_at = datetime.utcnow() if payload.status == "completed" else None
     
@@ -157,6 +190,7 @@ async def webhook_job_completed(
     if payload.error_message:
         job.error_message = payload.error_message
     
+    # KPIs básicos
     if payload.ndvi_mean is not None:
         job.ndvi_mean = payload.ndvi_mean
     if payload.ndvi_p10 is not None:
@@ -170,9 +204,32 @@ async def webhook_job_completed(
     if payload.stress_area_pct is not None:
         job.stress_area_pct = payload.stress_area_pct
     
+    # === NUEVOS CAMPOS FENOLÓGICOS (v3.2) ===
+    if payload.doy is not None:
+        job.doy = payload.doy
+    if payload.pheno_phase is not None:
+        job.pheno_phase = payload.pheno_phase
+    if payload.pheno_status is not None:
+        job.pheno_status = payload.pheno_status
+    if payload.ndvi_expected is not None:
+        job.ndvi_expected = payload.ndvi_expected
+    if payload.ndvi_deviation_pct is not None:
+        job.ndvi_deviation_pct = payload.ndvi_deviation_pct
+    if payload.ndvi_zscore_seasonal is not None:
+        job.ndvi_zscore_seasonal = payload.ndvi_zscore_seasonal
+    
     db.commit()
     
-    return MessageResponse(message=f"Job {payload.job_id} actualizado a {payload.status}")
+    # Mensaje con info fenológica si está disponible
+    pheno_info = ""
+    if payload.pheno_status:
+        pheno_info = f" | Fenología: {payload.pheno_status}"
+        if payload.pheno_phase:
+            pheno_info += f" ({payload.pheno_phase})"
+    
+    return MessageResponse(
+        message=f"Job {payload.job_id} actualizado a {payload.status}{pheno_info}"
+    )
 
 
 @router.post("/kpis", response_model=MessageResponse)
@@ -335,4 +392,9 @@ async def webhook_health(_: bool = Depends(verify_webhook)):
     """
     Health check para verificar que el webhook está funcionando
     """
-    return {"status": "ok", "service": "muorbita-webhooks"}
+    return {
+        "status": "ok", 
+        "service": "muorbita-webhooks",
+        "version": "3.2",
+        "phenology_support": True
+    }
