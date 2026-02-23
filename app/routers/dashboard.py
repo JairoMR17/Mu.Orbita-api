@@ -4,16 +4,17 @@ Endpoints para el dashboard del cliente
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
 from typing import List, Optional
 from datetime import date, datetime, timedelta
-from app.models.gee_image import GEEImage
-import httpx
+from pydantic import BaseModel
+import json
 
 from app.database import get_db
 from app.models import Client, Parcel, Job, Kpi, Report
+from app.models.gee_image import GEEImage
 from app.schemas import (
     DashboardSummary, DashboardAlert,
     ParcelResponse, ParcelWithLatestKpi, ParcelCreate, ParcelUpdate,
@@ -23,6 +24,74 @@ from app.schemas import (
 from app.dependencies import get_current_client, get_current_active_client
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+
+# ============================================================================
+# HELPER: Parsear GeoJSON (puede venir como string o dict)
+# ============================================================================
+
+def parse_geojson(roi_geojson):
+    """Parsea GeoJSON que puede estar como string o dict, con múltiples niveles de encoding"""
+    if roi_geojson is None:
+        return None
+    
+    parsed = roi_geojson
+    
+    # Parsear mientras sea string (puede haber doble encoding)
+    while isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError:
+            return None
+    
+    return parsed
+
+
+def extract_geometry(geojson):
+    """Extrae la geometría de un GeoJSON (Feature, FeatureCollection, o Geometry directa)"""
+    if geojson is None:
+        return None
+    
+    if geojson.get("type") == "Feature":
+        return geojson.get("geometry")
+    elif geojson.get("type") == "FeatureCollection":
+        features = geojson.get("features", [])
+        if features:
+            return features[0].get("geometry")
+    elif geojson.get("type") in ["Polygon", "MultiPolygon"]:
+        return geojson
+    
+    return None
+
+
+def calculate_bounds(geometry):
+    """Calcula bounds de una geometría"""
+    if geometry is None:
+        return None
+    
+    coords = []
+    geom_type = geometry.get("type")
+    
+    if geom_type == "Polygon":
+        coords = geometry.get("coordinates", [[]])[0]
+    elif geom_type == "MultiPolygon":
+        # Flatten all coordinates from all polygons
+        for polygon in geometry.get("coordinates", []):
+            if polygon:
+                coords.extend(polygon[0])
+    
+    if not coords:
+        return None
+    
+    lngs = [c[0] for c in coords]
+    lats = [c[1] for c in coords]
+    
+    return {
+        "south": min(lats),
+        "west": min(lngs),
+        "north": max(lats),
+        "east": max(lngs)
+    }
 
 
 # ============================================================================
@@ -69,8 +138,20 @@ async def get_dashboard_summary(
     parcel_ids = [p[0] for p in parcel_ids]
     
     avg_ndvi = None
+    avg_ndwi = None
+    stress_area_pct = None
     if parcel_ids:
         avg_ndvi = db.query(func.avg(Kpi.ndvi_mean)).filter(
+            Kpi.parcel_id.in_(parcel_ids),
+            Kpi.observation_date >= ninety_days_ago
+        ).scalar()
+        
+        avg_ndwi = db.query(func.avg(Kpi.ndwi_mean)).filter(
+            Kpi.parcel_id.in_(parcel_ids),
+            Kpi.observation_date >= ninety_days_ago
+        ).scalar()
+        
+        stress_area_pct = db.query(func.avg(Kpi.stress_area_pct)).filter(
             Kpi.parcel_id.in_(parcel_ids),
             Kpi.observation_date >= ninety_days_ago
         ).scalar()
@@ -93,16 +174,35 @@ async def get_dashboard_summary(
         if days_until_next < 0:
             days_until_next = 0
     
+    # Obtener datos fenológicos del último job si existen
+    pheno_phase = None
+    pheno_status = None
+    ndvi_expected = None
+    ndvi_deviation_pct = None
+    
+    if last_job:
+        pheno_phase = getattr(last_job, 'pheno_phase', None)
+        pheno_status = getattr(last_job, 'pheno_status', None)
+        ndvi_expected = getattr(last_job, 'ndvi_expected', None)
+        ndvi_deviation_pct = getattr(last_job, 'ndvi_deviation_pct', None)
+    
     return DashboardSummary(
         client_name=current_client.client_name,
         total_parcels=total_parcels,
         total_hectares=float(total_hectares),
         total_reports=total_reports,
         avg_ndvi=float(avg_ndvi) if avg_ndvi else None,
+        avg_ndwi=float(avg_ndwi) if avg_ndwi else None,
+        stress_area_pct=float(stress_area_pct) if stress_area_pct else None,
         ndvi_trend="stable",  # TODO: calcular tendencia real
         last_analysis_date=last_job.completed_at if last_job else None,
         days_until_next_report=days_until_next,
-        alerts_count=alerts_count
+        alerts_count=alerts_count,
+        # Campos fenológicos
+        pheno_phase=pheno_phase,
+        pheno_status=pheno_status,
+        ndvi_expected=float(ndvi_expected) if ndvi_expected else None,
+        ndvi_deviation_pct=float(ndvi_deviation_pct) if ndvi_deviation_pct else None
     )
 
 
@@ -167,17 +267,21 @@ async def create_parcel(
     """
     Crea una nueva parcela para el cliente
     """
-    # Calcular centroide del polígono (simplificado)
+    # Calcular centroide del polígono
     centroid_lat = None
     centroid_lon = None
     
-    if parcel.roi_geojson and "coordinates" in parcel.roi_geojson:
-        coords = parcel.roi_geojson["coordinates"][0]  # Primer anillo del polígono
-        if coords:
-            lats = [c[1] for c in coords]
-            lons = [c[0] for c in coords]
-            centroid_lat = sum(lats) / len(lats)
-            centroid_lon = sum(lons) / len(lons)
+    if parcel.roi_geojson:
+        parsed = parse_geojson(parcel.roi_geojson)
+        geometry = extract_geometry(parsed)
+        
+        if geometry and geometry.get("coordinates"):
+            coords = geometry["coordinates"][0] if geometry["type"] == "Polygon" else geometry["coordinates"][0][0]
+            if coords:
+                lats = [c[1] for c in coords]
+                lons = [c[0] for c in coords]
+                centroid_lat = sum(lats) / len(lats)
+                centroid_lon = sum(lons) / len(lons)
     
     new_parcel = Parcel(
         client_id=current_client.id,
@@ -461,17 +565,13 @@ async def download_report(
             detail="PDF no disponible"
         )
     
-    # Si es URL de Google Drive, redirigir
-    # Si es archivo local, servir directamente
-    # Por ahora, redirigimos a la URL del PDF
-    from fastapi.responses import RedirectResponse
+    # Redirigir a la URL del PDF (Google Drive u otro storage)
     return RedirectResponse(url=report.pdf_url)
+
 
 # ============================================================================
 # REPORTS - Guardar Link en BD (llamado desde n8n)
 # ============================================================================
-
-from pydantic import BaseModel
 
 class ReportLinkCreate(BaseModel):
     job_id_string: str
@@ -523,6 +623,7 @@ async def create_report_link(
         "report_id": str(new_report.id),
         "pdf_url": data.pdf_url
     }
+
 
 # ============================================================================
 # ALERTS
@@ -584,10 +685,8 @@ async def get_alerts(
 
 
 # ============================================================================
-# MAP DATA - Datos para capas satelitales (AÑADIR AL FINAL DE dashboard.py)
+# MAP DATA - Datos para capas satelitales
 # ============================================================================
-
-from app.models.gee_image import GEEImage
 
 @router.get("/parcels/{parcel_id}/map-data")
 async def get_parcel_map_data(
@@ -617,19 +716,10 @@ async def get_parcel_map_data(
         Job.status == "completed"
     ).order_by(desc(Job.completed_at)).first()
     
-    # Calcular bounds del ROI
-    bounds = None
-    if parcel.roi_geojson and "coordinates" in parcel.roi_geojson:
-        coords = parcel.roi_geojson["coordinates"][0]
-        if coords:
-            lats = [c[1] for c in coords]
-            lons = [c[0] for c in coords]
-            bounds = {
-                "south": min(lats),
-                "west": min(lons),
-                "north": max(lats),
-                "east": max(lons)
-            }
+    # Parsear ROI y calcular bounds
+    parsed_roi = parse_geojson(parcel.roi_geojson)
+    geometry = extract_geometry(parsed_roi)
+    bounds = calculate_bounds(geometry)
     
     # Obtener último KPI
     latest_kpi = db.query(Kpi).filter(
@@ -643,13 +733,17 @@ async def get_parcel_map_data(
         job_id = last_job.job_id
         
         # Buscar imágenes registradas para este job
-        gee_images = db.query(GEEImage).filter(
-            GEEImage.job_id == job_id,
-            GEEImage.gdrive_folder == "WEB"
-        ).all()
-        
-        for img in gee_images:
-            images[img.index_type] = f"/api/images/{job_id}/{img.filename}"
+        try:
+            gee_images = db.query(GEEImage).filter(
+                GEEImage.job_id == job_id,
+                GEEImage.gdrive_folder == "WEB"
+            ).all()
+            
+            for img in gee_images:
+                images[img.index_type] = f"/api/v1/images/{job_id}/{img.filename}"
+        except Exception as e:
+            # Si la tabla GEEImage no existe o hay error, continuar sin imágenes
+            print(f"Warning: Could not fetch GEE images: {e}")
     
     # Construir respuesta
     return {
@@ -659,14 +753,14 @@ async def get_parcel_map_data(
         
         "farm": {
             "type": "Feature",
-            "geometry": parcel.roi_geojson,
+            "geometry": geometry,
             "properties": {
                 "name": parcel.parcel_name,
                 "hectareas": float(parcel.hectares) if parcel.hectares else None,
                 "tipo_cultivo": parcel.crop_type,
                 "ubicacion": parcel.location_name or parcel.municipality
             }
-        },
+        } if geometry else None,
         
         "bounds": bounds,
         
@@ -677,7 +771,6 @@ async def get_parcel_map_data(
             "ndwi_mean": float(latest_kpi.ndwi_mean) if latest_kpi and latest_kpi.ndwi_mean else None,
             "stress_area_pct": float(latest_kpi.stress_area_pct) if latest_kpi and latest_kpi.stress_area_pct else None,
             "observation_date": latest_kpi.observation_date.isoformat() if latest_kpi and latest_kpi.observation_date else None,
-            # Bounds también en kpis para compatibilidad con frontend
             "bounds_south": bounds["south"] if bounds else None,
             "bounds_west": bounds["west"] if bounds else None,
             "bounds_north": bounds["north"] if bounds else None,
@@ -708,6 +801,8 @@ async def get_client_map_data(
     if not parcel:
         return {
             "error": "No hay parcelas activas",
+            "bounds": None,
+            "images": None,
             "has_satellite_layers": False
         }
     
