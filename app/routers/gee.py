@@ -10,7 +10,7 @@ from typing import Optional
 import json
 from types import SimpleNamespace
 
-router = APIRouter(prefix="/api/v1/gee", tags=["GEE"])
+router = APIRouter(prefix="/gee", tags=["GEE"])
 
 
 class GEERequest(BaseModel):
@@ -36,6 +36,9 @@ def normalize_crop_type(crop_type: str) -> str:
     Returns:
         Tipo normalizado: 'olivo', 'vina', 'almendro', o 'otro'
     """
+    if not crop_type:
+        return 'otro'
+    
     crop_map = {
         # Olivo
         'olivo': 'olivo',
@@ -56,9 +59,13 @@ def normalize_crop_type(crop_type: str) -> str:
         'almendra': 'almendro',
         'almendral': 'almendro',
         'almond': 'almendro',
+        
+        # Otros
+        'other': 'otro',
+        'otro': 'otro',
     }
     
-    normalized = crop_type.lower().strip() if crop_type else 'otro'
+    normalized = crop_type.lower().strip()
     return crop_map.get(normalized, 'otro')
 
 
@@ -75,15 +82,52 @@ async def execute_gee(request: GEERequest):
     - generate-script: Solo genera el script (para debug)
     """
     try:
-        from app.services.gee_automation import (
-            execute_analysis, 
-            check_status, 
-            download_results, 
-            start_tasks
-        )
-        
         # Normalizar tipo de cultivo para curvas fenológicas
         normalized_crop = normalize_crop_type(request.crop_type)
+        
+        # Modo generate-script (debug)
+        if request.mode == 'generate-script':
+            try:
+                from app.services.gee_script_generator import generate_gee_script
+                
+                script = generate_gee_script(
+                    job_id=request.job_id,
+                    roi_geojson=request.roi_geojson,
+                    crop_type=normalized_crop,
+                    start_date=request.start_date,
+                    end_date=request.end_date
+                )
+                
+                return {
+                    "success": True,
+                    "mode": "generate-script",
+                    "job_id": request.job_id,
+                    "crop_type_original": request.crop_type,
+                    "crop_type_normalized": normalized_crop,
+                    "phenology_enabled": normalized_crop in ['olivo', 'vina', 'almendro'],
+                    "script_length": len(script),
+                    "script_preview": script[:1000] + "..." if len(script) > 1000 else script,
+                    "message": "Script generated successfully (debug mode)"
+                }
+            except ImportError:
+                return {
+                    "success": False,
+                    "error": "gee_script_generator module not available"
+                }
+        
+        # Importar módulos GEE
+        try:
+            from app.services.gee_automation import (
+                execute_analysis, 
+                check_status, 
+                download_results, 
+                start_tasks
+            )
+        except ImportError as e:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"GEE automation module not available: {str(e)}"
+            )
         
         # Crear objeto args similar a argparse
         args = SimpleNamespace(
@@ -92,8 +136,8 @@ async def execute_gee(request: GEERequest):
             roi=json.dumps(request.roi_geojson) if request.roi_geojson else "{}",
             start_date=request.start_date,
             end_date=request.end_date,
-            crop=normalized_crop,  # Usar tipo normalizado
-            crop_type=normalized_crop,  # Alias para compatibilidad
+            crop=normalized_crop,
+            crop_type=normalized_crop,
             buffer=request.buffer_meters,
             analysis_type=request.analysis_type,
             output_dir=request.output_dir or f"/tmp/muorbita_{request.job_id}",
@@ -112,28 +156,6 @@ async def execute_gee(request: GEERequest):
         elif request.mode == 'start-tasks':
             result = start_tasks(args)
             
-        elif request.mode == 'generate-script':
-            # Modo debug: solo genera el script sin ejecutar
-            from app.services.gee_script_generator import generate_gee_script
-            
-            script = generate_gee_script(
-                job_id=request.job_id,
-                roi_geojson=request.roi_geojson,
-                crop_type=normalized_crop,
-                start_date=request.start_date,
-                end_date=request.end_date
-            )
-            
-            return {
-                "success": True,
-                "mode": "generate-script",
-                "job_id": request.job_id,
-                "crop_type_normalized": normalized_crop,
-                "script_length": len(script),
-                "script_preview": script[:500] + "...",
-                "message": "Script generated (debug mode)"
-            }
-            
         else:
             raise HTTPException(
                 status_code=400, 
@@ -151,16 +173,13 @@ async def execute_gee(request: GEERequest):
             }
         }
         
-    except ImportError as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Error importing GEE modules: {str(e)}"
-        )
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         raise HTTPException(
             status_code=500, 
-            detail=f"{str(e)}\n{traceback.format_exc()}"
+            detail=f"GEE execution error: {str(e)}\n{traceback.format_exc()}"
         )
 
 
@@ -176,26 +195,30 @@ async def get_crop_types():
                 "aliases": ["olivar", "oliva", "olive"],
                 "name_es": "Olivo",
                 "peak_ndvi_month": "Junio",
-                "peak_ndvi_value": 0.62
+                "peak_ndvi_value": 0.62,
+                "phases": ["Reposo invernal", "Brotación", "Floración", "Cuajado", "Envero", "Maduración", "Post-cosecha"]
             },
             {
                 "id": "vina",
                 "aliases": ["viña", "viñedo", "vid", "vineyard"],
                 "name_es": "Viña",
-                "peak_ndvi_month": "Junio",
-                "peak_ndvi_value": 0.58
+                "peak_ndvi_month": "Junio-Julio",
+                "peak_ndvi_value": 0.58,
+                "phases": ["Reposo invernal", "Lloro", "Brotación", "Floración", "Cuajado", "Envero", "Maduración", "Post-vendimia"]
             },
             {
                 "id": "almendro",
                 "aliases": ["almendra", "almendral", "almond"],
                 "name_es": "Almendro",
                 "peak_ndvi_month": "Junio",
-                "peak_ndvi_value": 0.65
+                "peak_ndvi_value": 0.65,
+                "phases": ["Reposo invernal", "Floración", "Cuajado", "Desarrollo fruto", "Maduración", "Post-cosecha"]
             }
         ],
         "fallback": {
             "id": "otro",
-            "description": "Para otros cultivos se usa z-score estacional sin curva fenológica específica"
+            "description": "Para otros cultivos se usa z-score estacional sin curva fenológica específica",
+            "method": "Comparación con histórico del mismo período (±15 días)"
         }
     }
 
@@ -205,24 +228,46 @@ async def gee_health():
     """
     Health check del servicio GEE.
     """
+    modules_status = {
+        "gee_automation": False,
+        "gee_script_generator": False,
+        "ee_initialized": False
+    }
+    
+    # Verificar módulos
     try:
-        # Intentar importar módulos necesarios
         from app.services.gee_automation import execute_analysis
+        modules_status["gee_automation"] = True
+    except ImportError:
+        pass
+    
+    try:
         from app.services.gee_script_generator import generate_gee_script
-        
-        return {
-            "status": "ok",
-            "service": "gee",
-            "version": "3.2",
-            "features": {
-                "phenological_curves": True,
-                "seasonal_zscore": True,
-                "supported_crops": ["olivo", "vina", "almendro"]
-            }
+        modules_status["gee_script_generator"] = True
+    except ImportError:
+        pass
+    
+    try:
+        import ee
+        # No inicializamos aquí, solo verificamos que está disponible
+        modules_status["ee_available"] = True
+    except ImportError:
+        modules_status["ee_available"] = False
+    
+    all_ok = all([
+        modules_status.get("gee_automation", False),
+        modules_status.get("ee_available", False)
+    ])
+    
+    return {
+        "status": "ok" if all_ok else "degraded",
+        "service": "gee",
+        "version": "3.2",
+        "modules": modules_status,
+        "features": {
+            "phenological_curves": True,
+            "seasonal_zscore": True,
+            "supported_crops": ["olivo", "vina", "almendro"],
+            "png_export": True
         }
-    except ImportError as e:
-        return {
-            "status": "degraded",
-            "service": "gee",
-            "error": str(e)
-        }
+    }
