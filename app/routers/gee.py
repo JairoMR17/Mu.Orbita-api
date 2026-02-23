@@ -1,7 +1,7 @@
 """
 Mu.Orbita API - GEE Router
 Endpoints para ejecutar análisis en Google Earth Engine
-VERSIÓN 3.2 - Con soporte para contexto fenológico
+VERSIÓN 4.1 - Con soporte para contexto fenológico + BIWEEKLY
 """
 
 from fastapi import APIRouter, HTTPException
@@ -21,7 +21,7 @@ class GEERequest(BaseModel):
     end_date: Optional[str] = ""
     crop_type: str = "olivar"
     buffer_meters: int = 0
-    analysis_type: str = "baseline"
+    analysis_type: str = "baseline"  # "baseline" o "biweekly"
     output_dir: Optional[str] = ""
     drive_folder: Optional[str] = "MuOrbita_Outputs"
 
@@ -29,40 +29,17 @@ class GEERequest(BaseModel):
 def normalize_crop_type(crop_type: str) -> str:
     """
     Normaliza el tipo de cultivo al formato esperado por GEE.
-    
-    Args:
-        crop_type: Tipo de cultivo del usuario (puede venir en varios formatos)
-    
-    Returns:
-        Tipo normalizado: 'olivo', 'vina', 'almendro', o 'otro'
     """
     if not crop_type:
         return 'otro'
     
     crop_map = {
-        # Olivo
-        'olivo': 'olivo',
-        'olivar': 'olivo',
-        'oliva': 'olivo',
-        'olive': 'olivo',
-        
-        # Viña
-        'viña': 'vina',
-        'vina': 'vina',
-        'viñedo': 'vina',
-        'vinedo': 'vina',
-        'vid': 'vina',
-        'vineyard': 'vina',
-        
-        # Almendro
-        'almendro': 'almendro',
-        'almendra': 'almendro',
-        'almendral': 'almendro',
+        'olivo': 'olivo', 'olivar': 'olivo', 'oliva': 'olivo', 'olive': 'olivo',
+        'viña': 'vina', 'vina': 'vina', 'viñedo': 'vina', 'vinedo': 'vina',
+        'vid': 'vina', 'vineyard': 'vina',
+        'almendro': 'almendro', 'almendra': 'almendro', 'almendral': 'almendro',
         'almond': 'almendro',
-        
-        # Otros
-        'other': 'otro',
-        'otro': 'otro',
+        'other': 'otro', 'otro': 'otro',
     }
     
     normalized = crop_type.lower().strip()
@@ -72,17 +49,21 @@ def normalize_crop_type(crop_type: str) -> str:
 @router.post("/execute")
 async def execute_gee(request: GEERequest):
     """
-    Ejecuta análisis GEE v3.2 con soporte para contexto fenológico.
+    Ejecuta análisis GEE v4.1 con soporte para baseline y biweekly.
     
     Modos disponibles:
-    - execute: Ejecuta el análisis completo
+    - execute: Ejecuta el análisis completo (baseline) o ligero (biweekly)
     - check-status: Verifica estado de tareas
     - download-results: Descarga resultados de Drive
     - start-tasks: Inicia tareas de exportación
     - generate-script: Solo genera el script (para debug)
+    
+    analysis_type:
+    - baseline: Análisis completo (~20 exports, VRA, todos los índices)
+    - biweekly: Seguimiento ligero (3 exports, weather ERA5, deltas)
     """
     try:
-        # Normalizar tipo de cultivo para curvas fenológicas
+        # Normalizar tipo de cultivo
         normalized_crop = normalize_crop_type(request.crop_type)
         
         # Modo generate-script (debug)
@@ -118,7 +99,8 @@ async def execute_gee(request: GEERequest):
         # Importar módulos GEE
         try:
             from app.services.gee_automation import (
-                execute_analysis, 
+                execute_analysis,
+                execute_biweekly_analysis,
                 check_status, 
                 download_results, 
                 start_tasks
@@ -129,7 +111,7 @@ async def execute_gee(request: GEERequest):
                 detail=f"GEE automation module not available: {str(e)}"
             )
         
-        # Crear objeto args similar a argparse
+        # Crear objeto args compatible con argparse
         args = SimpleNamespace(
             mode=request.mode,
             job_id=request.job_id,
@@ -141,11 +123,16 @@ async def execute_gee(request: GEERequest):
             buffer=request.buffer_meters,
             analysis_type=request.analysis_type,
             output_dir=request.output_dir or f"/tmp/muorbita_{request.job_id}",
-            drive_folder=request.drive_folder
+            drive_folder=request.drive_folder,
+            export_png=True
         )
         
         if request.mode == 'execute':
-            result = execute_analysis(args)
+            # ========== ROUTING: baseline vs biweekly ==========
+            if request.analysis_type == 'biweekly':
+                result = execute_biweekly_analysis(args)
+            else:
+                result = execute_analysis(args)
             
         elif request.mode == 'check-status':
             result = check_status(args)
@@ -162,14 +149,16 @@ async def execute_gee(request: GEERequest):
                 detail=f"Unknown mode: {request.mode}. Valid modes: execute, check-status, download-results, start-tasks, generate-script"
             )
         
-        # Añadir info de fenología a la respuesta
+        # Añadir info de fenología y tipo de análisis a la respuesta
         return {
             "success": True, 
             "result": result,
-            "phenology_info": {
+            "analysis_info": {
+                "analysis_type": request.analysis_type,
                 "crop_type_original": request.crop_type,
                 "crop_type_normalized": normalized_crop,
-                "phenology_enabled": normalized_crop in ['olivo', 'vina', 'almendro']
+                "phenology_enabled": normalized_crop in ['olivo', 'vina', 'almendro'],
+                "is_biweekly": request.analysis_type == 'biweekly'
             }
         }
         
@@ -223,6 +212,47 @@ async def get_crop_types():
     }
 
 
+@router.get("/analysis-types")
+async def get_analysis_types():
+    """
+    Devuelve los tipos de análisis disponibles.
+    """
+    return {
+        "types": [
+            {
+                "id": "baseline",
+                "name": "Análisis Baseline",
+                "description": "Análisis completo inicial con todos los índices, VRA y histórico",
+                "exports": "~20 archivos (PNGs, GeoTIFFs, CSVs, Shapefiles)",
+                "processing_time": "20-40 minutos",
+                "includes_weather": False,
+                "includes_vra": True
+            },
+            {
+                "id": "biweekly",
+                "name": "Seguimiento Bisemanal",
+                "description": "Análisis ligero recurrente con meteorología ERA5 integrada",
+                "exports": "3 archivos (PNG NDVI, PNG NDWI, KPIs CSV con weather)",
+                "processing_time": "5-10 minutos",
+                "includes_weather": True,
+                "weather_sources": ["ERA5-Land (30 días observados)", "Open-Meteo (14 días pronóstico, via n8n)"],
+                "includes_vra": False,
+                "weather_fields": [
+                    "weather_tmax_mean", "weather_tmax_max",
+                    "weather_tmin_mean", "weather_tmin_min",
+                    "weather_heat_days", "weather_frost_days",
+                    "weather_gdd_base10",
+                    "weather_precip_total_mm", "weather_precip_max_daily_mm",
+                    "weather_rain_days",
+                    "weather_et_total_mm", "weather_water_balance_mm",
+                    "weather_wind_mean_ms",
+                    "weather_soil_moisture_mean", "weather_soil_moisture_min"
+                ]
+            }
+        ]
+    }
+
+
 @router.get("/health")
 async def gee_health():
     """
@@ -230,14 +260,20 @@ async def gee_health():
     """
     modules_status = {
         "gee_automation": False,
+        "gee_automation_biweekly": False,
         "gee_script_generator": False,
-        "ee_initialized": False
+        "ee_available": False
     }
     
-    # Verificar módulos
     try:
         from app.services.gee_automation import execute_analysis
         modules_status["gee_automation"] = True
+    except ImportError:
+        pass
+    
+    try:
+        from app.services.gee_automation import execute_biweekly_analysis
+        modules_status["gee_automation_biweekly"] = True
     except ImportError:
         pass
     
@@ -249,25 +285,28 @@ async def gee_health():
     
     try:
         import ee
-        # No inicializamos aquí, solo verificamos que está disponible
         modules_status["ee_available"] = True
     except ImportError:
-        modules_status["ee_available"] = False
+        pass
     
     all_ok = all([
         modules_status.get("gee_automation", False),
+        modules_status.get("gee_automation_biweekly", False),
         modules_status.get("ee_available", False)
     ])
     
     return {
         "status": "ok" if all_ok else "degraded",
         "service": "gee",
-        "version": "3.2",
+        "version": "4.1",
         "modules": modules_status,
         "features": {
             "phenological_curves": True,
             "seasonal_zscore": True,
             "supported_crops": ["olivo", "vina", "almendro"],
-            "png_export": True
+            "png_export": True,
+            "biweekly_analysis": modules_status["gee_automation_biweekly"],
+            "era5_weather": modules_status["gee_automation_biweekly"],
+            "analysis_types": ["baseline", "biweekly"]
         }
     }
