@@ -120,7 +120,7 @@ class ParcelBase(BaseModel):
     location_name: Optional[str] = None
     municipality: Optional[str] = None
     province: Optional[str] = None
-    roi_geojson: dict  # GeoJSON Polygon
+    roi_geojson: Any  # GeoJSON Polygon - puede ser dict o string
 
 
 class ParcelCreate(ParcelBase):
@@ -224,7 +224,7 @@ class JobBase(BaseModel):
     analysis_type: str
     start_date: date
     end_date: date
-    roi_geojson: dict
+    roi_geojson: Any  # Puede ser dict o string
 
 
 class JobCreate(JobBase):
@@ -244,6 +244,13 @@ class JobUpdate(BaseModel):
     ndwi_mean: Optional[float] = None
     stress_area_ha: Optional[float] = None
     stress_area_pct: Optional[float] = None
+    # Campos fenológicos
+    doy: Optional[int] = None
+    pheno_phase: Optional[str] = None
+    pheno_status: Optional[str] = None
+    ndvi_expected: Optional[float] = None
+    ndvi_deviation_pct: Optional[float] = None
+    ndvi_zscore_seasonal: Optional[float] = None
 
 
 class JobResponse(JobBase):
@@ -258,6 +265,13 @@ class JobResponse(JobBase):
     ndvi_mean: Optional[float] = None
     created_at: datetime
     completed_at: Optional[datetime] = None
+    # Campos fenológicos
+    doy: Optional[int] = None
+    pheno_phase: Optional[str] = None
+    pheno_status: Optional[str] = None
+    ndvi_expected: Optional[float] = None
+    ndvi_deviation_pct: Optional[float] = None
+    ndvi_zscore_seasonal: Optional[float] = None
     
     class Config:
         from_attributes = True
@@ -276,8 +290,8 @@ class ReportResponse(BaseModel):
     period_end: Optional[date] = None
     generated_at: datetime
     sent_at: Optional[datetime] = None
-    ndvi_current: Optional[float] = None  # ← Cambiar str → float
-    ndvi_change: Optional[float] = None   # ← Cambiar str → float
+    ndvi_current: Optional[float] = None
+    ndvi_change: Optional[float] = None
     main_findings: Optional[List[str]] = None
     priority_actions: Optional[List[str]] = None
     
@@ -296,10 +310,17 @@ class DashboardSummary(BaseModel):
     total_hectares: float
     total_reports: int
     avg_ndvi: Optional[float] = None
+    avg_ndwi: Optional[float] = None
+    stress_area_pct: Optional[float] = None
     ndvi_trend: Optional[str] = None  # "up", "down", "stable"
     last_analysis_date: Optional[datetime] = None
     days_until_next_report: Optional[int] = None
     alerts_count: int = 0
+    # Campos fenológicos (v3.2)
+    pheno_phase: Optional[str] = None
+    pheno_status: Optional[str] = None
+    ndvi_expected: Optional[float] = None
+    ndvi_deviation_pct: Optional[float] = None
 
 
 class DashboardAlert(BaseModel):
@@ -329,6 +350,13 @@ class WebhookJobCompleted(BaseModel):
     stress_area_ha: Optional[float] = None
     stress_area_pct: Optional[float] = None
     error_message: Optional[str] = None
+    # Campos fenológicos (v3.2)
+    doy: Optional[int] = None
+    pheno_phase: Optional[str] = None
+    pheno_status: Optional[str] = None
+    ndvi_expected: Optional[float] = None
+    ndvi_deviation_pct: Optional[float] = None
+    ndvi_zscore_seasonal: Optional[float] = None
 
 
 class WebhookKpiBatch(BaseModel):
