@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Mu.Orbita GEE Automation Script v4 (WEB-READY)
-==============================================
+Mu.Orbita GEE Automation Script v4.1 (WEB-READY + BIWEEKLY)
+============================================================
 
-NOVEDADES V4:
-✅ Export PNG visualizados (listos para dashboard web)
-✅ Bounds incluidos en KPIs para posicionar en Leaflet
-✅ VRA zonificación (k-means 3 zonas)
-✅ Stats por zona VRA
-✅ Carpetas organizadas (WEB, TIFF, DATA, VRA)
-✅ Mantiene GeoTIFFs para análisis
+NOVEDADES V4.1:
+✅ Análisis BIWEEKLY (bisemanal) ligero para seguimiento recurrente
+✅ ERA5 Weather data integrado (Tmax, Tmin, Precip, ET, Soil Moisture, Wind)
+✅ Balance hídrico (Precip - ET)
+✅ GDD (Growing Degree Days)
+✅ Menos exports (3 vs ~20 del baseline)
+✅ KPIs con datos meteorológicos incluidos
+✅ Compatible con sistema baseline existente (sin cambios)
+
+MODOS:
+    baseline:   Análisis completo (18+ exports, VRA, todos los índices)
+    biweekly:   Seguimiento ligero (3 exports, weather, deltas)
 
 Uso:
-    python gee_automation_v4.py --mode execute --job-id JOB_123 --roi '{"type":"Polygon",...}'
+    python gee_automation.py --mode execute --job-id JOB_123 --roi '{"type":"Polygon",...}' --analysis-type biweekly
 """
 
 import argparse
@@ -79,7 +84,7 @@ VIZ_PALETTES = {
     },
     'VRA': {
         'min': 0, 'max': 2,
-        'palette': ['e74c3c', 'f1c40f', '27ae60']  # Rojo, Amarillo, Verde
+        'palette': ['e74c3c', 'f1c40f', '27ae60']
     },
     'LST': {
         'min': 15, 'max': 45,
@@ -92,7 +97,7 @@ VIZ_PALETTES = {
 # ============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Mu.Orbita GEE Automation v4 (Web-Ready)')
+    parser = argparse.ArgumentParser(description='Mu.Orbita GEE Automation v4.1 (Web-Ready + Biweekly)')
     parser.add_argument('--mode', required=True, 
                         choices=['execute', 'check-status', 'download-results', 'start-tasks'])
     parser.add_argument('--job-id', required=True)
@@ -101,7 +106,7 @@ def parse_args():
     parser.add_argument('--end-date', help='End date YYYY-MM-DD')
     parser.add_argument('--crop', default='olivar', help='Crop type')
     parser.add_argument('--buffer', type=int, default=0, help='Buffer in meters')
-    parser.add_argument('--analysis-type', default='baseline', help='Type of analysis')
+    parser.add_argument('--analysis-type', default='baseline', help='Type of analysis: baseline or biweekly')
     parser.add_argument('--drive-folder', default='MuOrbita_Outputs', help='Google Drive base folder')
     parser.add_argument('--output-dir', help='Local output directory')
     parser.add_argument('--export-png', type=bool, default=True, help='Export PNG for web dashboard')
@@ -133,7 +138,6 @@ def get_bounds(roi):
     """Get bounds of ROI for Leaflet positioning"""
     try:
         bounds = roi.bounds().coordinates().getInfo()[0]
-        # bounds es [[west, south], [west, north], [east, north], [east, south], [west, south]]
         lngs = [p[0] for p in bounds]
         lats = [p[1] for p in bounds]
         return {
@@ -188,11 +192,8 @@ def calculate_indices(image):
     
     ndci = image.normalizedDifference(['B5', 'B4']).rename('NDCI')
     
-    # SAVI (Soil Adjusted Vegetation Index)
     L = 0.5
     savi = nir.subtract(red).divide(nir.add(red).add(L)).multiply(1 + L).rename('SAVI')
-    
-    # OSAVI (Optimized for olive groves)
     osavi = nir.subtract(red).divide(nir.add(red).add(0.16)).multiply(1.16).rename('OSAVI')
     
     return image.addBands([ndvi, ndwi, evi, ndci, savi, osavi])
@@ -210,21 +211,18 @@ def get_modis_lst(roi, start_date, end_date):
     return modis.median().clip(roi)
 
 # ============================================================================
-# VRA ZONIFICACIÓN
+# VRA ZONIFICACIÓN (solo baseline)
 # ============================================================================
 
 def calculate_vra_zones(composite, roi):
     """Calculate VRA zones using k-means clustering"""
     try:
-        # Bandas para clustering
         training_bands = ['NDVI', 'EVI', 'NDWI']
         training_image = composite.select(training_bands)
         
-        # Máscara de píxeles válidos
         valid_mask = training_image.mask().reduce(ee.Reducer.min())
         training_masked = training_image.updateMask(valid_mask)
         
-        # Sample para entrenar clusterer
         sample = training_masked.sample(
             region=roi,
             scale=20,
@@ -232,11 +230,9 @@ def calculate_vra_zones(composite, roi):
             geometries=False
         )
         
-        # K-means con 3 clusters
         clusterer = ee.Clusterer.wekaKMeans(3).train(sample)
         vra = training_masked.cluster(clusterer).rename('zone')
         
-        # Calcular stats por zona
         vra_with_ndvi = vra.addBands(composite.select(['NDVI', 'NDWI', 'EVI']))
         
         vra_stats = []
@@ -265,7 +261,6 @@ def calculate_vra_zones(composite, roi):
                 'evi_mean': round(zone_indices.get('EVI', 0) or 0, 3)
             })
         
-        # Ordenar por NDVI para asignar labels
         vra_stats.sort(key=lambda x: x['ndvi_mean'])
         labels = ['Bajo vigor', 'Vigor medio', 'Alto vigor']
         recommendations = ['Dosis alta', 'Dosis media', 'Dosis baja']
@@ -281,21 +276,553 @@ def calculate_vra_zones(composite, roi):
         return None, []
 
 # ============================================================================
-# EJECUTAR ANÁLISIS
+# ERA5 WEATHER DATA (para biweekly)
+# ============================================================================
+
+def get_era5_weather(roi, start_date, end_date):
+    """
+    Obtiene datos meteorológicos de ERA5-Land DAILY_AGGR para el período.
+    
+    Retorna:
+        dict con KPIs meteorológicos agregados del período
+        list con serie temporal diaria (para CSV export)
+    """
+    weather_kpis = {}
+    daily_series = []
+    
+    try:
+        # ---- TEMPERATURA ----
+        era5_tmax = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+            .filterDate(start_date, end_date)
+            .filterBounds(roi)
+            .select('temperature_2m_max')
+            .map(lambda img: img.subtract(273.15).rename('Tmax_C')
+                 .copyProperties(img, ['system:time_start'])))
+        
+        era5_tmin = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+            .filterDate(start_date, end_date)
+            .filterBounds(roi)
+            .select('temperature_2m_min')
+            .map(lambda img: img.subtract(273.15).rename('Tmin_C')
+                 .copyProperties(img, ['system:time_start'])))
+        
+        # Stats de temperatura sobre el ROI
+        tmax_values = era5_tmax.map(lambda img: ee.Feature(None, {
+            'date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
+            'tmax': img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=roi,
+                scale=11132,
+                maxPixels=1e9
+            ).get('Tmax_C')
+        }))
+        
+        tmin_values = era5_tmin.map(lambda img: ee.Feature(None, {
+            'date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
+            'tmin': img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=roi,
+                scale=11132,
+                maxPixels=1e9
+            ).get('Tmin_C')
+        }))
+        
+        # Obtener listas
+        tmax_list = tmax_values.toList(100).getInfo()
+        tmin_list = tmin_values.toList(100).getInfo()
+        
+        # Procesar temperatura
+        tmax_vals = []
+        tmin_vals = []
+        heat_days = 0  # Días con Tmax >= 35°C
+        frost_days = 0  # Días con Tmin <= 0°C
+        gdd_total = 0  # Growing Degree Days (base 10°C)
+        
+        tmax_by_date = {}
+        for f in tmax_list:
+            props = f.get('properties', {})
+            val = props.get('tmax')
+            date = props.get('date', '')
+            if val is not None:
+                tmax_vals.append(val)
+                tmax_by_date[date] = val
+                if val >= 35:
+                    heat_days += 1
+        
+        tmin_by_date = {}
+        for f in tmin_list:
+            props = f.get('properties', {})
+            val = props.get('tmin')
+            date = props.get('date', '')
+            if val is not None:
+                tmin_vals.append(val)
+                tmin_by_date[date] = val
+                if val <= 0:
+                    frost_days += 1
+        
+        # GDD: sum of max(0, (Tmax + Tmin)/2 - 10) por día
+        for date in tmax_by_date:
+            tmax_d = tmax_by_date.get(date)
+            tmin_d = tmin_by_date.get(date)
+            if tmax_d is not None and tmin_d is not None:
+                tmean = (tmax_d + tmin_d) / 2
+                gdd_total += max(0, tmean - 10)
+        
+        weather_kpis['weather_tmax_mean'] = round(sum(tmax_vals) / len(tmax_vals), 1) if tmax_vals else None
+        weather_kpis['weather_tmax_max'] = round(max(tmax_vals), 1) if tmax_vals else None
+        weather_kpis['weather_tmin_mean'] = round(sum(tmin_vals) / len(tmin_vals), 1) if tmin_vals else None
+        weather_kpis['weather_tmin_min'] = round(min(tmin_vals), 1) if tmin_vals else None
+        weather_kpis['weather_heat_days'] = heat_days
+        weather_kpis['weather_frost_days'] = frost_days
+        weather_kpis['weather_gdd_base10'] = round(gdd_total, 1)
+        
+    except Exception as e:
+        print(f"Warning: ERA5 temperature failed: {e}")
+        weather_kpis['weather_tmax_mean'] = None
+        weather_kpis['weather_tmin_mean'] = None
+        weather_kpis['weather_heat_days'] = None
+        weather_kpis['weather_frost_days'] = None
+        weather_kpis['weather_gdd_base10'] = None
+    
+    try:
+        # ---- PRECIPITACIÓN ----
+        era5_precip = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+            .filterDate(start_date, end_date)
+            .filterBounds(roi)
+            .select('total_precipitation_sum')
+            .map(lambda img: img.multiply(1000).rename('Precip_mm')  # m → mm
+                 .copyProperties(img, ['system:time_start'])))
+        
+        precip_values = era5_precip.map(lambda img: ee.Feature(None, {
+            'date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
+            'precip': img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=roi,
+                scale=11132,
+                maxPixels=1e9
+            ).get('Precip_mm')
+        }))
+        
+        precip_list = precip_values.toList(100).getInfo()
+        precip_vals = []
+        rain_days = 0
+        
+        precip_by_date = {}
+        for f in precip_list:
+            props = f.get('properties', {})
+            val = props.get('precip')
+            date = props.get('date', '')
+            if val is not None:
+                precip_vals.append(val)
+                precip_by_date[date] = val
+                if val > 1:
+                    rain_days += 1
+        
+        weather_kpis['weather_precip_total_mm'] = round(sum(precip_vals), 1) if precip_vals else None
+        weather_kpis['weather_precip_max_daily_mm'] = round(max(precip_vals), 1) if precip_vals else None
+        weather_kpis['weather_rain_days'] = rain_days
+        
+    except Exception as e:
+        print(f"Warning: ERA5 precipitation failed: {e}")
+        weather_kpis['weather_precip_total_mm'] = None
+        weather_kpis['weather_rain_days'] = None
+    
+    try:
+        # ---- EVAPOTRANSPIRACIÓN ----
+        era5_et = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+            .filterDate(start_date, end_date)
+            .filterBounds(roi)
+            .select('total_evaporation_sum')
+            .map(lambda img: img.multiply(-1000).rename('ET_mm')  # m → mm, signo invertido
+                 .copyProperties(img, ['system:time_start'])))
+        
+        et_values = era5_et.map(lambda img: ee.Feature(None, {
+            'date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
+            'et': img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=roi,
+                scale=11132,
+                maxPixels=1e9
+            ).get('ET_mm')
+        }))
+        
+        et_list = et_values.toList(100).getInfo()
+        et_vals = []
+        et_by_date = {}
+        for f in et_list:
+            props = f.get('properties', {})
+            val = props.get('et')
+            date = props.get('date', '')
+            if val is not None:
+                et_vals.append(val)
+                et_by_date[date] = val
+        
+        et_total = sum(et_vals) if et_vals else 0
+        precip_total = weather_kpis.get('weather_precip_total_mm') or 0
+        
+        weather_kpis['weather_et_total_mm'] = round(et_total, 1) if et_vals else None
+        weather_kpis['weather_water_balance_mm'] = round(precip_total - et_total, 1)
+        
+    except Exception as e:
+        print(f"Warning: ERA5 ET failed: {e}")
+        weather_kpis['weather_et_total_mm'] = None
+        weather_kpis['weather_water_balance_mm'] = None
+    
+    try:
+        # ---- VIENTO ----
+        era5_wind_u = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+            .filterDate(start_date, end_date)
+            .filterBounds(roi)
+            .select('u_component_of_wind_10m'))
+        
+        era5_wind_v = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+            .filterDate(start_date, end_date)
+            .filterBounds(roi)
+            .select('v_component_of_wind_10m'))
+        
+        # Calcular velocidad del viento = sqrt(u² + v²)
+        wind_speed_mean = era5_wind_u.mean().pow(2).add(era5_wind_v.mean().pow(2)).sqrt()
+        wind_stats = wind_speed_mean.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=roi,
+            scale=11132,
+            maxPixels=1e9
+        ).getInfo()
+        
+        # Para el máximo, usar el promedio como aproximación
+        wind_val = list(wind_stats.values())[0] if wind_stats else None
+        weather_kpis['weather_wind_mean_ms'] = round(wind_val, 1) if wind_val else None
+        
+    except Exception as e:
+        print(f"Warning: ERA5 wind failed: {e}")
+        weather_kpis['weather_wind_mean_ms'] = None
+    
+    try:
+        # ---- HUMEDAD DEL SUELO ----
+        era5_sm = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+            .filterDate(start_date, end_date)
+            .filterBounds(roi)
+            .select('volumetric_soil_water_layer_1'))
+        
+        sm_stats = era5_sm.reduce(ee.Reducer.mean().combine(ee.Reducer.minMax(), sharedInputs=True)).reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=roi,
+            scale=11132,
+            maxPixels=1e9
+        ).getInfo()
+        
+        weather_kpis['weather_soil_moisture_mean'] = round(
+            sm_stats.get('volumetric_soil_water_layer_1_mean', 0) or 0, 3)
+        weather_kpis['weather_soil_moisture_min'] = round(
+            sm_stats.get('volumetric_soil_water_layer_1_min', 0) or 0, 3)
+        
+    except Exception as e:
+        print(f"Warning: ERA5 soil moisture failed: {e}")
+        weather_kpis['weather_soil_moisture_mean'] = None
+    
+    # ---- CONSTRUIR SERIE TEMPORAL DIARIA (para CSV export) ----
+    all_dates = sorted(set(
+        list(tmax_by_date.keys()) + 
+        list(tmin_by_date.keys()) + 
+        list(precip_by_date.keys()) +
+        list(et_by_date.keys())
+    ))
+    
+    for date in all_dates:
+        daily_series.append({
+            'date': date,
+            'tmax_c': round(tmax_by_date.get(date, -9999), 1),
+            'tmin_c': round(tmin_by_date.get(date, -9999), 1),
+            'precip_mm': round(precip_by_date.get(date, 0), 1),
+            'et_mm': round(et_by_date.get(date, 0), 1),
+        })
+    
+    return weather_kpis, daily_series
+
+
+# ============================================================================
+# EJECUTAR ANÁLISIS BIWEEKLY (NUEVO)
+# ============================================================================
+
+def execute_biweekly_analysis(args):
+    """
+    Ejecuta análisis BIWEEKLY ligero para seguimiento recurrente.
+    
+    Diferencias con baseline:
+    - Ventana de 30 días (no todo el histórico)
+    - Solo 3 exports: PNG NDVI, PNG NDWI, KPIs CSV
+    - Incluye datos ERA5 meteorológicos
+    - No recalcula VRA (usa zonas del baseline)
+    - No exporta GeoTIFFs pesados
+    - Más rápido: ~5-10 min vs 20-40 min del baseline
+    """
+    roi = create_roi(args.roi, args.buffer)
+    job_id = args.job_id
+    
+    # Carpetas de salida (más simples que baseline)
+    base_folder = f"{args.drive_folder}/{job_id}"
+    folders = {
+        'web': f"{base_folder}/WEB",
+        'data': f"{base_folder}/DATA",
+    }
+    
+    # Bounds para posicionamiento web
+    bounds = get_bounds(roi)
+    
+    # ========== DATOS SATELITALES (últimos 30 días) ==========
+    collection = get_sentinel2_collection(roi, args.start_date, args.end_date)
+    count = collection.size().getInfo()
+    
+    if count == 0:
+        return {
+            "error": "No images found for the biweekly period",
+            "job_id": job_id,
+            "analysis_type": "biweekly",
+            "start_date": args.start_date,
+            "end_date": args.end_date,
+            "suggestion": "Try extending the date range or check cloud cover"
+        }
+    
+    # Calcular índices
+    indexed_collection = collection.map(calculate_indices)
+    composite = indexed_collection.median().clip(roi)
+    
+    # Fecha de última imagen
+    latest = collection.sort('system:time_start', False).first()
+    try:
+        latest_date = ee.Date(latest.get('system:time_start')).format('YYYY-MM-dd').getInfo()
+    except:
+        latest_date = args.end_date
+    
+    # ========== ESTADÍSTICAS DE VEGETACIÓN ==========
+    stats = composite.select(['NDVI', 'NDWI', 'EVI', 'NDCI']).reduceRegion(
+        reducer=ee.Reducer.mean()
+            .combine(ee.Reducer.percentile([10, 50, 90]), sharedInputs=True)
+            .combine(ee.Reducer.stdDev(), sharedInputs=True),
+        geometry=roi,
+        scale=10,
+        maxPixels=1e9
+    ).getInfo()
+    
+    # Área total
+    area_ha = roi.area().divide(10000).getInfo()
+    
+    # Área de estrés (NDVI < 0.35)
+    stress_mask = composite.select('NDVI').lt(0.35)
+    stress_area = stress_mask.multiply(ee.Image.pixelArea()).reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=roi,
+        scale=10,
+        maxPixels=1e9
+    ).getInfo()
+    stress_ha = stress_area.get('NDVI', 0) / 10000
+    stress_pct = (stress_ha / area_ha * 100) if area_ha > 0 else 0
+    
+    # Z-score vs colección actual
+    hist_stats = indexed_collection.select('NDVI').mean().reduceRegion(
+        reducer=ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True),
+        geometry=roi,
+        scale=20,
+        maxPixels=1e9
+    ).getInfo()
+    
+    ndvi_mean = stats.get('NDVI_mean', 0) or 0
+    hist_mean = hist_stats.get('NDVI_mean', ndvi_mean) or ndvi_mean
+    hist_std = hist_stats.get('NDVI_stdDev', 0.1) or 0.1
+    z_score = (ndvi_mean - hist_mean) / hist_std if hist_std > 0 else 0
+    
+    # ========== DATOS METEOROLÓGICOS ERA5 (últimos 30 días) ==========
+    weather_kpis, weather_daily = get_era5_weather(roi, args.start_date, args.end_date)
+    
+    # ========== MODIS LST (rápido) ==========
+    try:
+        lst = get_modis_lst(roi, args.start_date, args.end_date)
+        lst_stats = lst.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=roi,
+            scale=1000,
+            maxPixels=1e9
+        ).getInfo()
+        lst_mean = lst_stats.get('LST_C_mean', None)
+    except:
+        lst_mean = None
+    
+    # ========== SERIE TEMPORAL NDVI corta (para tendencia) ==========
+    time_series = []
+    try:
+        ts_features = indexed_collection.select(['NDVI', 'NDWI', 'EVI']).map(lambda img: 
+            ee.Feature(None, img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=roi,
+                scale=20,
+                maxPixels=1e9
+            )).set('date', ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'))
+        )
+        
+        ts_list = ts_features.toList(100).getInfo()
+        for feature in ts_list:
+            props = feature.get('properties', {})
+            if props.get('date'):
+                time_series.append({
+                    'date': props.get('date', ''),
+                    'ndvi': round(props.get('NDVI_mean', 0) or 0, 3),
+                    'ndwi': round(props.get('NDWI_mean', 0) or 0, 3),
+                    'evi': round(props.get('EVI_mean', 0) or 0, 3)
+                })
+        time_series.sort(key=lambda x: x['date'])
+    except Exception as e:
+        print(f"Warning: Could not get time series: {e}")
+    
+    # ========== CONSTRUIR KPIs CONSOLIDADOS ==========
+    kpis = {
+        'job_id': job_id,
+        'crop_type': args.crop,
+        'analysis_type': 'biweekly',
+        'start_date': args.start_date,
+        'end_date': args.end_date,
+        'latest_image_date': latest_date,
+        'images_processed': count,
+        'area_hectares': round(area_ha, 2),
+        
+        # NDVI
+        'ndvi_mean': round(stats.get('NDVI_mean', 0) or 0, 3),
+        'ndvi_p10': round(stats.get('NDVI_p10', 0) or 0, 3),
+        'ndvi_p50': round(stats.get('NDVI_p50', 0) or 0, 3),
+        'ndvi_p90': round(stats.get('NDVI_p90', 0) or 0, 3),
+        'ndvi_stddev': round(stats.get('NDVI_stdDev', 0) or 0, 3),
+        'ndvi_zscore': round(z_score, 2),
+        
+        # NDWI
+        'ndwi_mean': round(stats.get('NDWI_mean', 0) or 0, 3),
+        'ndwi_p10': round(stats.get('NDWI_p10', 0) or 0, 3),
+        'ndwi_p90': round(stats.get('NDWI_p90', 0) or 0, 3),
+        
+        # EVI
+        'evi_mean': round(stats.get('EVI_mean', 0) or 0, 3),
+        
+        # NDCI
+        'ndci_mean': round(stats.get('NDCI_mean', 0) or 0, 3),
+        
+        # Estrés
+        'stress_area_ha': round(stress_ha, 2),
+        'stress_area_pct': round(stress_pct, 1),
+        
+        # LST
+        'lst_mean_c': round(lst_mean, 1) if lst_mean else None,
+        
+        # Bounds para web
+        'bounds_south': bounds['south'] if bounds else None,
+        'bounds_west': bounds['west'] if bounds else None,
+        'bounds_north': bounds['north'] if bounds else None,
+        'bounds_east': bounds['east'] if bounds else None,
+    }
+    
+    # Añadir todos los KPIs meteorológicos ERA5
+    kpis.update(weather_kpis)
+    
+    # ========== EXPORTS (solo 3: PNG NDVI, PNG NDWI, KPIs CSV) ==========
+    tasks = []
+    
+    # PNG NDVI
+    viz_ndvi = VIZ_PALETTES['NDVI']
+    ndvi_visualized = composite.select('NDVI').visualize(**viz_ndvi)
+    task_ndvi = ee.batch.Export.image.toDrive(
+        image=ndvi_visualized,
+        description=f'{job_id}_PNG_NDVI',
+        folder=folders['web'],
+        fileNamePrefix='PNG_NDVI',
+        region=roi,
+        scale=10,
+        maxPixels=1e9,
+        fileFormat='PNG'
+    )
+    task_ndvi.start()
+    tasks.append({
+        'name': 'PNG_NDVI.png',
+        'type': 'png_ndvi',
+        'id': task_ndvi.id,
+        'folder': 'WEB'
+    })
+    
+    # PNG NDWI
+    viz_ndwi = VIZ_PALETTES['NDWI']
+    ndwi_visualized = composite.select('NDWI').visualize(**viz_ndwi)
+    task_ndwi = ee.batch.Export.image.toDrive(
+        image=ndwi_visualized,
+        description=f'{job_id}_PNG_NDWI',
+        folder=folders['web'],
+        fileNamePrefix='PNG_NDWI',
+        region=roi,
+        scale=10,
+        maxPixels=1e9,
+        fileFormat='PNG'
+    )
+    task_ndwi.start()
+    tasks.append({
+        'name': 'PNG_NDWI.png',
+        'type': 'png_ndwi',
+        'id': task_ndwi.id,
+        'folder': 'WEB'
+    })
+    
+    # KPIs CSV (incluye weather)
+    kpi_feature = ee.Feature(None, kpis)
+    kpi_collection = ee.FeatureCollection([kpi_feature])
+    
+    task_kpis = ee.batch.Export.table.toDrive(
+        collection=kpi_collection,
+        description=f'{job_id}_KPIs_BIWEEKLY',
+        folder=folders['data'],
+        fileNamePrefix='KPIs_BIWEEKLY',
+        fileFormat='CSV'
+    )
+    task_kpis.start()
+    tasks.append({
+        'name': 'KPIs_BIWEEKLY.csv',
+        'type': 'kpis_biweekly',
+        'id': task_kpis.id,
+        'folder': 'DATA'
+    })
+    
+    # ========== RESULTADO ==========
+    result = {
+        'success': True,
+        'job_id': job_id,
+        'analysis_type': 'biweekly',
+        'kpis': kpis,
+        'weather': weather_kpis,
+        'weather_daily': weather_daily,
+        'bounds': bounds,
+        'time_series': time_series,
+        'tasks': tasks,
+        'task_count': len(tasks),
+        'folders': folders,
+        'image_urls': {
+            'NDVI': f"/api/images/{job_id}/PNG_NDVI.png",
+            'NDWI': f"/api/images/{job_id}/PNG_NDWI.png",
+        },
+        'message': f'Biweekly analysis complete. {len(tasks)} export tasks started. Weather data: {len(weather_daily)} days.'
+    }
+    
+    return result
+
+
+# ============================================================================
+# EJECUTAR ANÁLISIS BASELINE (original, sin cambios)
 # ============================================================================
 
 def execute_analysis(args):
-    """Execute GEE analysis and start export tasks"""
+    """Execute GEE analysis and start export tasks (BASELINE - original)"""
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
     
     # Carpetas de salida organizadas
     base_folder = f"{args.drive_folder}/{job_id}"
     folders = {
-        'web': f"{base_folder}/WEB",      # PNGs para dashboard
-        'tiff': f"{base_folder}/TIFF",    # GeoTIFFs para análisis
-        'data': f"{base_folder}/DATA",    # CSVs
-        'vra': f"{base_folder}/VRA"       # Zonificación
+        'web': f"{base_folder}/WEB",
+        'tiff': f"{base_folder}/TIFF",
+        'data': f"{base_folder}/DATA",
+        'vra': f"{base_folder}/VRA"
     }
     
     # Get bounds para posicionamiento web
@@ -499,7 +1026,7 @@ def execute_analysis(args):
                 folder=folders['web'],
                 fileNamePrefix='PNG_LST',
                 region=roi,
-                scale=250,  # MODIS resolution
+                scale=250,
                 maxPixels=1e9,
                 fileFormat='PNG'
             )
@@ -535,7 +1062,6 @@ def execute_analysis(args):
     
     # ---------- VRA EXPORTS ----------
     if vra_image is not None:
-        # VRA Raster
         task_vra_tiff = ee.batch.Export.image.toDrive(
             image=vra_image.byte(),
             description=f'{job_id}_VRA_RASTER',
@@ -554,7 +1080,6 @@ def execute_analysis(args):
             'folder': 'VRA'
         })
         
-        # VRA Vector (Shapefile)
         try:
             vra_vectors = vra_image.reduceToVectors(
                 geometry=roi,
@@ -581,7 +1106,6 @@ def execute_analysis(args):
         except Exception as e:
             print(f"Warning: VRA vector export failed: {e}")
         
-        # VRA Stats CSV
         vra_stats_feature = ee.FeatureCollection([
             ee.Feature(None, stat) for stat in vra_stats
         ])
@@ -602,8 +1126,6 @@ def execute_analysis(args):
         })
     
     # ---------- DATA EXPORTS (CSVs) ----------
-    
-    # KPIs CSV
     kpi_feature = ee.Feature(None, kpis)
     kpi_collection = ee.FeatureCollection([kpi_feature])
     
@@ -675,6 +1197,7 @@ def execute_analysis(args):
     result = {
         'success': True,
         'job_id': job_id,
+        'analysis_type': 'baseline',
         'kpis': kpis,
         'vra_stats': vra_stats,
         'bounds': bounds,
@@ -723,7 +1246,6 @@ def check_status(args):
     total = len(status)
     all_complete = (completed == total and total > 0 and running == 0 and pending == 0)
     
-    # Separate PNG tasks for quick check
     png_tasks = [t for t in status if 'PNG' in t['name']]
     png_complete = all(t['state'] == 'COMPLETED' for t in png_tasks) if png_tasks else False
     
@@ -736,7 +1258,7 @@ def check_status(args):
         'pending': pending,
         'total': total,
         'all_complete': all_complete,
-        'png_complete': png_complete,  # Dashboard can show images when PNGs are ready
+        'png_complete': png_complete,
         'any_failed': failed > 0,
         'progress_pct': round(completed / total * 100) if total > 0 else 0,
         'message': f'COMPLETED: {completed}, RUNNING: {running}, FAILED: {failed}, PENDING: {pending}'
@@ -764,39 +1286,52 @@ def download_results(args):
         os.makedirs(args.output_dir, exist_ok=True)
     
     job_id = args.job_id
+    analysis_type = getattr(args, 'analysis_type', 'baseline')
     
-    # List of files organized by folder
-    files = {
-        'WEB': [
-            {'name': 'PNG_NDVI.png', 'type': 'png_ndvi'},
-            {'name': 'PNG_NDWI.png', 'type': 'png_ndwi'},
-            {'name': 'PNG_EVI.png', 'type': 'png_evi'},
-            {'name': 'PNG_NDCI.png', 'type': 'png_ndci'},
-            {'name': 'PNG_SAVI.png', 'type': 'png_savi'},
-            {'name': 'PNG_VRA.png', 'type': 'png_vra'},
-            {'name': 'PNG_LST.png', 'type': 'png_lst'},
-        ],
-        'TIFF': [
-            {'name': 'TIFF_NDVI.tif', 'type': 'tiff_ndvi'},
-            {'name': 'TIFF_NDWI.tif', 'type': 'tiff_ndwi'},
-            {'name': 'TIFF_EVI.tif', 'type': 'tiff_evi'},
-            {'name': 'TIFF_NDCI.tif', 'type': 'tiff_ndci'},
-            {'name': 'TIFF_SAVI.tif', 'type': 'tiff_savi'},
-            {'name': 'TIFF_OSAVI.tif', 'type': 'tiff_osavi'},
-        ],
-        'DATA': [
-            {'name': 'KPIs.csv', 'type': 'kpis'},
-            {'name': 'TimeSeries.csv', 'type': 'timeseries'},
-        ],
-        'VRA': [
-            {'name': 'VRA_RASTER.tif', 'type': 'vra_raster'},
-            {'name': 'VRA_VECTOR.shp', 'type': 'vra_vector'},
-            {'name': 'VRA_STATS.csv', 'type': 'vra_stats'},
-        ]
-    }
+    # Archivos según tipo de análisis
+    if analysis_type == 'biweekly':
+        files = {
+            'WEB': [
+                {'name': 'PNG_NDVI.png', 'type': 'png_ndvi'},
+                {'name': 'PNG_NDWI.png', 'type': 'png_ndwi'},
+            ],
+            'DATA': [
+                {'name': 'KPIs_BIWEEKLY.csv', 'type': 'kpis_biweekly'},
+            ]
+        }
+    else:
+        files = {
+            'WEB': [
+                {'name': 'PNG_NDVI.png', 'type': 'png_ndvi'},
+                {'name': 'PNG_NDWI.png', 'type': 'png_ndwi'},
+                {'name': 'PNG_EVI.png', 'type': 'png_evi'},
+                {'name': 'PNG_NDCI.png', 'type': 'png_ndci'},
+                {'name': 'PNG_SAVI.png', 'type': 'png_savi'},
+                {'name': 'PNG_VRA.png', 'type': 'png_vra'},
+                {'name': 'PNG_LST.png', 'type': 'png_lst'},
+            ],
+            'TIFF': [
+                {'name': 'TIFF_NDVI.tif', 'type': 'tiff_ndvi'},
+                {'name': 'TIFF_NDWI.tif', 'type': 'tiff_ndwi'},
+                {'name': 'TIFF_EVI.tif', 'type': 'tiff_evi'},
+                {'name': 'TIFF_NDCI.tif', 'type': 'tiff_ndci'},
+                {'name': 'TIFF_SAVI.tif', 'type': 'tiff_savi'},
+                {'name': 'TIFF_OSAVI.tif', 'type': 'tiff_osavi'},
+            ],
+            'DATA': [
+                {'name': 'KPIs.csv', 'type': 'kpis'},
+                {'name': 'TimeSeries.csv', 'type': 'timeseries'},
+            ],
+            'VRA': [
+                {'name': 'VRA_RASTER.tif', 'type': 'vra_raster'},
+                {'name': 'VRA_VECTOR.shp', 'type': 'vra_vector'},
+                {'name': 'VRA_STATS.csv', 'type': 'vra_stats'},
+            ]
+        }
     
     return {
         'job_id': job_id,
+        'analysis_type': analysis_type,
         'status': 'ready',
         'download_ready': True,
         'files': files,
@@ -835,13 +1370,22 @@ def main():
     
     try:
         if args.mode == 'execute':
-            result = execute_analysis(args)
+            # ROUTING: baseline o biweekly según analysis_type
+            analysis_type = getattr(args, 'analysis_type', 'baseline')
+            if analysis_type == 'biweekly':
+                result = execute_biweekly_analysis(args)
+            else:
+                result = execute_analysis(args)
+                
         elif args.mode == 'check-status':
             result = check_status(args)
+            
         elif args.mode == 'download-results':
             result = download_results(args)
+            
         elif args.mode == 'start-tasks':
             result = start_tasks(args)
+            
         else:
             result = {'error': f'Unknown mode: {args.mode}'}
         
