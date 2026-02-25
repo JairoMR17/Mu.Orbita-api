@@ -124,7 +124,7 @@ async def execute_gee(request: GEERequest):
             analysis_type=request.analysis_type,
             output_dir=request.output_dir or f"/tmp/muorbita_{request.job_id}",
             drive_folder=request.drive_folder,
-            export_png=True
+            export_png=False
         )
         
         if request.mode == 'execute':
