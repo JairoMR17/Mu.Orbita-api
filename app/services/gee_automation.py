@@ -290,6 +290,12 @@ def get_era5_weather(roi, start_date, end_date):
     weather_kpis = {}
     daily_series = []
     
+    # Variables para construir serie diaria al final
+    tmax_by_date = {}
+    tmin_by_date = {}
+    precip_by_date = {}
+    et_by_date = {}
+    
     try:
         # ---- TEMPERATURA ----
         era5_tmax = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
@@ -338,7 +344,6 @@ def get_era5_weather(roi, start_date, end_date):
         frost_days = 0  # Días con Tmin <= 0°C
         gdd_total = 0  # Growing Degree Days (base 10°C)
         
-        tmax_by_date = {}
         for f in tmax_list:
             props = f.get('properties', {})
             val = props.get('tmax')
@@ -349,7 +354,6 @@ def get_era5_weather(roi, start_date, end_date):
                 if val >= 35:
                     heat_days += 1
         
-        tmin_by_date = {}
         for f in tmin_list:
             props = f.get('properties', {})
             val = props.get('tmin')
@@ -407,7 +411,6 @@ def get_era5_weather(roi, start_date, end_date):
         precip_vals = []
         rain_days = 0
         
-        precip_by_date = {}
         for f in precip_list:
             props = f.get('properties', {})
             val = props.get('precip')
@@ -448,7 +451,6 @@ def get_era5_weather(roi, start_date, end_date):
         
         et_list = et_values.toList(100).getInfo()
         et_vals = []
-        et_by_date = {}
         for f in et_list:
             props = f.get('properties', {})
             val = props.get('et')
@@ -550,7 +552,7 @@ def execute_biweekly_analysis(args):
     
     Diferencias con baseline:
     - Ventana de 30 días (no todo el histórico)
-    - Solo 3 exports: PNG NDVI, PNG NDWI, KPIs CSV
+    - Solo 3 exports: GeoTIFF NDVI, GeoTIFF NDWI, KPIs CSV
     - Incluye datos ERA5 meteorológicos
     - No recalcula VRA (usa zonas del baseline)
     - No exporta GeoTIFFs pesados
@@ -720,12 +722,13 @@ def execute_biweekly_analysis(args):
     # Añadir todos los KPIs meteorológicos ERA5
     kpis.update(weather_kpis)
     
-    # ========== EXPORTS (solo 3: PNG NDVI, PNG NDWI, KPIs CSV) ==========
+    # ========== EXPORTS (solo 3: GeoTIFF NDVI, GeoTIFF NDWI, KPIs CSV) ==========
     tasks = []
     
-    # PNG NDVI
+    # Visualizar NDVI para exportar como GeoTIFF coloreado
     viz_ndvi = VIZ_PALETTES['NDVI']
     ndvi_visualized = composite.select('NDVI').visualize(**viz_ndvi)
+    
     task_ndvi = ee.batch.Export.image.toDrive(
         image=ndvi_visualized,
         description=f'{job_id}_PNG_NDVI',
@@ -734,19 +737,20 @@ def execute_biweekly_analysis(args):
         region=roi,
         scale=10,
         maxPixels=1e9,
-        fileFormat='PNG'
+        fileFormat='GEO_TIFF'
     )
     task_ndvi.start()
     tasks.append({
-        'name': 'PNG_NDVI.png',
+        'name': 'PNG_NDVI.tif',
         'type': 'png_ndvi',
         'id': task_ndvi.id,
         'folder': 'WEB'
     })
     
-    # PNG NDWI
+    # Visualizar NDWI para exportar como GeoTIFF coloreado
     viz_ndwi = VIZ_PALETTES['NDWI']
     ndwi_visualized = composite.select('NDWI').visualize(**viz_ndwi)
+    
     task_ndwi = ee.batch.Export.image.toDrive(
         image=ndwi_visualized,
         description=f'{job_id}_PNG_NDWI',
@@ -755,11 +759,11 @@ def execute_biweekly_analysis(args):
         region=roi,
         scale=10,
         maxPixels=1e9,
-        fileFormat='PNG'
+        fileFormat='GEO_TIFF'
     )
     task_ndwi.start()
     tasks.append({
-        'name': 'PNG_NDWI.png',
+        'name': 'PNG_NDWI.tif',
         'type': 'png_ndwi',
         'id': task_ndwi.id,
         'folder': 'WEB'
@@ -798,8 +802,8 @@ def execute_biweekly_analysis(args):
         'task_count': len(tasks),
         'folders': folders,
         'image_urls': {
-            'NDVI': f"/api/images/{job_id}/PNG_NDVI.png",
-            'NDWI': f"/api/images/{job_id}/PNG_NDWI.png",
+            'NDVI': f"/api/images/{job_id}/PNG_NDVI.tif",
+            'NDWI': f"/api/images/{job_id}/PNG_NDWI.tif",
         },
         'message': f'Biweekly analysis complete. {len(tasks)} export tasks started. Weather data: {len(weather_daily)} days.'
     }
@@ -808,11 +812,11 @@ def execute_biweekly_analysis(args):
 
 
 # ============================================================================
-# EJECUTAR ANÁLISIS BASELINE (original, sin cambios)
+# EJECUTAR ANÁLISIS BASELINE (original)
 # ============================================================================
 
 def execute_analysis(args):
-    """Execute GEE analysis and start export tasks (BASELINE - original)"""
+    """Execute GEE analysis and start export tasks (BASELINE)"""
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
     
@@ -966,7 +970,7 @@ def execute_analysis(args):
     # ========== EXPORT TASKS ==========
     tasks = []
     
-    # ---------- PNG EXPORTS (Web Dashboard) ----------
+    # ---------- GeoTIFF visualizado EXPORTS (Web Dashboard) ----------
     if args.export_png:
         indices_to_export_png = ['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI']
         
@@ -982,17 +986,17 @@ def execute_analysis(args):
                 region=roi,
                 scale=10,
                 maxPixels=1e9,
-                fileFormat='PNG'
+                fileFormat='GEO_TIFF'
             )
             task.start()
             tasks.append({
-                'name': f'PNG_{idx_name}.png',
+                'name': f'PNG_{idx_name}.tif',
                 'type': f'png_{idx_name.lower()}',
                 'id': task.id,
                 'folder': 'WEB'
             })
         
-        # PNG VRA
+        # VRA visualizado
         if vra_image is not None:
             viz_vra = VIZ_PALETTES['VRA']
             vra_visualized = vra_image.visualize(**viz_vra)
@@ -1005,17 +1009,17 @@ def execute_analysis(args):
                 region=roi,
                 scale=10,
                 maxPixels=1e9,
-                fileFormat='PNG'
+                fileFormat='GEO_TIFF'
             )
             task_vra_png.start()
             tasks.append({
-                'name': 'PNG_VRA.png',
+                'name': 'PNG_VRA.tif',
                 'type': 'png_vra',
                 'id': task_vra_png.id,
                 'folder': 'WEB'
             })
         
-        # PNG LST
+        # LST visualizado
         if lst is not None:
             viz_lst = VIZ_PALETTES['LST']
             lst_visualized = lst.visualize(**viz_lst)
@@ -1028,16 +1032,16 @@ def execute_analysis(args):
                 region=roi,
                 scale=250,
                 maxPixels=1e9,
-                fileFormat='PNG'
+                fileFormat='GEO_TIFF'
             )
             task_lst_png.start()
             tasks.append({
-                'name': 'PNG_LST.png',
+                'name': 'PNG_LST.tif',
                 'type': 'png_lst',
                 'id': task_lst_png.id,
                 'folder': 'WEB'
             })
-    
+            
     # ---------- GEOTIFF EXPORTS (Analysis) ----------
     indices_to_export_tiff = ['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI', 'OSAVI']
     
@@ -1191,7 +1195,7 @@ def execute_analysis(args):
     image_urls = {}
     if bounds:
         for idx in ['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI', 'VRA', 'LST']:
-            image_urls[idx] = f"/api/images/{job_id}/PNG_{idx}.png"
+            image_urls[idx] = f"/api/images/{job_id}/PNG_{idx}.tif"
     
     # Return result
     result = {
@@ -1206,7 +1210,7 @@ def execute_analysis(args):
         'task_count': len(tasks),
         'folders': folders,
         'time_series': time_series,
-        'message': f'Analysis complete. {len(tasks)} export tasks started ({len([t for t in tasks if "png" in t["type"]])} PNGs for web).'
+        'message': f'Analysis complete. {len(tasks)} export tasks started ({len([t for t in tasks if "png" in t["type"]])} visualized GeoTIFFs for web).'
     }
     
     return result
@@ -1292,8 +1296,8 @@ def download_results(args):
     if analysis_type == 'biweekly':
         files = {
             'WEB': [
-                {'name': 'PNG_NDVI.png', 'type': 'png_ndvi'},
-                {'name': 'PNG_NDWI.png', 'type': 'png_ndwi'},
+                {'name': 'PNG_NDVI.tif', 'type': 'png_ndvi'},
+                {'name': 'PNG_NDWI.tif', 'type': 'png_ndwi'},
             ],
             'DATA': [
                 {'name': 'KPIs_BIWEEKLY.csv', 'type': 'kpis_biweekly'},
@@ -1302,13 +1306,13 @@ def download_results(args):
     else:
         files = {
             'WEB': [
-                {'name': 'PNG_NDVI.png', 'type': 'png_ndvi'},
-                {'name': 'PNG_NDWI.png', 'type': 'png_ndwi'},
-                {'name': 'PNG_EVI.png', 'type': 'png_evi'},
-                {'name': 'PNG_NDCI.png', 'type': 'png_ndci'},
-                {'name': 'PNG_SAVI.png', 'type': 'png_savi'},
-                {'name': 'PNG_VRA.png', 'type': 'png_vra'},
-                {'name': 'PNG_LST.png', 'type': 'png_lst'},
+                {'name': 'PNG_NDVI.tif', 'type': 'png_ndvi'},
+                {'name': 'PNG_NDWI.tif', 'type': 'png_ndwi'},
+                {'name': 'PNG_EVI.tif', 'type': 'png_evi'},
+                {'name': 'PNG_NDCI.tif', 'type': 'png_ndci'},
+                {'name': 'PNG_SAVI.tif', 'type': 'png_savi'},
+                {'name': 'PNG_VRA.tif', 'type': 'png_vra'},
+                {'name': 'PNG_LST.tif', 'type': 'png_lst'},
             ],
             'TIFF': [
                 {'name': 'TIFF_NDVI.tif', 'type': 'tiff_ndvi'},
