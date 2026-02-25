@@ -2,13 +2,11 @@
 Mu.Orbita API - Main Application
 FastAPI backend para dashboard de agricultura de precisión
 """
-
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import time
-
 from app.config import settings
 from app.database import check_db_connection
 from app.routers import auth_router, dashboard_router, webhooks_router, gee_router, reports_router, images_router
@@ -43,6 +41,7 @@ app = FastAPI(
     redoc_url="/redoc" if settings.debug else None,
     lifespan=lifespan
 )
+
 
 # CORS
 app.add_middleware(
@@ -107,13 +106,13 @@ async def health_check():
     }
 
 
-# Incluir routers
+# Incluir routers - TODOS con prefix /api/v1
 app.include_router(auth_router, prefix=f"/api/{settings.api_version}")
 app.include_router(dashboard_router, prefix=f"/api/{settings.api_version}")
 app.include_router(webhooks_router, prefix=f"/api/{settings.api_version}")
-app.include_router(images_router)
-app.include_router(gee_router)
-app.include_router(reports_router)
+app.include_router(images_router, prefix=f"/api/{settings.api_version}")
+app.include_router(gee_router, prefix=f"/api/{settings.api_version}")
+app.include_router(reports_router, prefix=f"/api/{settings.api_version}")
 
 
 # Para desarrollo local
