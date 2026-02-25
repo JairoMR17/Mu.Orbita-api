@@ -15,7 +15,6 @@ NOVEDADES V4.1:
 MODOS:
     baseline:   Análisis completo (18+ exports, VRA, todos los índices)
     biweekly:   Seguimiento ligero (3 exports, weather, deltas)
-
 Uso:
     python gee_automation.py --mode execute --job-id JOB_123 --roi '{"type":"Polygon",...}' --analysis-type biweekly
 """
