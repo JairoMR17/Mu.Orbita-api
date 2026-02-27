@@ -611,7 +611,7 @@ async def create_report_link(
         client_id=client.id,
         report_type=data.report_type,
         pdf_url=data.pdf_url,
-        status="completed"
+        
     )
     
     db.add(new_report)
