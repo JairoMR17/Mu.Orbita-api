@@ -106,13 +106,15 @@ async def health_check():
     }
 
 
-# Incluir routers - TODOS con prefix /api/v1
+# Routers SIN prefix interno → main.py añade /api/v1
 app.include_router(auth_router, prefix=f"/api/{settings.api_version}")
 app.include_router(dashboard_router, prefix=f"/api/{settings.api_version}")
 app.include_router(webhooks_router, prefix=f"/api/{settings.api_version}")
-app.include_router(images_router, prefix=f"/api/{settings.api_version}")
 app.include_router(gee_router, prefix=f"/api/{settings.api_version}")
-app.include_router(reports_router, prefix=f"/api/{settings.api_version}")
+
+# Routers CON prefix interno → main.py NO añade nada
+app.include_router(images_router)
+app.include_router(reports_router)
 
 
 # Para desarrollo local
