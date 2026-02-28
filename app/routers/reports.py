@@ -39,6 +39,9 @@ class PDFRequest(BaseModel):
     html_report: Optional[str] = ""
     markdown_analysis: Optional[str] = ""
     time_series: Optional[List[Dict]] = None
+
+    png_images: Optional[List[Dict]] = None
+    drive_images: Optional[List[Dict]] = None
     
     class Config:
         populate_by_name = True
