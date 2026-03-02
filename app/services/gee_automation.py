@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Mu.Orbita GEE Automation Script v5.0 (NO-DRIVE)
-=================================================
+Mu.Orbita GEE Automation Script v5.1 (COMPOSITE IMAGES)
+=========================================================
 
-CAMBIOS V5.0 vs V4.1:
-✅ Eliminado Export.image.toDrive() — ya no necesita Google Drive
-✅ PNGs generados con getThumbURL() — descarga directa e inmediata
-✅ Imágenes devueltas como base64 en el JSON — listas para BD/dashboard/PDF
-✅ CSVs eliminados de Drive — datos ya están en el JSON de respuesta
-✅ Ejecución 10x más rápida (2-5 min vs 20-40 min)
-✅ Sin tareas asíncronas — todo se resuelve en una sola llamada
-✅ Compatible con el router gee.py existente (misma interfaz)
+CAMBIOS V5.1 vs V5.0:
+✅ PNGs ahora son COMPOSITES: Satelital RGB + Overlay índice + Contorno parcela
+✅ Nueva función get_composite_png_base64() reemplaza get_png_base64()
+✅ Imagen RGB satelital de referencia incluida (PNG_RGB)
+✅ Leyenda con colorbar añadida a cada imagen (requiere Pillow)
+✅ Alpha configurable por índice (VRA=0.65, LST=0.70, resto=0.55)
+✅ Buffer geográfico para contexto visual (50m alrededor de parcela)
+✅ Todo lo demás IDÉNTICO a v5.0 (ERA5, VRA, series temporales, etc.)
 
 MODOS:
-    baseline:   Análisis completo (todos los índices + VRA + imágenes PNG)
+    baseline:   Análisis completo (todos los índices + VRA + imágenes compuestas)
     biweekly:   Seguimiento ligero (NDVI + NDWI + weather ERA5)
 """
 
@@ -22,6 +22,7 @@ import json
 import ee
 import sys
 import os
+import io
 import base64
 import urllib.request
 from datetime import datetime, timedelta
@@ -59,35 +60,49 @@ VIZ_PALETTES = {
     'NDVI': {
         'min': 0.0, 'max': 0.8,
         'palette': ['8B0000', 'FF0000', 'FF6347', 'FFA500', 'FFFF00', 
-                    'ADFF2F', '7CFC00', '32CD32', '228B22', '006400']
+                    'ADFF2F', '7CFC00', '32CD32', '228B22', '006400'],
+        'alpha': 0.55,
+        'label': 'NDVI (Vigor Vegetativo)'
     },
     'NDWI': {
         'min': -0.3, 'max': 0.4,
         'palette': ['8B4513', 'D2691E', 'F4A460', 'FFF8DC', 'E0FFFF', 
-                    '87CEEB', '4682B4', '0000CD', '00008B']
+                    '87CEEB', '4682B4', '0000CD', '00008B'],
+        'alpha': 0.55,
+        'label': 'NDWI (Estado Hídrico)'
     },
     'EVI': {
         'min': 0.0, 'max': 0.6,
         'palette': ['8B0000', 'CD5C5C', 'F08080', 'FFFFE0', 'ADFF2F', 
-                    '7FFF00', '32CD32', '228B22', '006400']
+                    '7FFF00', '32CD32', '228B22', '006400'],
+        'alpha': 0.55,
+        'label': 'EVI (Productividad)'
     },
     'NDCI': {
         'min': -0.2, 'max': 0.6,
         'palette': ['8B0000', 'FF6347', 'FFA500', 'FFFF00', 'ADFF2F', 
-                    '7CFC00', '32CD32', '228B22', '006400']
+                    '7CFC00', '32CD32', '228B22', '006400'],
+        'alpha': 0.55,
+        'label': 'NDCI (Clorofila)'
     },
     'SAVI': {
         'min': 0.0, 'max': 0.8,
         'palette': ['8B0000', 'FF0000', 'FF6347', 'FFA500', 'FFFF00', 
-                    'ADFF2F', '7CFC00', '32CD32', '228B22', '006400']
+                    'ADFF2F', '7CFC00', '32CD32', '228B22', '006400'],
+        'alpha': 0.55,
+        'label': 'SAVI (Vigor Ajustado Suelo)'
     },
     'VRA': {
         'min': 0, 'max': 2,
-        'palette': ['e74c3c', 'f1c40f', '27ae60']
+        'palette': ['e74c3c', 'f1c40f', '27ae60'],
+        'alpha': 0.65,
+        'label': 'Zonas de Manejo Variable'
     },
     'LST': {
         'min': 15, 'max': 45,
-        'palette': ['0000FF', '00FFFF', '00FF00', 'FFFF00', 'FF0000']
+        'palette': ['0000FF', '00FFFF', '00FF00', 'FFFF00', 'FF0000'],
+        'alpha': 0.70,
+        'label': 'Temperatura Superficial (°C)'
     }
 }
 
@@ -96,7 +111,7 @@ VIZ_PALETTES = {
 # ============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Mu.Orbita GEE Automation v5.0 (No-Drive)')
+    parser = argparse.ArgumentParser(description='Mu.Orbita GEE Automation v5.1 (Composite Images)')
     parser.add_argument('--mode', required=True, 
                         choices=['execute', 'check-status', 'download-results', 'start-tasks'])
     parser.add_argument('--job-id', required=True)
@@ -150,47 +165,250 @@ def get_bounds(roi):
         return None
 
 
-def get_png_base64(image, roi, viz_params, dimensions=1024):
+# ============================================================================
+# GENERACIÓN DE IMÁGENES COMPUESTAS (NUEVO EN V5.1)
+# ============================================================================
+
+def get_composite_png_base64(
+    index_image,
+    sentinel_rgb_image,
+    roi,
+    viz_params,
+    alpha=0.55,
+    dimensions=1024,
+    boundary_color='FFFFFF',
+    boundary_width=2,
+    buffer_meters=50
+):
     """
-    Genera un PNG coloreado directamente desde GEE y lo devuelve como base64.
+    Genera un PNG COMPUESTO: Satelital RGB + Overlay índice + Contorno parcela.
     
-    SIN exportar a Drive. Usa getThumbURL() para obtener una URL temporal,
-    descarga los bytes y los codifica en base64.
+    ANTES (v5.0): Solo el índice coloreado → heatmap pixelado sin contexto.
+    AHORA (v5.1): Imagen satelital real + índice semitransparente + contorno blanco.
     
     Args:
-        image: ee.Image con la banda a visualizar
-        roi: ee.Geometry del área
-        viz_params: dict con min, max, palette
-        dimensions: resolución máxima del PNG (px del lado más largo)
+        index_image:        ee.Image con 1 banda del índice (NDVI, NDWI, etc.)
+        sentinel_rgb_image: ee.Image Sentinel-2 con bandas B4, B3, B2 (ya dividida por 10000)
+        roi:                ee.Geometry de la parcela
+        viz_params:         dict con min, max, palette del índice
+        alpha:              peso del overlay (0=solo satélite, 1=solo índice). Default 0.55
+        dimensions:         resolución máxima del PNG. Default 1024
+        boundary_color:     color hex del contorno. Default 'FFFFFF'
+        boundary_width:     grosor del contorno en píxeles. Default 2
+        buffer_meters:      buffer alrededor del ROI para contexto. Default 50
     
     Returns:
-        str: PNG codificado en base64, o None si falla
+        str: PNG en base64, o None si falla
     """
     try:
-        # Generar URL temporal del PNG coloreado
-        url = image.visualize(**viz_params).getThumbURL({
+        # ── 1. Imagen satelital true-color RGB ──────────────────────
+        # Sentinel-2 ya está en reflectancia (dividido por 10000), escala 0-0.3
+        rgb = sentinel_rgb_image.select(['B4', 'B3', 'B2']).visualize(
+            min=0, max=0.3, gamma=1.3
+        )
+        
+        # ── 2. Índice coloreado con paleta ──────────────────────────
+        index_viz = {k: v for k, v in viz_params.items() if k in ('min', 'max', 'palette')}
+        index_colored = index_image.visualize(**index_viz)
+        
+        # ── 3. Blending: mezcla satelital + índice ──────────────────
+        # Ambas son imágenes RGB 0-255 (vis-red, vis-green, vis-blue)
+        blended = rgb.multiply(1.0 - alpha).add(index_colored.multiply(alpha)).toUint8()
+        
+        # ── 4. Contorno de parcela ──────────────────────────────────
+        roi_fc = ee.FeatureCollection([ee.Feature(roi)])
+        outline = ee.Image().byte().paint(
+            featureCollection=roi_fc,
+            color=1,
+            width=boundary_width
+        )
+        outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
+        
+        # Superponer contorno sobre el blend
+        final = blended.blend(outline_vis)
+        
+        # ── 5. Región con buffer para contexto visual ───────────────
+        buffered_region = roi.buffer(buffer_meters).bounds()
+        region_coords = buffered_region.getInfo()['coordinates']
+        
+        # ── 6. Generar thumbnail URL y descargar ────────────────────
+        url = final.getThumbURL({
+            'region': region_coords,
+            'dimensions': dimensions,
+            'format': 'png'
+        })
+        
+        req = urllib.request.Request(url)
+        req.add_header('User-Agent', 'MuOrbita/5.1')
+        response = urllib.request.urlopen(req, timeout=60)
+        png_bytes = response.read()
+        
+        if len(png_bytes) < 100:
+            print(f"Warning: Composite PNG too small ({len(png_bytes)} bytes)")
+            return None
+        
+        return base64.b64encode(png_bytes).decode('utf-8')
+        
+    except Exception as e:
+        print(f"Warning: Could not generate composite PNG: {e}")
+        return None
+
+
+def get_rgb_png_base64(sentinel_rgb_image, roi, dimensions=1024, 
+                        boundary_color='FFFFFF', boundary_width=2, buffer_meters=50):
+    """
+    Genera un PNG solo de imagen satelital true-color (referencia visual).
+    """
+    try:
+        rgb = sentinel_rgb_image.select(['B4', 'B3', 'B2']).visualize(
+            min=0, max=0.3, gamma=1.3
+        )
+        
+        roi_fc = ee.FeatureCollection([ee.Feature(roi)])
+        outline = ee.Image().byte().paint(roi_fc, 1, boundary_width)
+        outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
+        final = rgb.blend(outline_vis)
+        
+        buffered_region = roi.buffer(buffer_meters).bounds()
+        region_coords = buffered_region.getInfo()['coordinates']
+        
+        url = final.getThumbURL({
+            'region': region_coords,
+            'dimensions': dimensions,
+            'format': 'png'
+        })
+        
+        req = urllib.request.Request(url)
+        req.add_header('User-Agent', 'MuOrbita/5.1')
+        response = urllib.request.urlopen(req, timeout=60)
+        png_bytes = response.read()
+        
+        if len(png_bytes) < 100:
+            return None
+        
+        return base64.b64encode(png_bytes).decode('utf-8')
+        
+    except Exception as e:
+        print(f"Warning: Could not generate RGB PNG: {e}")
+        return None
+
+
+def get_plain_png_base64(image, roi, viz_params, dimensions=1024):
+    """
+    FALLBACK: Genera PNG coloreado SIN composición satelital.
+    Idéntico al get_png_base64() de v5.0 — se usa si no hay imagen Sentinel disponible
+    (por ejemplo para LST MODIS que tiene resolución diferente).
+    """
+    try:
+        url = image.visualize(**{k: v for k, v in viz_params.items() 
+                                  if k in ('min', 'max', 'palette')}).getThumbURL({
             'region': roi,
             'dimensions': dimensions,
             'format': 'png'
         })
         
-        # Descargar PNG inmediatamente
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.0')
+        req.add_header('User-Agent', 'MuOrbita/5.1')
         response = urllib.request.urlopen(req, timeout=60)
         png_bytes = response.read()
         
-        # Verificar que recibimos datos válidos
         if len(png_bytes) < 100:
-            print(f"Warning: PNG too small ({len(png_bytes)} bytes), might be an error")
             return None
         
-        # Codificar en base64
         return base64.b64encode(png_bytes).decode('utf-8')
         
     except Exception as e:
-        print(f"Warning: Could not generate PNG: {e}")
+        print(f"Warning: Could not generate plain PNG: {e}")
         return None
+
+
+# ============================================================================
+# LEYENDAS CON PIL (OPCIONAL)
+# ============================================================================
+
+def add_legend_to_png(png_base64, index_name, mean_value=None):
+    """
+    Añade barra de color (leyenda) y título a un PNG compuesto.
+    Requiere Pillow. Si no está instalado, devuelve la imagen original.
+    
+    Args:
+        png_base64:  PNG en base64
+        index_name:  'NDVI', 'NDWI', etc.
+        mean_value:  valor medio para mostrar (ej: 0.65)
+    
+    Returns:
+        PNG con leyenda, en base64
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return png_base64
+    
+    viz = VIZ_PALETTES.get(index_name)
+    if not viz:
+        return png_base64
+    
+    img_bytes = base64.b64decode(png_base64)
+    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+    
+    # Dimensiones de la leyenda
+    legend_h = 70
+    pad = 16
+    bar_h = 16
+    bar_w = min(280, img.width - 2 * pad)
+    
+    # Nueva imagen con espacio para leyenda
+    new_img = Image.new('RGB', (img.width, img.height + legend_h), (25, 22, 20))
+    new_img.paste(img, (0, 0))
+    draw = ImageDraw.Draw(new_img)
+    
+    # Fuentes
+    try:
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+    except (OSError, IOError):
+        font_title = ImageFont.load_default()
+        font_small = font_title
+    
+    y0 = img.height + 6
+    
+    # Título
+    label = viz.get('label', index_name)
+    if mean_value is not None:
+        label += f"  |  Media: {mean_value:.2f}"
+    draw.text((pad, y0), label, fill=(240, 240, 240), font=font_title)
+    
+    # Barra de color
+    bar_y = y0 + 22
+    colors_hex = viz['palette']
+    colors_rgb = [tuple(int(h[i:i+2], 16) for i in (0, 2, 4)) for h in colors_hex]
+    n = len(colors_rgb)
+    
+    for x in range(bar_w):
+        t = x / bar_w
+        idx = t * (n - 1)
+        i = min(int(idx), n - 2)
+        f = idx - i
+        c1, c2 = colors_rgb[i], colors_rgb[i + 1]
+        color = tuple(int(c1[j] * (1 - f) + c2[j] * f) for j in range(3))
+        draw.rectangle([pad + x, bar_y, pad + x + 1, bar_y + bar_h], fill=color)
+    
+    draw.rectangle([pad, bar_y, pad + bar_w, bar_y + bar_h], outline=(120, 120, 120), width=1)
+    
+    # Etiquetas
+    ey = bar_y + bar_h + 3
+    draw.text((pad, ey), str(viz['min']), fill=(170, 170, 170), font=font_small)
+    max_str = str(viz['max'])
+    draw.text((pad + bar_w - len(max_str) * 7, ey), max_str, fill=(170, 170, 170), font=font_small)
+    mid = (viz['min'] + viz['max']) / 2
+    mid_str = f"{mid:.1f}"
+    draw.text((pad + bar_w // 2 - len(mid_str) * 3, ey), mid_str, fill=(170, 170, 170), font=font_small)
+    
+    # Exportar
+    out = io.BytesIO()
+    new_img.save(out, format='PNG', optimize=True)
+    out.seek(0)
+    return base64.b64encode(out.read()).decode('utf-8')
 
 
 # ============================================================================
@@ -560,7 +778,7 @@ def get_era5_weather(roi, start_date, end_date):
 
 def execute_biweekly_analysis(args):
     """
-    Análisis BIWEEKLY ligero — SIN Drive, PNGs directos.
+    Análisis BIWEEKLY ligero — PNGs compuestos directos.
     """
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
@@ -582,6 +800,9 @@ def execute_biweekly_analysis(args):
     
     indexed_collection = collection.map(calculate_indices)
     composite = indexed_collection.median().clip(roi)
+    
+    # ── Imagen Sentinel-2 más reciente (para fondo RGB) ─────────────
+    latest_sentinel = indexed_collection.sort('system:time_start', False).first().clip(roi)
     
     latest = collection.sort('system:time_start', False).first()
     try:
@@ -627,6 +848,7 @@ def execute_biweekly_analysis(args):
         ).getInfo()
         lst_mean = lst_stats.get('LST_C_mean', None)
     except:
+        lst = None
         lst_mean = None
     
     # ========== SERIE TEMPORAL ==========
@@ -651,23 +873,46 @@ def execute_biweekly_analysis(args):
     except Exception as e:
         print(f"Warning: Could not get time series: {e}")
     
-    # ========== GENERAR PNGs DIRECTAMENTE (SIN DRIVE) ==========
-    print("Generating PNG images directly from GEE...")
+    # ========== GENERAR PNGs COMPUESTOS (v5.1) ==========
+    print("Generating COMPOSITE PNG images (satellite + overlay)...")
     
     images_base64 = {}
+    
+    # KPIs para leyendas
+    kpi_means = {
+        'NDVI': stats.get('NDVI_mean'),
+        'NDWI': stats.get('NDWI_mean'),
+    }
+    
     for idx_name in ['NDVI', 'NDWI']:
-        print(f"  Generating {idx_name} PNG...")
-        b64 = get_png_base64(
-            composite.select(idx_name), 
-            roi, 
-            VIZ_PALETTES[idx_name],
+        print(f"  Generating composite {idx_name}...")
+        viz = VIZ_PALETTES[idx_name]
+        b64 = get_composite_png_base64(
+            index_image=composite.select(idx_name),
+            sentinel_rgb_image=latest_sentinel,
+            roi=roi,
+            viz_params=viz,
+            alpha=viz.get('alpha', 0.55),
             dimensions=1024
         )
         if b64:
+            # Añadir leyenda
+            b64 = add_legend_to_png(b64, idx_name, kpi_means.get(idx_name))
             images_base64[idx_name] = b64
-            print(f"  ✓ {idx_name}: {len(b64)} chars base64")
+            print(f"  ✓ {idx_name}: composite + legend OK")
         else:
-            print(f"  ✗ {idx_name}: failed")
+            print(f"  ✗ {idx_name}: failed, trying plain fallback...")
+            b64 = get_plain_png_base64(composite.select(idx_name), roi, viz)
+            if b64:
+                images_base64[idx_name] = b64
+                print(f"  ✓ {idx_name}: plain fallback OK")
+    
+    # Imagen RGB de referencia
+    print("  Generating RGB reference...")
+    rgb_b64 = get_rgb_png_base64(latest_sentinel, roi, dimensions=1024)
+    if rgb_b64:
+        images_base64['RGB'] = rgb_b64
+        print("  ✓ RGB: OK")
     
     # ========== KPIs ==========
     kpis = {
@@ -713,7 +958,7 @@ def execute_biweekly_analysis(args):
         'images_base64': images_base64,
         'tasks': [],
         'task_count': 0,
-        'message': f'Biweekly analysis complete. {len(images_base64)} PNG images generated directly. No Drive exports needed.'
+        'message': f'Biweekly analysis complete. {len(images_base64)} composite PNG images generated.'
     }
     
     return result
@@ -725,7 +970,7 @@ def execute_biweekly_analysis(args):
 
 def execute_analysis(args):
     """
-    Análisis BASELINE completo — SIN Drive, PNGs directos.
+    Análisis BASELINE completo — PNGs compuestos directos.
     """
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
@@ -745,6 +990,9 @@ def execute_analysis(args):
     
     indexed_collection = collection.map(calculate_indices)
     composite = indexed_collection.median().clip(roi)
+    
+    # ── Imagen Sentinel-2 más reciente (para fondo RGB de composites) ──
+    latest_sentinel = indexed_collection.sort('system:time_start', False).first().clip(roi)
     
     latest = collection.sort('system:time_start', False).first()
     try:
@@ -834,51 +1082,89 @@ def execute_analysis(args):
         'valid_pixels': stats.get('NDVI_count', 0)
     }
     
-    # ========== GENERAR PNGs DIRECTAMENTE (SIN DRIVE) ==========
-    print("Generating PNG images directly from GEE...")
+    # ========== GENERAR PNGs COMPUESTOS (v5.1) ==========
+    print("Generating COMPOSITE PNG images (satellite + overlay + boundary)...")
     
     images_base64 = {}
     
-    # Índices vegetativos
+    # Dict de valores medios para leyendas
+    kpi_means = {
+        'NDVI': kpis.get('ndvi_mean'),
+        'NDWI': kpis.get('ndwi_mean'),
+        'EVI':  kpis.get('evi_mean'),
+        'NDCI': kpis.get('ndci_mean'),
+        'SAVI': kpis.get('savi_mean'),
+        'LST':  kpis.get('lst_mean_c'),
+    }
+    
+    # ── Índices vegetativos (composite: satélite + overlay + contorno) ──
     for idx_name in ['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI']:
-        print(f"  Generating {idx_name} PNG...")
-        b64 = get_png_base64(
-            composite.select(idx_name), 
-            roi, 
-            VIZ_PALETTES[idx_name],
+        print(f"  Generating composite {idx_name}...")
+        viz = VIZ_PALETTES[idx_name]
+        
+        b64 = get_composite_png_base64(
+            index_image=composite.select(idx_name),
+            sentinel_rgb_image=latest_sentinel,
+            roi=roi,
+            viz_params=viz,
+            alpha=viz.get('alpha', 0.55),
             dimensions=1024
         )
+        
         if b64:
+            b64 = add_legend_to_png(b64, idx_name, kpi_means.get(idx_name))
             images_base64[idx_name] = b64
-            print(f"  ✓ {idx_name}: {len(b64)} chars base64")
+            print(f"  ✓ {idx_name}: composite + legend OK")
         else:
-            print(f"  ✗ {idx_name}: failed")
+            # Fallback: PNG plano sin fondo satelital
+            print(f"  ✗ {idx_name}: composite failed, trying plain fallback...")
+            b64 = get_plain_png_base64(composite.select(idx_name), roi, viz)
+            if b64:
+                b64 = add_legend_to_png(b64, idx_name, kpi_means.get(idx_name))
+                images_base64[idx_name] = b64
+                print(f"  ✓ {idx_name}: plain fallback + legend OK")
+            else:
+                print(f"  ✗ {idx_name}: all methods failed")
     
-    # VRA
+    # ── VRA (composite con alpha más alto para zonas claras) ────────
     if vra_image is not None:
-        print("  Generating VRA PNG...")
-        b64 = get_png_base64(
-            vra_image, 
-            roi, 
-            VIZ_PALETTES['VRA'],
+        print("  Generating composite VRA...")
+        viz = VIZ_PALETTES['VRA']
+        b64 = get_composite_png_base64(
+            index_image=vra_image,
+            sentinel_rgb_image=latest_sentinel,
+            roi=roi,
+            viz_params=viz,
+            alpha=viz.get('alpha', 0.65),
             dimensions=1024
         )
         if b64:
+            b64 = add_legend_to_png(b64, 'VRA')
             images_base64['VRA'] = b64
-            print(f"  ✓ VRA: {len(b64)} chars base64")
+            print("  ✓ VRA: composite + legend OK")
+        else:
+            b64 = get_plain_png_base64(vra_image, roi, viz)
+            if b64:
+                images_base64['VRA'] = b64
     
-    # LST
+    # ── LST (plain — resolución MODIS 1km no encaja bien con Sentinel 10m) ──
     if lst is not None:
-        print("  Generating LST PNG...")
-        b64 = get_png_base64(
-            lst, 
-            roi, 
-            VIZ_PALETTES['LST'],
-            dimensions=512
-        )
+        print("  Generating LST PNG (plain — different resolution)...")
+        viz = VIZ_PALETTES['LST']
+        b64 = get_plain_png_base64(lst, roi, viz, dimensions=512)
         if b64:
+            b64 = add_legend_to_png(b64, 'LST', kpi_means.get('LST'))
             images_base64['LST'] = b64
-            print(f"  ✓ LST: {len(b64)} chars base64")
+            print("  ✓ LST: plain + legend OK")
+    
+    # ── Imagen RGB satelital de referencia ──────────────────────────
+    print("  Generating RGB reference image...")
+    rgb_b64 = get_rgb_png_base64(latest_sentinel, roi, dimensions=1024)
+    if rgb_b64:
+        images_base64['RGB'] = rgb_b64
+        print("  ✓ RGB: OK")
+    
+    print(f"\n  Total images generated: {len(images_base64)}")
     
     # ========== SERIE TEMPORAL ==========
     time_series = []
@@ -916,7 +1202,7 @@ def execute_analysis(args):
         'time_series': time_series,
         'tasks': [],
         'task_count': 0,
-        'message': f'Baseline analysis complete. {len(images_base64)} PNG images generated directly. No Drive exports needed.'
+        'message': f'Baseline analysis complete. {len(images_base64)} composite PNG images generated.'
     }
     
     return result
@@ -926,7 +1212,7 @@ def execute_analysis(args):
 # ============================================================================
 
 def check_status(args):
-    """Check status — con v5.0 siempre está completo (no hay tasks asíncronos)"""
+    """Check status — con v5.x siempre está completo (no hay tasks asíncronos)"""
     return {
         'job_id': args.job_id,
         'tasks': [],
@@ -939,7 +1225,7 @@ def check_status(args):
         'png_complete': True,
         'any_failed': False,
         'progress_pct': 100,
-        'message': 'v5.0: No async tasks. All data returned immediately in execute response.'
+        'message': 'v5.1: No async tasks. All data returned immediately in execute response.'
     }
 
 # ============================================================================
@@ -947,13 +1233,13 @@ def check_status(args):
 # ============================================================================
 
 def download_results(args):
-    """Download results — con v5.0 no aplica, datos ya en JSON"""
+    """Download results — con v5.x no aplica, datos ya en JSON"""
     return {
         'job_id': args.job_id,
         'analysis_type': getattr(args, 'analysis_type', 'baseline'),
         'status': 'ready',
         'download_ready': True,
-        'message': 'v5.0: All data (KPIs, images, time series) returned directly in the execute response. No Drive downloads needed.'
+        'message': 'v5.1: All data returned directly in execute response. No Drive downloads needed.'
     }
 
 # ============================================================================
@@ -961,11 +1247,11 @@ def download_results(args):
 # ============================================================================
 
 def start_tasks(args):
-    """Start tasks — con v5.0 no aplica"""
+    """Start tasks — con v5.x no aplica"""
     return {
         'job_id': args.job_id,
         'started': 0,
-        'message': 'v5.0: No async tasks to start. All processing is synchronous.'
+        'message': 'v5.1: No async tasks to start. All processing is synchronous.'
     }
 
 # ============================================================================
