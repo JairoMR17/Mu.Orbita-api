@@ -1,15 +1,14 @@
 """
-Mu.Orbita PDF Report Generator v3.1
+Mu.Orbita PDF Report Generator v3.2
 ====================================
-Generador profesional de informes PDF con ReportLab.
-
-CAMBIOS v3.1 vs v3.0:
-- Soporte para png_images reales desde n8n (base64)
-- _real_or_generated(): usa PNG real si existe, fallback a matplotlib
-- png_map construido en __init__ indexado por nombre de imagen
+FIX v3.2 vs v3.1:
+- KEY MAPPING: GEE envía 'NDVI'/'NDWI' pero v3.1 buscaba 'NDVI_MAP'/'NDWI_MAP'
+- Ahora acepta ambos formatos de clave
+- También lee images_base64 directamente (no solo png_images)
+- Log detallado para debug
 
 Autor: Mu.Orbita
-Fecha: 2026-02
+Fecha: 2026-03
 """
 
 import io
@@ -472,6 +471,7 @@ def generate_ndvi_gauge(ndvi_mean, ndvi_p10, ndvi_p90, width_px=520, height_px=1
 
 def generate_heatmap(title, mean_val, cmap_name='RdYlGn',
                      width_px=280, height_px=220) -> bytes:
+    """FALLBACK ONLY — solo se usa si NO hay composite de GEE."""
     _chart_style()
     fig, ax = plt.subplots(figsize=(width_px/100, height_px/100), dpi=180)
 
@@ -508,6 +508,24 @@ def generate_heatmap(title, mean_val, cmap_name='RdYlGn',
 
 class MuOrbitaPDFGenerator:
 
+    # ── v3.2: MAPEO DE CLAVES GEE → PDF ──────────────────────────
+    # GEE v5.1 envía: NDVI, NDWI, EVI, NDCI, SAVI, VRA, LST, RGB
+    # PDF v3.1 esperaba: NDVI_MAP, NDWI_MAP, TIME_SERIES, NDVI_DISTRIBUTION
+    # Este mapeo acepta AMBOS formatos
+    KEY_ALIASES = {
+        'NDVI_MAP':          ['NDVI_MAP', 'NDVI', 'ndvi', 'ndvi_map'],
+        'NDWI_MAP':          ['NDWI_MAP', 'NDWI', 'ndwi', 'ndwi_map'],
+        'EVI_MAP':           ['EVI_MAP', 'EVI', 'evi', 'evi_map'],
+        'NDCI_MAP':          ['NDCI_MAP', 'NDCI', 'ndci'],
+        'SAVI_MAP':          ['SAVI_MAP', 'SAVI', 'savi'],
+        'VRA_MAP':           ['VRA_MAP', 'VRA', 'vra'],
+        'LST_MAP':           ['LST_MAP', 'LST', 'lst'],
+        'RGB':               ['RGB', 'rgb', 'RGB_MAP'],
+        'TIME_SERIES':       ['TIME_SERIES', 'time_series'],
+        'NDVI_DISTRIBUTION': ['NDVI_DISTRIBUTION', 'ndvi_distribution'],
+        'KPI_SUMMARY':       ['KPI_SUMMARY', 'kpi_summary'],
+    }
+
     def __init__(self, data: Dict[str, Any]):
         self.d = data
         self.styles = get_styles()
@@ -516,38 +534,52 @@ class MuOrbitaPDFGenerator:
         self.M = 15*mm
         self.content_w = self.W - 2*self.M
 
-        # ── v3.1: índice de imágenes reales por nombre ──────────────────────
-        # Nombres esperados: NDVI_MAP, NDWI_MAP, KPI_SUMMARY, TIME_SERIES,
-        #                    NDVI_DISTRIBUTION, VRA (si aplica)
+        # ── v3.2: Build png_map from MULTIPLE sources ──────────────
         self.png_map = {}
+        
+        # Source 1: png_images array (from n8n pipeline)
         for img in data.get('png_images', []) or []:
             name = img.get('name', '')
             b64  = img.get('base64', '')
-            if name and b64:
+            if name and b64 and not b64.startswith('['):
                 self.png_map[name] = b64
+        
+        # Source 2: images_base64 dict (directly from GEE v5.1)
+        for name, b64 in (data.get('images_base64', {}) or {}).items():
+            if name and b64 and isinstance(b64, str) and not b64.startswith('['):
+                # Don't overwrite if already in png_map
+                if name not in self.png_map:
+                    self.png_map[name] = b64
+        
         if self.png_map:
-            print(f"✅ png_map cargado: {list(self.png_map.keys())}")
+            print(f"✅ PDF v3.2: png_map cargado con {len(self.png_map)} imágenes: {list(self.png_map.keys())}")
         else:
-            print("⚠️  png_map vacío — se usarán gráficos matplotlib como fallback")
+            print("⚠️  PDF v3.2: png_map vacío — se usarán gráficos matplotlib como fallback")
 
-    # ── v3.1: helper imagen real vs fallback ────────────────────────────────
+    # ── v3.2: helper imagen real vs fallback CON ALIAS ──────────────
     def _real_or_generated(self, name: str, fallback_bytes: bytes,
                            width_mm: float, height_mm: float) -> Image:
         """
         Devuelve un Image de ReportLab con el PNG real si existe en png_map,
         o con el gráfico matplotlib generado como fallback.
-
-        Args:
-            name:          Clave en png_map (ej: 'NDVI_MAP', 'TIME_SERIES')
-            fallback_bytes: Bytes del gráfico matplotlib ya generado
-            width_mm:      Ancho deseado en mm
-            height_mm:     Alto deseado en mm
+        
+        v3.2: Busca el nombre Y todos sus alias.
         """
+        # Buscar por nombre directo primero
         if name in self.png_map:
-            print(f"   🖼️  Usando PNG real: {name}")
+            print(f"   🛰️  Usando composite GEE: {name}")
             img_bytes = base64.b64decode(self.png_map[name])
             return Image(io.BytesIO(img_bytes), width=width_mm*mm, height=height_mm*mm)
-        print(f"   📊  Usando fallback matplotlib: {name}")
+        
+        # Buscar por aliases
+        aliases = self.KEY_ALIASES.get(name, [])
+        for alias in aliases:
+            if alias in self.png_map:
+                print(f"   🛰️  Usando composite GEE: {alias} (alias de {name})")
+                img_bytes = base64.b64decode(self.png_map[alias])
+                return Image(io.BytesIO(img_bytes), width=width_mm*mm, height=height_mm*mm)
+        
+        print(f"   📊  Fallback matplotlib: {name} (no encontrado en png_map: {list(self.png_map.keys())})")
         return Image(io.BytesIO(fallback_bytes), width=width_mm*mm, height=height_mm*mm)
 
     # --- Header / Footer ---
@@ -1018,7 +1050,7 @@ class MuOrbitaPDFGenerator:
         elements.append(SectionDivider(self.content_w))
         elements.append(Spacer(1, 2*mm))
 
-        # ── MAPAS: real PNG si existe, fallback a matplotlib ──
+        # ── MAPAS: v3.2 busca 'NDVI_MAP' Y 'NDVI' via aliases ──
         ndvi_map_bytes = generate_heatmap('NDVI (Vigor)', d.get('ndvi_mean', 0.3), 'RdYlGn')
         ndwi_map_bytes = generate_heatmap('NDWI (Agua)', max(0, d.get('ndwi_mean', 0)), 'YlGnBu')
 
@@ -1033,12 +1065,18 @@ class MuOrbitaPDFGenerator:
         elements.append(maps_tbl)
         elements.append(Spacer(1, 2*mm))
 
+        # ── v3.2: Nota dinámica según fuente de imágenes ──
+        has_real_maps = any(
+            alias in self.png_map 
+            for aliases in [self.KEY_ALIASES.get('NDVI_MAP', []), self.KEY_ALIASES.get('NDWI_MAP', [])]
+            for alias in aliases
+        )
         map_note = (
-            '<b>Nota:</b> Estos mapas muestran la distribución espacial de los índices '
-            'calculados sobre la geometría real de la parcela vía Google Earth Engine.'
-            if self.png_map else
-            '<b>Nota:</b> Estos mapas muestran la distribución espacial estimada. '
-            'En futuras entregas incluirán la geometría real de la parcela sobre imagen satelital base.'
+            '<b>Nota:</b> Mapas generados por Google Earth Engine sobre imagen satelital Sentinel-2 '
+            'con la geometría real de la parcela.'
+            if has_real_maps else
+            '<b>Nota:</b> Mapas sintéticos de distribución espacial estimada. '
+            'Contacte a soporte si no aparecen las imágenes satelitales reales.'
         )
         elements.append(Paragraph(f'<font size="8" color="{C["text_muted"]}">{map_note}</font>',
                                   s['Footnote']))
@@ -1149,6 +1187,7 @@ def generate_muorbita_report(data: Dict[str, Any]) -> Dict[str, Any]:
             'pdf_size': len(pdf_bytes),
             'job_id': job_id,
             'generated_at': datetime.now().isoformat(),
+            'images_used': list(generator.png_map.keys()) if generator.png_map else ['matplotlib_fallback'],
             'ndvi_mean': data.get('ndvi_mean', 0),
             'ndvi_p10': data.get('ndvi_p10', 0),
             'ndvi_p90': data.get('ndvi_p90', 0),
@@ -1192,7 +1231,7 @@ if __name__ == '__main__':
         "stress_area_ha": 21.1, "stress_area_pct": 78.5,
         "lst_mean_c": 18.2, "lst_min_c": 4.5, "lst_max_c": 32.8,
         "heterogeneity": 0.15,
-        "png_images": [],  # En producción vendrán con base64 desde n8n
+        "png_images": [],
         "time_series": [
             {"date": "2025-09-01", "ndvi": 0.35, "ndwi": 0.03, "evi": 0.30},
             {"date": "2025-10-01", "ndvi": 0.31, "ndwi": 0.01, "evi": 0.27},
@@ -1215,6 +1254,7 @@ if __name__ == '__main__':
         with open(out_path, 'wb') as f:
             f.write(base64.b64decode(result['pdf_base64']))
         print(f"✅ PDF generado: {out_path} ({result['pdf_size']:,} bytes)")
+        print(f"   Imágenes usadas: {result['images_used']}")
     else:
         print(f"❌ Error: {result['error']}")
         print(result.get('traceback', ''))
