@@ -1,17 +1,32 @@
 """
-Mu.Orbita API - GEE Router
-Endpoints para ejecutar análisis en Google Earth Engine
-VERSIÓN 4.1 - Con soporte para contexto fenológico + BIWEEKLY
+Mu.Orbita API - GEE Router v5.0 (NO-DRIVE)
+============================================
+
+CAMBIOS V5.0:
+✅ execute devuelve images_base64 directamente → se guardan en BD
+✅ Eliminados: start-tasks, check-status, download-results (legacy stubs)
+✅ Nuevo: guarda PNGs en tabla gee_images como base64
+✅ Nuevo: guarda KPIs y time_series en respuesta para n8n
+✅ Compatible con n8n workflow simplificado (sin loop Drive)
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
+from sqlalchemy.orm import Session
 import json
+import traceback
 from types import SimpleNamespace
+
+from app.database import get_db
+from app.models.gee_image import GEEImage
 
 router = APIRouter(prefix="/gee", tags=["GEE"])
 
+
+# =====================================================
+# REQUEST MODEL
+# =====================================================
 
 class GEERequest(BaseModel):
     mode: str
@@ -21,18 +36,18 @@ class GEERequest(BaseModel):
     end_date: Optional[str] = ""
     crop_type: str = "olivar"
     buffer_meters: int = 0
-    analysis_type: str = "baseline"  # "baseline" o "biweekly"
+    analysis_type: str = "baseline"
     output_dir: Optional[str] = ""
-    drive_folder: Optional[str] = "MuOrbita_Outputs"
+    drive_folder: Optional[str] = "MuOrbita_Outputs"  # legacy, unused
 
+
+# =====================================================
+# HELPERS
+# =====================================================
 
 def normalize_crop_type(crop_type: str) -> str:
-    """
-    Normaliza el tipo de cultivo al formato esperado por GEE.
-    """
     if not crop_type:
         return 'otro'
-    
     crop_map = {
         'olivo': 'olivo', 'olivar': 'olivo', 'oliva': 'olivo', 'olive': 'olivo',
         'viña': 'vina', 'vina': 'vina', 'viñedo': 'vina', 'vinedo': 'vina',
@@ -41,36 +56,80 @@ def normalize_crop_type(crop_type: str) -> str:
         'almond': 'almendro',
         'other': 'otro', 'otro': 'otro',
     }
-    
-    normalized = crop_type.lower().strip()
-    return crop_map.get(normalized, 'otro')
+    return crop_map.get(crop_type.lower().strip(), 'otro')
 
+
+def save_images_to_db(db: Session, job_id: str, images_base64: dict, bounds: dict = None):
+    """
+    Guarda las imágenes PNG (base64) directamente en la BD.
+    Reemplaza el flujo anterior: Drive export → search → download → convert.
+    
+    images_base64: {"NDVI": "iVBOR...", "NDWI": "iVBOR...", ...}
+    """
+    saved = []
+    
+    for index_type, b64_data in images_base64.items():
+        if not b64_data:
+            continue
+        
+        filename = f"PNG_{index_type}.png"
+        
+        # Upsert: actualizar si ya existe, crear si no
+        existing = db.query(GEEImage).filter(
+            GEEImage.job_id == job_id,
+            GEEImage.index_type == index_type
+        ).first()
+        
+        if existing:
+            existing.png_base64 = b64_data
+            if bounds:
+                existing.bounds_north = bounds.get('north')
+                existing.bounds_south = bounds.get('south')
+                existing.bounds_east = bounds.get('east')
+                existing.bounds_west = bounds.get('west')
+            saved.append({"index_type": index_type, "action": "updated"})
+        else:
+            new_image = GEEImage(
+                job_id=job_id,
+                index_type=index_type,
+                filename=filename,
+                png_base64=b64_data,
+                bounds_north=bounds.get('north') if bounds else None,
+                bounds_south=bounds.get('south') if bounds else None,
+                bounds_east=bounds.get('east') if bounds else None,
+                bounds_west=bounds.get('west') if bounds else None,
+            )
+            db.add(new_image)
+            saved.append({"index_type": index_type, "action": "created"})
+    
+    db.commit()
+    return saved
+
+
+# =====================================================
+# EXECUTE ENDPOINT
+# =====================================================
 
 @router.post("/execute")
-async def execute_gee(request: GEERequest):
+async def execute_gee(request: GEERequest, db: Session = Depends(get_db)):
     """
-    Ejecuta análisis GEE v4.1 con soporte para baseline y biweekly.
+    Ejecuta análisis GEE v5.0 — sin Drive, PNGs directos.
     
-    Modos disponibles:
-    - execute: Ejecuta el análisis completo (baseline) o ligero (biweekly)
-    - check-status: Verifica estado de tareas
-    - download-results: Descarga resultados de Drive
-    - start-tasks: Inicia tareas de exportación
-    - generate-script: Solo genera el script (para debug)
+    Flujo:
+    1. Llama a gee_automation.execute_analysis() o execute_biweekly_analysis()
+    2. Recibe KPIs + images_base64 + time_series en el JSON
+    3. Guarda imágenes PNG en la BD automáticamente
+    4. Devuelve todo a n8n para generar informe Claude + PDF
     
-    analysis_type:
-    - baseline: Análisis completo (~20 exports, VRA, todos los índices)
-    - biweekly: Seguimiento ligero (3 exports, weather ERA5, deltas)
+    n8n ya NO necesita: start-tasks, wait, download-results, buscar TIF en Drive
     """
     try:
-        # Normalizar tipo de cultivo
         normalized_crop = normalize_crop_type(request.crop_type)
         
         # Modo generate-script (debug)
         if request.mode == 'generate-script':
             try:
                 from app.services.gee_script_generator import generate_gee_script
-                
                 script = generate_gee_script(
                     job_id=request.job_id,
                     roi_geojson=request.roi_geojson,
@@ -78,32 +137,21 @@ async def execute_gee(request: GEERequest):
                     start_date=request.start_date,
                     end_date=request.end_date
                 )
-                
                 return {
                     "success": True,
                     "mode": "generate-script",
                     "job_id": request.job_id,
-                    "crop_type_original": request.crop_type,
-                    "crop_type_normalized": normalized_crop,
-                    "phenology_enabled": normalized_crop in ['olivo', 'vina', 'almendro'],
                     "script_length": len(script),
-                    "script_preview": script[:1000] + "..." if len(script) > 1000 else script,
-                    "message": "Script generated successfully (debug mode)"
+                    "script_preview": script[:1000] + "..." if len(script) > 1000 else script
                 }
             except ImportError:
-                return {
-                    "success": False,
-                    "error": "gee_script_generator module not available"
-                }
+                return {"success": False, "error": "gee_script_generator not available"}
         
-        # Importar módulos GEE
+        # Importar módulo GEE
         try:
             from app.services.gee_automation import (
                 execute_analysis,
                 execute_biweekly_analysis,
-                check_status, 
-                download_results, 
-                start_tasks
             )
         except ImportError as e:
             raise HTTPException(
@@ -111,7 +159,7 @@ async def execute_gee(request: GEERequest):
                 detail=f"GEE automation module not available: {str(e)}"
             )
         
-        # Crear objeto args compatible con argparse
+        # Crear args compatibles
         args = SimpleNamespace(
             mode=request.mode,
             job_id=request.job_id,
@@ -128,55 +176,77 @@ async def execute_gee(request: GEERequest):
         )
         
         if request.mode == 'execute':
-            # ========== ROUTING: baseline vs biweekly ==========
+            # ========== EJECUTAR ANÁLISIS ==========
             if request.analysis_type == 'biweekly':
                 result = execute_biweekly_analysis(args)
             else:
                 result = execute_analysis(args)
             
-        elif request.mode == 'check-status':
-            result = check_status(args)
+            # ========== GUARDAR IMÁGENES EN BD ==========
+            images_base64 = result.get('images_base64', {})
+            bounds = result.get('bounds', {})
             
-        elif request.mode == 'download-results':
-            result = download_results(args)
+            if images_base64:
+                saved_images = save_images_to_db(db, request.job_id, images_base64, bounds)
+                result['images_saved'] = saved_images
+                result['images_saved_count'] = len(saved_images)
             
-        elif request.mode == 'start-tasks':
-            result = start_tasks(args)
-            
+            # Eliminar base64 pesado del JSON de respuesta para n8n
+            # (n8n no necesita los bytes, ya están en BD)
+            # Pero MANTENER las keys para que n8n sepa qué capas hay
+            if images_base64:
+                result['images_available'] = list(images_base64.keys())
+                # Limpiar base64 del resultado para no saturar n8n
+                result['images_base64'] = {
+                    k: f"[saved_to_db:{len(v)} chars]" 
+                    for k, v in images_base64.items() if v
+                }
+        
+        elif request.mode in ('check-status', 'start-tasks', 'download-results'):
+            # Legacy stubs — v5.0 no tiene tasks asíncronos
+            result = {
+                'job_id': request.job_id,
+                'all_complete': True,
+                'progress_pct': 100,
+                'tasks': [],
+                'message': 'v5.0: All data returned synchronously in execute response.'
+            }
+        
         else:
             raise HTTPException(
-                status_code=400, 
-                detail=f"Unknown mode: {request.mode}. Valid modes: execute, check-status, download-results, start-tasks, generate-script"
+                status_code=400,
+                detail=f"Unknown mode: {request.mode}. Valid: execute, generate-script"
             )
         
-        # Añadir info de fenología y tipo de análisis a la respuesta
         return {
-            "success": True, 
+            "success": True,
             "result": result,
             "analysis_info": {
                 "analysis_type": request.analysis_type,
                 "crop_type_original": request.crop_type,
                 "crop_type_normalized": normalized_crop,
                 "phenology_enabled": normalized_crop in ['olivo', 'vina', 'almendro'],
-                "is_biweekly": request.analysis_type == 'biweekly'
+                "is_biweekly": request.analysis_type == 'biweekly',
+                "version": "5.0",
+                "drive_used": False
             }
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
         raise HTTPException(
             status_code=500, 
             detail=f"GEE execution error: {str(e)}\n{traceback.format_exc()}"
         )
 
 
+# =====================================================
+# INFO ENDPOINTS (sin cambios)
+# =====================================================
+
 @router.get("/crop-types")
 async def get_crop_types():
-    """
-    Devuelve los tipos de cultivo soportados con curvas fenológicas.
-    """
     return {
         "supported_with_phenology": [
             {
@@ -185,7 +255,6 @@ async def get_crop_types():
                 "name_es": "Olivo",
                 "peak_ndvi_month": "Junio",
                 "peak_ndvi_value": 0.62,
-                "phases": ["Reposo invernal", "Brotación", "Floración", "Cuajado", "Envero", "Maduración", "Post-cosecha"]
             },
             {
                 "id": "vina",
@@ -193,7 +262,6 @@ async def get_crop_types():
                 "name_es": "Viña",
                 "peak_ndvi_month": "Junio-Julio",
                 "peak_ndvi_value": 0.58,
-                "phases": ["Reposo invernal", "Lloro", "Brotación", "Floración", "Cuajado", "Envero", "Maduración", "Post-vendimia"]
             },
             {
                 "id": "almendro",
@@ -201,53 +269,36 @@ async def get_crop_types():
                 "name_es": "Almendro",
                 "peak_ndvi_month": "Junio",
                 "peak_ndvi_value": 0.65,
-                "phases": ["Reposo invernal", "Floración", "Cuajado", "Desarrollo fruto", "Maduración", "Post-cosecha"]
             }
         ],
         "fallback": {
             "id": "otro",
-            "description": "Para otros cultivos se usa z-score estacional sin curva fenológica específica",
-            "method": "Comparación con histórico del mismo período (±15 días)"
+            "description": "Z-score estacional sin curva fenológica"
         }
     }
 
 
 @router.get("/analysis-types")
 async def get_analysis_types():
-    """
-    Devuelve los tipos de análisis disponibles.
-    """
     return {
         "types": [
             {
                 "id": "baseline",
                 "name": "Análisis Baseline",
-                "description": "Análisis completo inicial con todos los índices, VRA y histórico",
-                "exports": "~20 archivos (PNGs, GeoTIFFs, CSVs, Shapefiles)",
-                "processing_time": "20-40 minutos",
+                "description": "Análisis completo con todos los índices, VRA y PNGs",
+                "processing_time": "2-5 minutos (v5.0, sin Drive)",
                 "includes_weather": False,
-                "includes_vra": True
+                "includes_vra": True,
+                "images": ["NDVI", "NDWI", "EVI", "NDCI", "SAVI", "VRA", "LST"]
             },
             {
                 "id": "biweekly",
                 "name": "Seguimiento Bisemanal",
-                "description": "Análisis ligero recurrente con meteorología ERA5 integrada",
-                "exports": "3 archivos (PNG NDVI, PNG NDWI, KPIs CSV con weather)",
-                "processing_time": "5-10 minutos",
+                "description": "Análisis ligero con meteorología ERA5",
+                "processing_time": "1-3 minutos (v5.0, sin Drive)",
                 "includes_weather": True,
-                "weather_sources": ["ERA5-Land (30 días observados)", "Open-Meteo (14 días pronóstico, via n8n)"],
                 "includes_vra": False,
-                "weather_fields": [
-                    "weather_tmax_mean", "weather_tmax_max",
-                    "weather_tmin_mean", "weather_tmin_min",
-                    "weather_heat_days", "weather_frost_days",
-                    "weather_gdd_base10",
-                    "weather_precip_total_mm", "weather_precip_max_daily_mm",
-                    "weather_rain_days",
-                    "weather_et_total_mm", "weather_water_balance_mm",
-                    "weather_wind_mean_ms",
-                    "weather_soil_moisture_mean", "weather_soil_moisture_min"
-                ]
+                "images": ["NDVI", "NDWI"]
             }
         ]
     }
@@ -255,58 +306,39 @@ async def get_analysis_types():
 
 @router.get("/health")
 async def gee_health():
-    """
-    Health check del servicio GEE.
-    """
-    modules_status = {
-        "gee_automation": False,
-        "gee_automation_biweekly": False,
-        "gee_script_generator": False,
-        "ee_available": False
-    }
+    modules_status = {}
     
     try:
         from app.services.gee_automation import execute_analysis
         modules_status["gee_automation"] = True
     except ImportError:
-        pass
+        modules_status["gee_automation"] = False
     
     try:
         from app.services.gee_automation import execute_biweekly_analysis
         modules_status["gee_automation_biweekly"] = True
     except ImportError:
-        pass
-    
-    try:
-        from app.services.gee_script_generator import generate_gee_script
-        modules_status["gee_script_generator"] = True
-    except ImportError:
-        pass
+        modules_status["gee_automation_biweekly"] = False
     
     try:
         import ee
         modules_status["ee_available"] = True
     except ImportError:
-        pass
+        modules_status["ee_available"] = False
     
-    all_ok = all([
-        modules_status.get("gee_automation", False),
-        modules_status.get("gee_automation_biweekly", False),
-        modules_status.get("ee_available", False)
-    ])
+    all_ok = all(modules_status.values())
     
     return {
         "status": "ok" if all_ok else "degraded",
         "service": "gee",
-        "version": "4.1",
+        "version": "5.0",
+        "drive_dependency": False,
         "modules": modules_status,
         "features": {
+            "direct_png_generation": True,
+            "drive_export": False,
             "phenological_curves": True,
-            "seasonal_zscore": True,
-            "supported_crops": ["olivo", "vina", "almendro"],
-            "png_export": True,
-            "biweekly_analysis": modules_status["gee_automation_biweekly"],
-            "era5_weather": modules_status["gee_automation_biweekly"],
+            "era5_weather": True,
             "analysis_types": ["baseline", "biweekly"]
         }
     }
