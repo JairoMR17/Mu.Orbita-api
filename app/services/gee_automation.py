@@ -771,6 +771,61 @@ def get_era5_weather(roi, start_date, end_date):
     
     return weather_kpis, daily_series
 
+def persist_images_to_db(job_id, images_base64, bounds=None):
+    """
+    Persiste las imágenes generadas por GEE en PostgreSQL vía HTTP API.
+    Se llama al final de cada análisis (baseline/biweekly).
+    
+    Las imágenes se guardan en la tabla gee_images y el PDF generator
+    las carga directamente de BD por job_id, sin depender de n8n.
+    
+    Args:
+        job_id: Identificador del análisis
+        images_base64: Dict {NDVI: "base64...", NDWI: "base64...", ...}
+        bounds: Dict {north, south, east, west} o None
+    
+    Returns:
+        list: Nombres de las imágenes guardadas exitosamente
+    """
+    if not images_base64:
+        print("⚠️ No images to persist")
+        return []
+    
+    stored = []
+    api_base = os.environ.get(
+        'API_BASE_URL', 
+        'https://muorbita-api-production.up.railway.app'
+    )
+    
+    try:
+        store_payload = json.dumps({
+            'job_id': job_id,
+            'images': images_base64,
+            'bounds': bounds
+        }).encode('utf-8')
+        
+        req = urllib.request.Request(
+            f'{api_base}/api/images/store',
+            data=store_payload,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        
+        response = urllib.request.urlopen(req, timeout=60)
+        result = json.loads(response.read().decode('utf-8'))
+        
+        if result.get('success'):
+            stored = [d['index_type'] for d in result.get('details', [])]
+            total_kb = sum(d.get('size_kb', 0) for d in result.get('details', []))
+            print(f"✅ Persisted {len(stored)} images in DB ({total_kb} KB total): {stored}")
+        else:
+            print(f"⚠️ Store API returned success=false: {result}")
+            
+    except Exception as e:
+        print(f"⚠️ Could not persist images to DB: {e}")
+        print("   Images will be passed inline as fallback (legacy behavior)")
+    
+    return stored
 
 # ============================================================================
 # EJECUTAR ANÁLISIS BIWEEKLY
@@ -945,6 +1000,9 @@ def execute_biweekly_analysis(args):
     }
     kpis.update(weather_kpis)
     
+    # ========== PERSISTIR IMÁGENES EN BD (v5.2) ==========
+    stored = persist_images_to_db(job_id, images_base64, bounds)
+    
     # ========== RESULTADO ==========
     result = {
         'success': True,
@@ -955,10 +1013,23 @@ def execute_biweekly_analysis(args):
         'weather_daily': weather_daily,
         'bounds': bounds,
         'time_series': time_series,
-        'images_base64': images_base64,
+        
+        # v5.2: Metadata de imágenes (ligero, para n8n)
+        'images_stored': stored,
+        'images_available': list(images_base64.keys()),
+        
+        # SOLO incluir base64 si NO se pudieron guardar en BD (fallback)
+        'images_base64': {} if stored else images_base64,
+        
         'tasks': [],
         'task_count': 0,
-        'message': f'Biweekly analysis complete. {len(images_base64)} composite PNG images generated.'
+        'message': (
+            f'Biweekly analysis complete. '
+            f'{len(stored)} images persisted in DB.'
+            if stored else
+            f'Biweekly analysis complete. '
+            f'{len(images_base64)} images in response (DB store failed).'
+        )
     }
     
     return result
@@ -1190,6 +1261,9 @@ def execute_analysis(args):
     except Exception as e:
         print(f"Warning: Could not get time series: {e}")
     
+  # ========== PERSISTIR IMÁGENES EN BD (v5.2) ==========
+    stored = persist_images_to_db(job_id, images_base64, bounds)
+    
     # ========== RESULTADO ==========
     result = {
         'success': True,
@@ -1198,11 +1272,21 @@ def execute_analysis(args):
         'kpis': kpis,
         'vra_stats': vra_stats,
         'bounds': bounds,
-        'images_base64': images_base64,
         'time_series': time_series,
+        
+        # v5.2: Metadata de imágenes (ligero, para n8n)
+        'images_stored': stored,
+        'images_available': list(images_base64.keys()),
+        
+        # SOLO incluir base64 si NO se pudieron guardar en BD (fallback)
+        'images_base64': {} if stored else images_base64,
+        
         'tasks': [],
         'task_count': 0,
-        'message': f'Baseline analysis complete. {len(images_base64)} composite PNG images generated.'
+        'message': (
+            f'Baseline analysis complete. '
+            f'{len(stored)} images persisted in DB.'
+        )
     }
     
     return result
