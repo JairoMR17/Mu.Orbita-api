@@ -527,6 +527,10 @@ class MuOrbitaPDFGenerator:
     }
 
     def __init__(self, data: Dict[str, Any]):
+        """
+        v4.0: Carga imágenes desde BD por job_id (prioridad 1),
+        con fallback a datos inline del payload (prioridad 2).
+        """
         self.d = data
         self.styles = get_styles()
         self.buffer = io.BytesIO()
@@ -534,28 +538,101 @@ class MuOrbitaPDFGenerator:
         self.M = 15*mm
         self.content_w = self.W - 2*self.M
 
-        # ── v3.2: Build png_map from MULTIPLE sources ──────────────
-        self.png_map = {}
-        
-        # Source 1: png_images array (from n8n pipeline)
-        for img in data.get('png_images', []) or []:
-            name = img.get('name', '')
-            b64  = img.get('base64', '')
-            if name and b64 and not b64.startswith('['):
-                self.png_map[name] = b64
-        
-        # Source 2: images_base64 dict (directly from GEE v5.1)
-        for name, b64 in (data.get('images_base64', {}) or {}).items():
-            if name and b64 and isinstance(b64, str) and not b64.startswith('['):
-                # Don't overwrite if already in png_map
-                if name not in self.png_map:
-                    self.png_map[name] = b64
-        
-        if self.png_map:
-            print(f"✅ PDF v3.2: png_map cargado con {len(self.png_map)} imágenes: {list(self.png_map.keys())}")
-        else:
-            print("⚠️  PDF v3.2: png_map vacío — se usarán gráficos matplotlib como fallback")
+        # KEY_ALIASES sin cambio — mantener el dict existente tal cual
+        # (está definido como class variable, no necesita tocarse)
 
+        # ── v4.0: Build png_map con PRIORIDAD BD ──────────────
+        self.png_map = {}
+        job_id = data.get('job_id', '')
+
+        # PRIORIDAD 1: Cargar desde PostgreSQL (más fiable)
+        if job_id:
+            self._load_images_from_db(job_id)
+
+        # PRIORIDAD 2: Fallback a datos inline (compatibilidad con legacy)
+        if not self.png_map:
+            # Source A: png_images array (from n8n pipeline)
+            for img in data.get('png_images', []) or []:
+                name = img.get('name', '')
+                b64 = img.get('base64', '')
+                if name and b64 and not b64.startswith('['):
+                    self.png_map[name] = b64
+
+            # Source B: images_base64 dict (directly from GEE)
+            for name, b64 in (data.get('images_base64', {}) or {}).items():
+                if name and b64 and isinstance(b64, str) and not b64.startswith('['):
+                    if name not in self.png_map:
+                        self.png_map[name] = b64
+
+        # Log resultado
+        if self.png_map:
+            sources = list(self.png_map.keys())
+            print(f"✅ PDF v4.0: png_map con {len(self.png_map)} imágenes: {sources}")
+        else:
+            print("⚠️ PDF v4.0: png_map VACÍO — se usarán gráficos matplotlib")
+
+ def _load_images_from_db(self, job_id: str):
+        """
+        Carga todas las imágenes satelitales desde PostgreSQL en una sola query.
+        
+        Mucho más fiable que recibir base64 vía HTTP payload:
+        - No depende de que n8n pase los datos correctamente
+        - No hay límite de tamaño de payload
+        - Las imágenes persisten entre reintentos del pipeline
+        """
+        try:
+            from app.services.image_provider import get_image_provider
+
+            provider = get_image_provider()
+            self.png_map = provider.load_all_as_map(job_id)
+
+            if self.png_map:
+                print(f"✅ Loaded {len(self.png_map)} images from DB for {job_id}")
+            else:
+                print(f"⚠️ No images found in DB for {job_id} — trying inline fallback")
+
+        except ImportError:
+            # Fallback si image_provider no está instalado aún
+            print("⚠️ image_provider not available, trying direct DB access...")
+            self._load_images_from_db_direct(job_id)
+        except Exception as e:
+            print(f"⚠️ Could not load images from DB: {e}")
+            # No lanzar excepción — el fallback inline se intentará después
+
+    def _load_images_from_db_direct(self, job_id: str):
+        """
+        Fallback: acceso directo a BD sin image_provider.
+        Útil durante la migración gradual o si image_provider falla.
+        """
+        try:
+            from app.database import SessionLocal
+            from app.models.gee_image import GEEImage
+
+            db = SessionLocal()
+            try:
+                images = db.query(
+                    GEEImage.index_type, GEEImage.png_base64
+                ).filter(
+                    GEEImage.job_id == job_id,
+                    GEEImage.png_base64.isnot(None)
+                ).all()
+
+                for index_type, b64 in images:
+                    if b64 and isinstance(b64, str) and not b64.startswith('['):
+                        self.png_map[index_type] = b64
+                        size_kb = len(b64) * 3 // 4 // 1024
+                        print(f"  📷 Loaded {index_type} from DB (~{size_kb} KB)")
+
+                if self.png_map:
+                    print(f"✅ Direct DB load: {len(self.png_map)} images for {job_id}")
+            finally:
+                db.close()
+
+        except Exception as e:
+            print(f"⚠️ Direct DB load failed: {e}")
+
+
+    
     # ── v3.2: helper imagen real vs fallback CON ALIAS ──────────────
     def _real_or_generated(self, name: str, fallback_bytes: bytes,
                            width_mm: float, height_mm: float) -> Image:
