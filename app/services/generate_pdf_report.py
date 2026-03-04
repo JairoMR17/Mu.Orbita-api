@@ -526,7 +526,7 @@ class MuOrbitaPDFGenerator:
         'KPI_SUMMARY':       ['KPI_SUMMARY', 'kpi_summary'],
     }
 
-    def __init__(self, data: Dict[str, Any]):
+        def __init__(self, data: Dict[str, Any]):
         """
         v4.0: Carga imágenes desde BD por job_id (prioridad 1),
         con fallback a datos inline del payload (prioridad 2).
@@ -571,7 +571,7 @@ class MuOrbitaPDFGenerator:
         else:
             print("⚠️ PDF v4.0: png_map VACÍO — se usarán gráficos matplotlib")
 
- def _load_images_from_db(self, job_id: str):
+     def _load_images_from_db(self, job_id: str):
         """
         Carga todas las imágenes satelitales desde PostgreSQL en una sola query.
         
@@ -599,7 +599,7 @@ class MuOrbitaPDFGenerator:
             print(f"⚠️ Could not load images from DB: {e}")
             # No lanzar excepción — el fallback inline se intentará después
 
-    def _load_images_from_db_direct(self, job_id: str):
+        def _load_images_from_db_direct(self, job_id: str):
         """
         Fallback: acceso directo a BD sin image_provider.
         Útil durante la migración gradual o si image_provider falla.
@@ -634,7 +634,7 @@ class MuOrbitaPDFGenerator:
 
     
     # ── v3.2: helper imagen real vs fallback CON ALIAS ──────────────
-    def _real_or_generated(self, name: str, fallback_bytes: bytes,
+        def _real_or_generated(self, name: str, fallback_bytes: bytes,
                            width_mm: float, height_mm: float) -> Image:
         """
         Devuelve un Image de ReportLab con el PNG real si existe en png_map,
