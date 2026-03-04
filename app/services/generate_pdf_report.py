@@ -1,11 +1,12 @@
 """
-Mu.Orbita PDF Report Generator v3.2
+Mu.Orbita PDF Report Generator v4.0
 ====================================
-FIX v3.2 vs v3.1:
-- KEY MAPPING: GEE envía 'NDVI'/'NDWI' pero v3.1 buscaba 'NDVI_MAP'/'NDWI_MAP'
-- Ahora acepta ambos formatos de clave
-- También lee images_base64 directamente (no solo png_images)
-- Log detallado para debug
+v4.0: Carga imágenes desde PostgreSQL por job_id (prioridad 1),
+      con fallback a datos inline del payload (prioridad 2).
+
+Changelog:
+- v3.2: Key aliases para mapeo GEE → PDF
+- v4.0: Carga imágenes desde BD por job_id
 
 Autor: Mu.Orbita
 Fecha: 2026-03
@@ -509,9 +510,6 @@ def generate_heatmap(title, mean_val, cmap_name='RdYlGn',
 class MuOrbitaPDFGenerator:
 
     # ── v3.2: MAPEO DE CLAVES GEE → PDF ──────────────────────────
-    # GEE v5.1 envía: NDVI, NDWI, EVI, NDCI, SAVI, VRA, LST, RGB
-    # PDF v3.1 esperaba: NDVI_MAP, NDWI_MAP, TIME_SERIES, NDVI_DISTRIBUTION
-    # Este mapeo acepta AMBOS formatos
     KEY_ALIASES = {
         'NDVI_MAP':          ['NDVI_MAP', 'NDVI', 'ndvi', 'ndvi_map'],
         'NDWI_MAP':          ['NDWI_MAP', 'NDWI', 'ndwi', 'ndwi_map'],
@@ -526,7 +524,7 @@ class MuOrbitaPDFGenerator:
         'KPI_SUMMARY':       ['KPI_SUMMARY', 'kpi_summary'],
     }
 
-        def __init__(self, data: Dict[str, Any]):
+    def __init__(self, data: Dict[str, Any]):
         """
         v4.0: Carga imágenes desde BD por job_id (prioridad 1),
         con fallback a datos inline del payload (prioridad 2).
@@ -537,9 +535,6 @@ class MuOrbitaPDFGenerator:
         self.W, self.H = A4
         self.M = 15*mm
         self.content_w = self.W - 2*self.M
-
-        # KEY_ALIASES sin cambio — mantener el dict existente tal cual
-        # (está definido como class variable, no necesita tocarse)
 
         # ── v4.0: Build png_map con PRIORIDAD BD ──────────────
         self.png_map = {}
@@ -571,14 +566,9 @@ class MuOrbitaPDFGenerator:
         else:
             print("⚠️ PDF v4.0: png_map VACÍO — se usarán gráficos matplotlib")
 
-     def _load_images_from_db(self, job_id: str):
+    def _load_images_from_db(self, job_id: str):
         """
         Carga todas las imágenes satelitales desde PostgreSQL en una sola query.
-        
-        Mucho más fiable que recibir base64 vía HTTP payload:
-        - No depende de que n8n pase los datos correctamente
-        - No hay límite de tamaño de payload
-        - Las imágenes persisten entre reintentos del pipeline
         """
         try:
             from app.services.image_provider import get_image_provider
@@ -592,17 +582,14 @@ class MuOrbitaPDFGenerator:
                 print(f"⚠️ No images found in DB for {job_id} — trying inline fallback")
 
         except ImportError:
-            # Fallback si image_provider no está instalado aún
             print("⚠️ image_provider not available, trying direct DB access...")
             self._load_images_from_db_direct(job_id)
         except Exception as e:
             print(f"⚠️ Could not load images from DB: {e}")
-            # No lanzar excepción — el fallback inline se intentará después
 
-        def _load_images_from_db_direct(self, job_id: str):
+    def _load_images_from_db_direct(self, job_id: str):
         """
         Fallback: acceso directo a BD sin image_provider.
-        Útil durante la migración gradual o si image_provider falla.
         """
         try:
             from app.database import SessionLocal
@@ -631,23 +618,19 @@ class MuOrbitaPDFGenerator:
         except Exception as e:
             print(f"⚠️ Direct DB load failed: {e}")
 
-
-    
-    # ── v3.2: helper imagen real vs fallback CON ALIAS ──────────────
-        def _real_or_generated(self, name: str, fallback_bytes: bytes,
+    def _real_or_generated(self, name: str, fallback_bytes: bytes,
                            width_mm: float, height_mm: float) -> Image:
         """
-        Devuelve un Image de ReportLab con el PNG real si existe en png_map,
-        o con el gráfico matplotlib generado como fallback.
-        
-        v3.2: Busca el nombre Y todos sus alias.
+        Devuelve Image con PNG real si existe en png_map,
+        o con gráfico matplotlib como fallback.
+        v3.2: Busca nombre Y todos sus aliases.
         """
         # Buscar por nombre directo primero
         if name in self.png_map:
             print(f"   🛰️  Usando composite GEE: {name}")
             img_bytes = base64.b64decode(self.png_map[name])
             return Image(io.BytesIO(img_bytes), width=width_mm*mm, height=height_mm*mm)
-        
+
         # Buscar por aliases
         aliases = self.KEY_ALIASES.get(name, [])
         for alias in aliases:
@@ -655,7 +638,7 @@ class MuOrbitaPDFGenerator:
                 print(f"   🛰️  Usando composite GEE: {alias} (alias de {name})")
                 img_bytes = base64.b64decode(self.png_map[alias])
                 return Image(io.BytesIO(img_bytes), width=width_mm*mm, height=height_mm*mm)
-        
+
         print(f"   📊  Fallback matplotlib: {name} (no encontrado en png_map: {list(self.png_map.keys())})")
         return Image(io.BytesIO(fallback_bytes), width=width_mm*mm, height=height_mm*mm)
 
@@ -1144,7 +1127,7 @@ class MuOrbitaPDFGenerator:
 
         # ── v3.2: Nota dinámica según fuente de imágenes ──
         has_real_maps = any(
-            alias in self.png_map 
+            alias in self.png_map
             for aliases in [self.KEY_ALIASES.get('NDVI_MAP', []), self.KEY_ALIASES.get('NDWI_MAP', [])]
             for alias in aliases
         )
