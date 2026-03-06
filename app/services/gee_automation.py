@@ -155,55 +155,53 @@ def get_bounds(roi):
 # ============================================================================
 
 def get_map_style_png(index_image_unclipped, roi, viz_params, dimensions=768,
-                      boundary_color='000000', boundary_width=3,
-                      padding_meters=150):
+                      boundary_color='000000', boundary_width=4,
+                      padding_meters=100):
     """
-    Genera un PNG que se ve como el mapa del GEE Code Editor:
-    - El índice coloreado llena TODA el área visible (no solo la parcela)
-    - La parcela se dibuja como un CONTORNO negro sobre los colores
-    - Vista cenital plana, sin efecto 3D
+    Genera un PNG estilo mapa profesional:
+    - DENTRO de la parcela: colores vivos del índice (100% saturación)
+    - FUERA de la parcela: colores atenuados (40% blanco encima)
+    - Contorno negro grueso (4px) delimita la parcela
+    - Vista cenital 2D plana
 
-    DIFERENCIA CLAVE vs v5.1/v5.2/v5.3:
-    ────────────────────────────────────────────────────────────────
-    ANTES: index_image.clip(roi)  → forma aislada → parece 3D
-    AHORA: index_image SIN clip   → colores en toda el área → 2D plano
-    ────────────────────────────────────────────────────────────────
-
-    Args:
-        index_image_unclipped: ee.Image del índice SIN clipar al ROI
-        roi:                   ee.Geometry de la parcela
-        viz_params:            dict con min, max, palette
-        dimensions:            resolución del PNG (default 768)
-        boundary_color:        hex del contorno (default negro)
-        boundary_width:        grosor del contorno (default 3px)
-        padding_meters:        padding alrededor de la parcela (default 150m)
+    Técnica: blend de la versión "dimmed" (todo el área) + versión "bright"
+    (solo dentro de parcela). Como .blend() solo pinta donde hay datos,
+    la versión clipped reemplaza los píxeles atenuados dentro del ROI.
     """
     try:
-        # 1. Colorear el índice en TODA el área (SIN clip)
-        index_colored = index_image_unclipped.visualize(
-            **{k: v for k, v in viz_params.items() if k in ('min', 'max', 'palette')}
-        )
+        viz_kw = {k: v for k, v in viz_params.items() if k in ('min', 'max', 'palette')}
 
-        # 2. Dibujar contorno de la parcela ENCIMA de los colores
+        # 1. Versión ATENUADA: índice en toda el área + overlay blanco 40%
+        index_full = index_image_unclipped.visualize(**viz_kw)
+        white = ee.Image([255, 255, 255]).toUint8().rename(
+            ['vis-red', 'vis-green', 'vis-blue'])
+        index_dimmed = index_full.multiply(0.6).add(white.multiply(0.4)).toUint8()
+
+        # 2. Versión VIVA: índice clipado a la parcela (colores al 100%)
+        index_bright = index_image_unclipped.clip(roi).visualize(**viz_kw)
+
+        # 3. Componer: dimmed base + bright dentro de parcela
+        #    .blend() solo sobreescribe donde index_bright tiene datos
+        composed = index_dimmed.blend(index_bright)
+
+        # 4. Contorno negro grueso de la parcela
         roi_fc = ee.FeatureCollection([ee.Feature(roi)])
-        outline = ee.Image().byte().paint(
-            featureCollection=roi_fc, color=1, width=boundary_width
-        )
+        outline = ee.Image().byte().paint(roi_fc, 1, boundary_width)
         outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
-        final = index_colored.blend(outline_vis)
+        final = composed.blend(outline_vis)
 
-        # 3. Región = parcela + padding → vista con contexto
+        # 5. Región = parcela + padding (100m = parcela ocupa ~80% del frame)
         padded_region = roi.buffer(padding_meters).bounds()
         region_coords = padded_region.getInfo()['coordinates']
 
-        # 4. Generar thumbnail
+        # 6. Generar thumbnail
         url = final.getThumbURL({
             'region': region_coords,
             'dimensions': dimensions,
             'format': 'png'
         })
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.4')
+        req.add_header('User-Agent', 'MuOrbita/5.4.1')
         png_bytes = urllib.request.urlopen(req, timeout=60).read()
 
         if len(png_bytes) < 100:
@@ -216,31 +214,35 @@ def get_map_style_png(index_image_unclipped, roi, viz_params, dimensions=768,
 
 
 def get_map_style_rgb(sentinel_unclipped, roi, dimensions=768,
-                      boundary_color='FFFFFF', boundary_width=3,
-                      padding_meters=150):
-    """PNG RGB satelital tipo mapa con contorno de parcela."""
+                      boundary_color='FFFFFF', boundary_width=4,
+                      padding_meters=100):
+    """PNG RGB satelital con parcela destacada (entorno atenuado)."""
     try:
-        rgb = sentinel_unclipped.select(['B4', 'B3', 'B2']).visualize(
+        rgb_full = sentinel_unclipped.select(['B4', 'B3', 'B2']).visualize(
             min=0, max=0.3, gamma=1.3)
+        white = ee.Image([255, 255, 255]).toUint8().rename(
+            ['vis-red', 'vis-green', 'vis-blue'])
+        rgb_dimmed = rgb_full.multiply(0.6).add(white.multiply(0.4)).toUint8()
+
+        rgb_bright = sentinel_unclipped.select(['B4', 'B3', 'B2']).clip(roi).visualize(
+            min=0, max=0.3, gamma=1.3)
+        composed = rgb_dimmed.blend(rgb_bright)
 
         roi_fc = ee.FeatureCollection([ee.Feature(roi)])
         outline = ee.Image().byte().paint(roi_fc, 1, boundary_width)
         outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
-        final = rgb.blend(outline_vis)
+        final = composed.blend(outline_vis)
 
         padded_region = roi.buffer(padding_meters).bounds()
         region_coords = padded_region.getInfo()['coordinates']
-
         url = final.getThumbURL({
-            'region': region_coords, 'dimensions': dimensions, 'format': 'png'
-        })
+            'region': region_coords, 'dimensions': dimensions, 'format': 'png'})
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.4')
+        req.add_header('User-Agent', 'MuOrbita/5.4.1')
         png_bytes = urllib.request.urlopen(req, timeout=60).read()
         if len(png_bytes) < 100:
             return None
         return base64.b64encode(png_bytes).decode('utf-8')
-
     except Exception as e:
         print(f"Warning: get_map_style_rgb failed: {e}")
         return None
