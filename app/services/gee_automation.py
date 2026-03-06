@@ -151,79 +151,89 @@ def get_bounds(roi):
 
 
 # ============================================================================
-# PNG TIPO GEE CODE EDITOR (v5.4) — LA CLAVE DEL CAMBIO
+# PNG ESTILO MAPA PROFESIONAL (v5.4.2) — CERO PÍXELES VACÍOS
 # ============================================================================
 
 def get_map_style_png(index_image_unclipped, roi, viz_params, dimensions=768,
                       boundary_color='000000', boundary_width=4,
                       padding_meters=100):
     """
-    Genera un PNG estilo mapa profesional:
-    - DENTRO de la parcela: colores vivos del índice (100% saturación)
-    - FUERA de la parcela: colores atenuados (40% blanco encima)
-    - Contorno negro grueso (4px) delimita la parcela
-    - Vista cenital 2D plana
+    v5.4.2: Garantiza CERO píxeles vacíos en la imagen final.
 
-    Técnica: blend de la versión "dimmed" (todo el área) + versión "bright"
-    (solo dentro de parcela). Como .blend() solo pinta donde hay datos,
-    la versión clipped reemplaza los píxeles atenuados dentro del ROI.
+    Técnica:
+    1. bg sólido gris (#D0CCC4) cubre TODO el rectángulo
+    2. Índice coloreado en toda el área → .unmask(bg) rellena huecos de nubes
+    3. Se atenúa al 50% (mezcla con blanco)
+    4. Índice clipado a la parcela (colores 100%) se pinta encima
+    5. Contorno negro grueso delimita la parcela
+
+    Resultado: rectángulo COMPLETAMENTE relleno de color.
+    Parcela = colores vivos. Entorno = colores apagados. Sin huecos.
     """
     try:
+        print(f"  [v5.4.2] Generating map-style PNG...")
         viz_kw = {k: v for k, v in viz_params.items() if k in ('min', 'max', 'palette')}
 
-        # 1. Versión ATENUADA: índice en toda el área + overlay blanco 40%
-        index_full = index_image_unclipped.visualize(**viz_kw)
+        # 1. Fondo sólido gris claro (cubre TODO, sin huecos posibles)
+        bg = ee.Image([208, 204, 196]).toUint8().rename(
+            ['vis-red', 'vis-green', 'vis-blue'])
+
+        # 2. Índice coloreado en toda el área + rellenar huecos de nubes
+        index_full = index_image_unclipped.visualize(**viz_kw).unmask(bg)
+
+        # 3. Atenuar: 50% índice + 50% blanco → entorno apagado
         white = ee.Image([255, 255, 255]).toUint8().rename(
             ['vis-red', 'vis-green', 'vis-blue'])
-        index_dimmed = index_full.multiply(0.6).add(white.multiply(0.4)).toUint8()
+        index_dimmed = index_full.multiply(0.5).add(white.multiply(0.5)).toUint8()
 
-        # 2. Versión VIVA: índice clipado a la parcela (colores al 100%)
+        # 4. Parcela con colores vivos (100% saturación)
         index_bright = index_image_unclipped.clip(roi).visualize(**viz_kw)
 
-        # 3. Componer: dimmed base + bright dentro de parcela
-        #    .blend() solo sobreescribe donde index_bright tiene datos
+        # 5. Componer: dimmed base + bright parcela encima
+        #    .blend() solo sobreescribe donde index_bright tiene datos (= dentro de parcela)
         composed = index_dimmed.blend(index_bright)
 
-        # 4. Contorno negro grueso de la parcela
+        # 6. Contorno negro grueso
         roi_fc = ee.FeatureCollection([ee.Feature(roi)])
         outline = ee.Image().byte().paint(roi_fc, 1, boundary_width)
         outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
         final = composed.blend(outline_vis)
 
-        # 5. Región = parcela + padding (100m = parcela ocupa ~80% del frame)
-        padded_region = roi.buffer(padding_meters).bounds()
-        region_coords = padded_region.getInfo()['coordinates']
+        # 7. Región con padding
+        region_coords = roi.buffer(padding_meters).bounds().getInfo()['coordinates']
 
-        # 6. Generar thumbnail
+        # 8. Descargar thumbnail
         url = final.getThumbURL({
-            'region': region_coords,
-            'dimensions': dimensions,
-            'format': 'png'
+            'region': region_coords, 'dimensions': dimensions, 'format': 'png'
         })
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.4.1')
+        req.add_header('User-Agent', 'MuOrbita/5.4.2')
         png_bytes = urllib.request.urlopen(req, timeout=60).read()
+        print(f"  [v5.4.2] PNG size: {len(png_bytes)} bytes")
 
         if len(png_bytes) < 100:
             return None
         return base64.b64encode(png_bytes).decode('utf-8')
 
     except Exception as e:
-        print(f"Warning: get_map_style_png failed: {e}")
+        print(f"Warning: [v5.4.2] get_map_style_png failed: {e}")
         return None
 
 
 def get_map_style_rgb(sentinel_unclipped, roi, dimensions=768,
                       boundary_color='FFFFFF', boundary_width=4,
                       padding_meters=100):
-    """PNG RGB satelital con parcela destacada (entorno atenuado)."""
+    """PNG RGB satelital — parcela destacada, entorno atenuado, cero huecos."""
     try:
-        rgb_full = sentinel_unclipped.select(['B4', 'B3', 'B2']).visualize(
-            min=0, max=0.3, gamma=1.3)
+        print(f"  [v5.4.2] Generating map-style RGB...")
+        bg = ee.Image([208, 204, 196]).toUint8().rename(
+            ['vis-red', 'vis-green', 'vis-blue'])
         white = ee.Image([255, 255, 255]).toUint8().rename(
             ['vis-red', 'vis-green', 'vis-blue'])
-        rgb_dimmed = rgb_full.multiply(0.6).add(white.multiply(0.4)).toUint8()
 
+        rgb_full = sentinel_unclipped.select(['B4', 'B3', 'B2']).visualize(
+            min=0, max=0.3, gamma=1.3).unmask(bg)
+        rgb_dimmed = rgb_full.multiply(0.5).add(white.multiply(0.5)).toUint8()
         rgb_bright = sentinel_unclipped.select(['B4', 'B3', 'B2']).clip(roi).visualize(
             min=0, max=0.3, gamma=1.3)
         composed = rgb_dimmed.blend(rgb_bright)
@@ -233,18 +243,18 @@ def get_map_style_rgb(sentinel_unclipped, roi, dimensions=768,
         outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
         final = composed.blend(outline_vis)
 
-        padded_region = roi.buffer(padding_meters).bounds()
-        region_coords = padded_region.getInfo()['coordinates']
+        region_coords = roi.buffer(padding_meters).bounds().getInfo()['coordinates']
         url = final.getThumbURL({
             'region': region_coords, 'dimensions': dimensions, 'format': 'png'})
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.4.1')
+        req.add_header('User-Agent', 'MuOrbita/5.4.2')
         png_bytes = urllib.request.urlopen(req, timeout=60).read()
+        print(f"  [v5.4.2] RGB PNG size: {len(png_bytes)} bytes")
         if len(png_bytes) < 100:
             return None
         return base64.b64encode(png_bytes).decode('utf-8')
     except Exception as e:
-        print(f"Warning: get_map_style_rgb failed: {e}")
+        print(f"Warning: [v5.4.2] get_map_style_rgb failed: {e}")
         return None
 
 
@@ -605,6 +615,10 @@ def generate_map_pngs(composite_unclipped, latest_sentinel_unclipped, roi, kpis,
 # ============================================================================
 
 def execute_biweekly_analysis(args):
+    print("=" * 60)
+    print("  Mu.Orbita GEE v5.4.2 — BIWEEKLY ANALYSIS")
+    print("  Map style: dimmed exterior + bright parcel + black border")
+    print("=" * 60)
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
     bounds = get_bounds(roi)
@@ -731,6 +745,10 @@ def execute_biweekly_analysis(args):
 # ============================================================================
 
 def execute_analysis(args):
+    print("=" * 60)
+    print("  Mu.Orbita GEE v5.4.2 — BASELINE ANALYSIS")
+    print("  Map style: dimmed exterior + bright parcel + black border")
+    print("=" * 60)
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
     bounds = get_bounds(roi)
@@ -743,7 +761,9 @@ def execute_analysis(args):
 
     indexed = collection.map(calculate_indices)
 
-    # ── CLAVE v5.4: Composite CON clip (stats) y SIN clip (PNGs) ──
+    # ── v5.4.2: Dos composites ──────────────────────────────────
+    # composite_clipped → ESTADÍSTICAS (valores precisos dentro de la parcela)
+    # composite_viz     → PNGs (sin clip → colores en toda el área)
     composite_clipped = indexed.median().clip(roi)
     composite_viz = indexed.median()  # SIN CLIP → para PNGs
     latest_sentinel_viz = indexed.sort('system:time_start', False).first()  # SIN CLIP
