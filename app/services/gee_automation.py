@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """
-Mu.Orbita GEE Automation Script v5.3 (FLAT 2D + OPTIMIZED)
-=============================================================
+Mu.Orbita GEE Automation Script v5.4 (TRUE FLAT 2D MAPS)
+==========================================================
 
-CAMBIOS V5.3:
-✅ MAPAS PLANOS 2D: clip(roi) + roi.bounds() + fondo neutro — NO perspectiva 3D
-✅ OPTIMIZACIÓN: ERA5 en 1 sola query (antes 6 separadas) → ahorra ~90s
-✅ OPTIMIZACIÓN: Estadísticas en 1 getInfo() combinado
-✅ OPTIMIZACIÓN: PNGs a 768px (suficiente para PDF A4 y web)
-✅ OPTIMIZACIÓN: Series temporales limitadas a 50 imágenes max
-✅ Leyenda profesional: fondo claro, marcador ▼, min/max con unidades
-✅ Sin blending RGB satelital → heatmap puro del índice
-✅ Contorno oscuro (#333) sobre fondo crema (#F5F5F0)
+CAMBIOS V5.4 vs V5.3:
+✅ PNGs COMO GEE CODE EDITOR: índice coloreado en TODA el área + contorno parcela
+✅ NO se clipan las imágenes para visualización → llena todo el rectángulo de color
+✅ Se usa composite SIN clip para PNGs (el clip era la causa del efecto 3D)
+✅ Contorno negro grueso (3px) de la parcela sobre el mapa de colores
+✅ Padding de 150m alrededor de la parcela para contexto visual
+✅ Optimización ERA5 mantenida de v5.3 (batched queries)
 
-TIEMPO ESTIMADO:
-    Antes (v5.1):  ~5 min (6 ERA5 queries + PNGs 1024px + getInfo() individual)
-    Ahora (v5.3):  ~2-3 min (1 ERA5 batch + PNGs 768px + stats combinados)
-
-MODOS:
-    baseline:   Análisis completo (todos los índices + VRA + LST)
-    biweekly:   Seguimiento ligero (NDVI + NDWI + weather ERA5)
+POR QUÉ PARECÍA 3D:
+    El polígono de la parcela está rotado geográficamente.
+    Al hacer clip(roi) + fondo sólido, se genera una forma geométrica aislada
+    que el cerebro interpreta como un objeto 3D flotando.
+    
+    SOLUCIÓN: NO clipar. Colorear toda el área (como GEE Code Editor).
+    La parcela se muestra como un CONTORNO sobre el mapa de colores.
 """
 
 import argparse
@@ -37,7 +35,6 @@ from datetime import datetime, timedelta
 # ============================================================================
 
 def initialize_gee():
-    """Initialize Earth Engine with Service Account or default credentials"""
     try:
         service_account_key = os.environ.get('GEE_SERVICE_ACCOUNT_KEY')
         if service_account_key:
@@ -109,7 +106,7 @@ VIZ_PALETTES = {
 # ============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.3')
+    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.4')
     parser.add_argument('--mode', required=True,
                         choices=['execute', 'check-status', 'download-results', 'start-tasks'])
     parser.add_argument('--job-id', required=True)
@@ -154,60 +151,59 @@ def get_bounds(roi):
 
 
 # ============================================================================
-# PNG PLANO 2D — FUNCIÓN PRINCIPAL (v5.3)
+# PNG TIPO GEE CODE EDITOR (v5.4) — LA CLAVE DEL CAMBIO
 # ============================================================================
 
-def get_flat_index_png(index_image, roi, viz_params, dimensions=768,
-                       bg_color='F5F5F0', boundary_color='333333',
-                       boundary_width=2):
+def get_map_style_png(index_image_unclipped, roi, viz_params, dimensions=768,
+                      boundary_color='000000', boundary_width=3,
+                      padding_meters=150):
     """
-    Genera un PNG PLANO 2D del índice — vista cenital pura.
+    Genera un PNG que se ve como el mapa del GEE Code Editor:
+    - El índice coloreado llena TODA el área visible (no solo la parcela)
+    - La parcela se dibuja como un CONTORNO negro sobre los colores
+    - Vista cenital plana, sin efecto 3D
 
-    Cómo funciona:
-    1. clip(roi)     → solo píxeles dentro de la parcela tienen datos
-    2. bg_image      → imagen de fondo sólido (crema)
-    3. blend()       → el índice coloreado se pinta SOBRE el fondo
-                       (fuera de parcela no hay datos → se ve el fondo)
-    4. roi.bounds()  → bounding box RECTANGULAR alineado a ejes lat/lng
-                       → getThumbURL genera vista cenital plana, NO 3D
+    DIFERENCIA CLAVE vs v5.1/v5.2/v5.3:
+    ────────────────────────────────────────────────────────────────
+    ANTES: index_image.clip(roi)  → forma aislada → parece 3D
+    AHORA: index_image SIN clip   → colores en toda el área → 2D plano
+    ────────────────────────────────────────────────────────────────
+
+    Args:
+        index_image_unclipped: ee.Image del índice SIN clipar al ROI
+        roi:                   ee.Geometry de la parcela
+        viz_params:            dict con min, max, palette
+        dimensions:            resolución del PNG (default 768)
+        boundary_color:        hex del contorno (default negro)
+        boundary_width:        grosor del contorno (default 3px)
+        padding_meters:        padding alrededor de la parcela (default 150m)
     """
     try:
-        # 1. Clipar estrictamente a la parcela
-        clipped = index_image.clip(roi)
-
-        # 2. Fondo sólido
-        bg_r, bg_g, bg_b = int(bg_color[0:2], 16), int(bg_color[2:4], 16), int(bg_color[4:6], 16)
-        bg_image = ee.Image([
-            ee.Image.constant(bg_r).toUint8().rename('vis-red'),
-            ee.Image.constant(bg_g).toUint8().rename('vis-green'),
-            ee.Image.constant(bg_b).toUint8().rename('vis-blue')
-        ])
-
-        # 3. Colorear índice con paleta
-        index_colored = clipped.visualize(
+        # 1. Colorear el índice en TODA el área (SIN clip)
+        index_colored = index_image_unclipped.visualize(
             **{k: v for k, v in viz_params.items() if k in ('min', 'max', 'palette')}
         )
 
-        # 4. Componer: fondo + índice (solo donde hay datos = dentro de parcela)
-        composed = bg_image.blend(index_colored)
-
-        # 5. Contorno oscuro de la parcela
+        # 2. Dibujar contorno de la parcela ENCIMA de los colores
         roi_fc = ee.FeatureCollection([ee.Feature(roi)])
-        outline = ee.Image().byte().paint(featureCollection=roi_fc, color=1, width=boundary_width)
+        outline = ee.Image().byte().paint(
+            featureCollection=roi_fc, color=1, width=boundary_width
+        )
         outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
-        final = composed.blend(outline_vis)
+        final = index_colored.blend(outline_vis)
 
-        # 6. Bounding box RECTANGULAR → vista cenital plana
-        region_coords = roi.bounds().getInfo()['coordinates']
+        # 3. Región = parcela + padding → vista con contexto
+        padded_region = roi.buffer(padding_meters).bounds()
+        region_coords = padded_region.getInfo()['coordinates']
 
-        # 7. Descargar thumbnail
+        # 4. Generar thumbnail
         url = final.getThumbURL({
             'region': region_coords,
             'dimensions': dimensions,
             'format': 'png'
         })
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.3')
+        req.add_header('User-Agent', 'MuOrbita/5.4')
         png_bytes = urllib.request.urlopen(req, timeout=60).read()
 
         if len(png_bytes) < 100:
@@ -215,41 +211,38 @@ def get_flat_index_png(index_image, roi, viz_params, dimensions=768,
         return base64.b64encode(png_bytes).decode('utf-8')
 
     except Exception as e:
-        print(f"Warning: get_flat_index_png failed: {e}")
+        print(f"Warning: get_map_style_png failed: {e}")
         return None
 
 
-def get_flat_rgb_png(sentinel_rgb_image, roi, dimensions=768,
-                     bg_color='F5F5F0', boundary_color='333333', boundary_width=2):
-    """PNG plano 2D de imagen satelital true-color."""
+def get_map_style_rgb(sentinel_unclipped, roi, dimensions=768,
+                      boundary_color='FFFFFF', boundary_width=3,
+                      padding_meters=150):
+    """PNG RGB satelital tipo mapa con contorno de parcela."""
     try:
-        rgb = sentinel_rgb_image.select(['B4', 'B3', 'B2']).clip(roi).visualize(
+        rgb = sentinel_unclipped.select(['B4', 'B3', 'B2']).visualize(
             min=0, max=0.3, gamma=1.3)
 
-        bg_r, bg_g, bg_b = int(bg_color[0:2], 16), int(bg_color[2:4], 16), int(bg_color[4:6], 16)
-        bg_image = ee.Image([
-            ee.Image.constant(bg_r).toUint8().rename('vis-red'),
-            ee.Image.constant(bg_g).toUint8().rename('vis-green'),
-            ee.Image.constant(bg_b).toUint8().rename('vis-blue')
-        ])
-
-        composed = bg_image.blend(rgb)
         roi_fc = ee.FeatureCollection([ee.Feature(roi)])
         outline = ee.Image().byte().paint(roi_fc, 1, boundary_width)
         outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
-        final = composed.blend(outline_vis)
+        final = rgb.blend(outline_vis)
 
-        region_coords = roi.bounds().getInfo()['coordinates']
-        url = final.getThumbURL({'region': region_coords, 'dimensions': dimensions, 'format': 'png'})
+        padded_region = roi.buffer(padding_meters).bounds()
+        region_coords = padded_region.getInfo()['coordinates']
+
+        url = final.getThumbURL({
+            'region': region_coords, 'dimensions': dimensions, 'format': 'png'
+        })
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.3')
+        req.add_header('User-Agent', 'MuOrbita/5.4')
         png_bytes = urllib.request.urlopen(req, timeout=60).read()
         if len(png_bytes) < 100:
             return None
         return base64.b64encode(png_bytes).decode('utf-8')
 
     except Exception as e:
-        print(f"Warning: get_flat_rgb_png failed: {e}")
+        print(f"Warning: get_map_style_rgb failed: {e}")
         return None
 
 
@@ -258,7 +251,6 @@ def get_flat_rgb_png(sentinel_rgb_image, roi, dimensions=768,
 # ============================================================================
 
 def add_legend(png_base64, index_name, mean_value=None):
-    """Añade leyenda con colorbar, título y marcador de media."""
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
@@ -269,7 +261,6 @@ def add_legend(png_base64, index_name, mean_value=None):
         return png_base64
 
     img = Image.open(io.BytesIO(base64.b64decode(png_base64))).convert('RGBA')
-
     legend_h, pad, bar_h = 90, 20, 18
     bar_w = min(350, img.width - 2 * pad)
 
@@ -287,11 +278,8 @@ def add_legend(png_base64, index_name, mean_value=None):
         ft = fs = fv = ImageFont.load_default()
 
     y0 = img.height + 8
-    accent = (139, 69, 19)
-    dark = (51, 51, 51)
-    muted = (136, 136, 136)
+    accent, dark, muted = (139, 69, 19), (51, 51, 51), (136, 136, 136)
 
-    # Título
     label = viz.get('label', index_name)
     draw.text((pad, y0), label, fill=accent, font=ft)
     if mean_value is not None:
@@ -301,7 +289,6 @@ def add_legend(png_base64, index_name, mean_value=None):
             tw = len(label) * 8
         draw.text((pad + tw + 20, y0 + 1), f"Media: {mean_value:.2f}", fill=dark, font=fv)
 
-    # Colorbar
     bar_y, bar_x = y0 + 24, pad
     colors = [tuple(int(h[i:i+2], 16) for i in (0, 2, 4)) for h in viz['palette']]
     n = len(colors)
@@ -314,7 +301,6 @@ def add_legend(png_base64, index_name, mean_value=None):
         draw.rectangle([bar_x + x, bar_y, bar_x + x + 1, bar_y + bar_h], fill=c)
     draw.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], outline=(100, 100, 100), width=1)
 
-    # Min/max labels
     unit = viz.get('unit', '')
     draw.text((bar_x, bar_y + bar_h + 3), f"{viz['min']}{unit}", fill=muted, font=fs)
     mx_txt = f"{viz['max']}{unit}"
@@ -324,7 +310,6 @@ def add_legend(png_base64, index_name, mean_value=None):
         mx_w = len(mx_txt) * 6
     draw.text((bar_x + bar_w - mx_w, bar_y + bar_h + 3), mx_txt, fill=muted, font=fs)
 
-    # Marcador ▼
     if mean_value is not None:
         rng = viz['max'] - viz['min']
         if rng > 0:
@@ -351,81 +336,66 @@ def get_sentinel2_collection(roi, start_date, end_date):
         cloud_mask = qa.bitwiseAnd(1 << 10).eq(0).And(qa.bitwiseAnd(1 << 11).eq(0))
         scl_mask = scl.neq(3).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10))
         return (image.updateMask(cloud_mask.And(scl_mask))
-                .divide(10000)
-                .copyProperties(image, ['system:time_start']))
-
+                .divide(10000).copyProperties(image, ['system:time_start']))
     return (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-        .filterBounds(roi)
-        .filterDate(start_date, end_date)
+        .filterBounds(roi).filterDate(start_date, end_date)
         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
         .map(mask_clouds))
 
 
 def calculate_indices(image):
-    nir = image.select('B8')
-    red = image.select('B4')
-    blue = image.select('B2')
-
+    nir, red, blue = image.select('B8'), image.select('B4'), image.select('B2')
     ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
     ndwi = image.normalizedDifference(['B8', 'B11']).rename('NDWI')
     evi = image.expression(
         '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',
-        {'NIR': nir, 'RED': red, 'BLUE': blue}
-    ).rename('EVI')
+        {'NIR': nir, 'RED': red, 'BLUE': blue}).rename('EVI')
     ndci = image.normalizedDifference(['B5', 'B4']).rename('NDCI')
-
     L = 0.5
     savi = nir.subtract(red).divide(nir.add(red).add(L)).multiply(1 + L).rename('SAVI')
     osavi = nir.subtract(red).divide(nir.add(red).add(0.16)).multiply(1.16).rename('OSAVI')
-
     return image.addBands([ndvi, ndwi, evi, ndci, savi, osavi])
 
 
 def get_modis_lst(roi, start_date, end_date):
-    modis = (ee.ImageCollection('MODIS/061/MOD11A2')
-        .filterBounds(roi)
-        .filterDate(start_date, end_date)
+    return (ee.ImageCollection('MODIS/061/MOD11A2')
+        .filterBounds(roi).filterDate(start_date, end_date)
         .select('LST_Day_1km')
         .map(lambda img: img.multiply(0.02).subtract(273.15).rename('LST_C')
-             .copyProperties(img, ['system:time_start'])))
-    return modis.median().clip(roi)
+             .copyProperties(img, ['system:time_start']))
+    ).median()  # NOTE: NO .clip(roi) aquí — se clipará para stats pero no para PNG
+
 
 # ============================================================================
 # VRA ZONIFICACIÓN
 # ============================================================================
 
-def calculate_vra_zones(composite, roi):
+def calculate_vra_zones(composite_clipped, roi):
     try:
-        training_image = composite.select(['NDVI', 'EVI', 'NDWI'])
-        valid_mask = training_image.mask().reduce(ee.Reducer.min())
-        training_masked = training_image.updateMask(valid_mask)
-
-        sample = training_masked.sample(region=roi, scale=20, numPixels=5000, geometries=False)
+        training = composite_clipped.select(['NDVI', 'EVI', 'NDWI'])
+        valid = training.mask().reduce(ee.Reducer.min())
+        masked = training.updateMask(valid)
+        sample = masked.sample(region=roi, scale=20, numPixels=5000, geometries=False)
         clusterer = ee.Clusterer.wekaKMeans(3).train(sample)
-        vra = training_masked.cluster(clusterer).rename('zone')
+        vra = masked.cluster(clusterer).rename('zone')
 
         vra_stats = []
-        for zone_num in range(3):
-            zone_mask = vra.eq(zone_num)
-            zone_area = zone_mask.multiply(ee.Image.pixelArea()).reduceRegion(
-                reducer=ee.Reducer.sum(), geometry=roi, scale=20, maxPixels=1e9
-            ).getInfo()
-            zone_indices = composite.select(['NDVI', 'NDWI', 'EVI']).updateMask(zone_mask).reduceRegion(
-                reducer=ee.Reducer.mean(), geometry=roi, scale=20, maxPixels=1e9
-            ).getInfo()
+        for z in range(3):
+            zm = vra.eq(z)
+            area = zm.multiply(ee.Image.pixelArea()).reduceRegion(
+                ee.Reducer.sum(), roi, 20, maxPixels=1e9).getInfo()
+            idx = composite_clipped.select(['NDVI', 'NDWI', 'EVI']).updateMask(zm).reduceRegion(
+                ee.Reducer.mean(), roi, 20, maxPixels=1e9).getInfo()
             vra_stats.append({
-                'zone': zone_num,
-                'area_ha': round(zone_area.get('zone', 0) / 10000, 2),
-                'ndvi_mean': round(zone_indices.get('NDVI', 0) or 0, 3),
-                'ndwi_mean': round(zone_indices.get('NDWI', 0) or 0, 3),
-                'evi_mean': round(zone_indices.get('EVI', 0) or 0, 3)
+                'zone': z, 'area_ha': round(area.get('zone', 0) / 10000, 2),
+                'ndvi_mean': round(idx.get('NDVI', 0) or 0, 3),
+                'ndwi_mean': round(idx.get('NDWI', 0) or 0, 3),
+                'evi_mean': round(idx.get('EVI', 0) or 0, 3)
             })
-
         vra_stats.sort(key=lambda x: x['ndvi_mean'])
         for i, s in enumerate(vra_stats):
             s['label'] = ['Bajo vigor', 'Vigor medio', 'Alto vigor'][i]
             s['recommendation'] = ['Dosis alta', 'Dosis media', 'Dosis baja'][i]
-
         return vra, vra_stats
     except Exception as e:
         print(f"Warning: VRA failed: {e}")
@@ -433,33 +403,20 @@ def calculate_vra_zones(composite, roi):
 
 
 # ============================================================================
-# ERA5 WEATHER — OPTIMIZADO (1 query combinada en vez de 6 separadas)
+# ERA5 WEATHER — OPTIMIZADO (v5.3)
 # ============================================================================
 
 def get_era5_weather(roi, start_date, end_date):
-    """
-    v5.3 OPTIMIZADO: Una sola ImageCollection filtrada, múltiples select().
-    Antes: 6 ImageCollections separadas × toList().getInfo() = ~90s
-    Ahora: 1 ImageCollection + 2-3 getInfo() = ~20-30s
-    """
     weather_kpis = {}
     daily_series = []
-
     try:
-        # ── UNA SOLA QUERY base ERA5 ───────────────────────────────
-        era5_base = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
-            .filterDate(start_date, end_date)
-            .filterBounds(roi))
+        era5 = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+            .filterDate(start_date, end_date).filterBounds(roi))
 
-        # ── Temperatura: servidor calcula todo, solo 1 getInfo() ───
-        era5_temp = era5_base.select(
-            ['temperature_2m_max', 'temperature_2m_min']
-        ).map(lambda img:
-            img.subtract(273.15)
-            .copyProperties(img, ['system:time_start'])
-        )
-
-        temp_features = era5_temp.map(lambda img: ee.Feature(None, {
+        # Temperatura
+        temp = era5.select(['temperature_2m_max', 'temperature_2m_min']).map(
+            lambda img: img.subtract(273.15).copyProperties(img, ['system:time_start']))
+        temp_feat = temp.map(lambda img: ee.Feature(None, {
             'date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
             'tmax': img.select('temperature_2m_max').reduceRegion(
                 ee.Reducer.mean(), roi, 11132, maxPixels=1e9).get('temperature_2m_max'),
@@ -467,15 +424,13 @@ def get_era5_weather(roi, start_date, end_date):
                 ee.Reducer.mean(), roi, 11132, maxPixels=1e9).get('temperature_2m_min'),
         }))
 
-        # ── Precipitación + ET combinados ──────────────────────────
-        era5_water = era5_base.select(
-            ['total_precipitation_sum', 'total_evaporation_sum']
-        ).map(lambda img: ee.Image([
-            img.select('total_precipitation_sum').multiply(1000).rename('precip_mm'),
-            img.select('total_evaporation_sum').multiply(-1000).rename('et_mm')
-        ]).copyProperties(img, ['system:time_start']))
-
-        water_features = era5_water.map(lambda img: ee.Feature(None, {
+        # Precipitación + ET
+        water = era5.select(['total_precipitation_sum', 'total_evaporation_sum']).map(
+            lambda img: ee.Image([
+                img.select('total_precipitation_sum').multiply(1000).rename('precip_mm'),
+                img.select('total_evaporation_sum').multiply(-1000).rename('et_mm')
+            ]).copyProperties(img, ['system:time_start']))
+        water_feat = water.map(lambda img: ee.Feature(None, {
             'date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
             'precip': img.select('precip_mm').reduceRegion(
                 ee.Reducer.mean(), roi, 11132, maxPixels=1e9).get('precip_mm'),
@@ -483,148 +438,110 @@ def get_era5_weather(roi, start_date, end_date):
                 ee.Reducer.mean(), roi, 11132, maxPixels=1e9).get('et_mm'),
         }))
 
-        # ── 2 getInfo() en vez de 6 ───────────────────────────────
-        print("  Fetching ERA5 temperature...")
-        temp_list = temp_features.toList(50).getInfo()
-        print("  Fetching ERA5 precipitation + ET...")
-        water_list = water_features.toList(50).getInfo()
+        print("  Fetching ERA5 temp + water...")
+        temp_list = temp_feat.toList(50).getInfo()
+        water_list = water_feat.toList(50).getInfo()
 
-        # Procesar temperatura
-        tmax_by_date = {}
-        tmin_by_date = {}
+        tmax_by_date, tmin_by_date = {}, {}
         tmax_vals, tmin_vals = [], []
-        heat_days, frost_days, gdd_total = 0, 0, 0
-
+        heat_days, frost_days, gdd = 0, 0, 0
         for f in temp_list:
             p = f.get('properties', {})
             d, tx, tn = p.get('date', ''), p.get('tmax'), p.get('tmin')
             if tx is not None:
-                tmax_vals.append(tx)
-                tmax_by_date[d] = tx
+                tmax_vals.append(tx); tmax_by_date[d] = tx
                 if tx >= 35: heat_days += 1
             if tn is not None:
-                tmin_vals.append(tn)
-                tmin_by_date[d] = tn
+                tmin_vals.append(tn); tmin_by_date[d] = tn
                 if tn <= 0: frost_days += 1
-
         for d in tmax_by_date:
             tx, tn = tmax_by_date.get(d), tmin_by_date.get(d)
             if tx is not None and tn is not None:
-                gdd_total += max(0, (tx + tn) / 2 - 10)
+                gdd += max(0, (tx + tn) / 2 - 10)
 
-        weather_kpis['weather_tmax_mean'] = round(sum(tmax_vals) / len(tmax_vals), 1) if tmax_vals else None
+        weather_kpis['weather_tmax_mean'] = round(sum(tmax_vals)/len(tmax_vals), 1) if tmax_vals else None
         weather_kpis['weather_tmax_max'] = round(max(tmax_vals), 1) if tmax_vals else None
-        weather_kpis['weather_tmin_mean'] = round(sum(tmin_vals) / len(tmin_vals), 1) if tmin_vals else None
+        weather_kpis['weather_tmin_mean'] = round(sum(tmin_vals)/len(tmin_vals), 1) if tmin_vals else None
         weather_kpis['weather_tmin_min'] = round(min(tmin_vals), 1) if tmin_vals else None
         weather_kpis['weather_heat_days'] = heat_days
         weather_kpis['weather_frost_days'] = frost_days
-        weather_kpis['weather_gdd_base10'] = round(gdd_total, 1)
+        weather_kpis['weather_gdd_base10'] = round(gdd, 1)
 
-        # Procesar agua
-        precip_by_date = {}
-        et_by_date = {}
+        precip_by_date, et_by_date = {}, {}
         precip_vals, et_vals = [], []
         rain_days = 0
-
         for f in water_list:
             p = f.get('properties', {})
-            d = p.get('date', '')
-            pr, et = p.get('precip'), p.get('et')
+            d, pr, et = p.get('date', ''), p.get('precip'), p.get('et')
             if pr is not None:
-                precip_vals.append(pr)
-                precip_by_date[d] = pr
+                precip_vals.append(pr); precip_by_date[d] = pr
                 if pr > 1: rain_days += 1
             if et is not None:
-                et_vals.append(et)
-                et_by_date[d] = et
+                et_vals.append(et); et_by_date[d] = et
 
-        precip_total = sum(precip_vals) if precip_vals else 0
-        et_total = sum(et_vals) if et_vals else 0
-
-        weather_kpis['weather_precip_total_mm'] = round(precip_total, 1) if precip_vals else None
+        pt, ett = sum(precip_vals) if precip_vals else 0, sum(et_vals) if et_vals else 0
+        weather_kpis['weather_precip_total_mm'] = round(pt, 1) if precip_vals else None
         weather_kpis['weather_precip_max_daily_mm'] = round(max(precip_vals), 1) if precip_vals else None
         weather_kpis['weather_rain_days'] = rain_days
-        weather_kpis['weather_et_total_mm'] = round(et_total, 1) if et_vals else None
-        weather_kpis['weather_water_balance_mm'] = round(precip_total - et_total, 1)
+        weather_kpis['weather_et_total_mm'] = round(ett, 1) if et_vals else None
+        weather_kpis['weather_water_balance_mm'] = round(pt - ett, 1)
 
-        # ── Viento + Suelo: 1 solo getInfo() con aggregados del servidor ──
-        print("  Fetching ERA5 wind + soil moisture (aggregated)...")
+        # Viento + Suelo (1 getInfo)
+        print("  Fetching ERA5 wind + soil...")
         try:
-            wind_u = era5_base.select('u_component_of_wind_10m').mean()
-            wind_v = era5_base.select('v_component_of_wind_10m').mean()
-            wind_speed = wind_u.pow(2).add(wind_v.pow(2)).sqrt()
-
-            sm = era5_base.select('volumetric_soil_water_layer_1')
-            sm_composite = sm.reduce(ee.Reducer.mean().combine(ee.Reducer.min(), sharedInputs=True))
-
-            # Combinar en 1 imagen para 1 solo getInfo()
-            combined = wind_speed.rename('wind').addBands(sm_composite)
-            combined_stats = combined.reduceRegion(
-                reducer=ee.Reducer.mean(), geometry=roi, scale=11132, maxPixels=1e9
-            ).getInfo()
-
-            wind_val = combined_stats.get('wind')
-            weather_kpis['weather_wind_mean_ms'] = round(wind_val, 1) if wind_val else None
-            sm_mean = combined_stats.get('volumetric_soil_water_layer_1_mean')
-            sm_min = combined_stats.get('volumetric_soil_water_layer_1_min')
-            weather_kpis['weather_soil_moisture_mean'] = round(sm_mean, 3) if sm_mean else None
-            weather_kpis['weather_soil_moisture_min'] = round(sm_min, 3) if sm_min else None
-        except Exception as e:
-            print(f"  Warning: wind/soil query failed: {e}")
+            wu = era5.select('u_component_of_wind_10m').mean()
+            wv = era5.select('v_component_of_wind_10m').mean()
+            wind = wu.pow(2).add(wv.pow(2)).sqrt().rename('wind')
+            sm = era5.select('volumetric_soil_water_layer_1').reduce(
+                ee.Reducer.mean().combine(ee.Reducer.min(), sharedInputs=True))
+            combined = wind.addBands(sm).reduceRegion(
+                ee.Reducer.mean(), roi, 11132, maxPixels=1e9).getInfo()
+            wv_val = combined.get('wind')
+            weather_kpis['weather_wind_mean_ms'] = round(wv_val, 1) if wv_val else None
+            sm_m = combined.get('volumetric_soil_water_layer_1_mean')
+            sm_mn = combined.get('volumetric_soil_water_layer_1_min')
+            weather_kpis['weather_soil_moisture_mean'] = round(sm_m, 3) if sm_m else None
+            weather_kpis['weather_soil_moisture_min'] = round(sm_mn, 3) if sm_mn else None
+        except:
             weather_kpis['weather_wind_mean_ms'] = None
             weather_kpis['weather_soil_moisture_mean'] = None
 
-        # ── Serie temporal diaria ──────────────────────────────────
-        all_dates = sorted(set(
-            list(tmax_by_date.keys()) + list(precip_by_date.keys())
-        ))
-        for d in all_dates:
+        for d in sorted(set(list(tmax_by_date.keys()) + list(precip_by_date.keys()))):
             daily_series.append({
-                'date': d,
-                'tmax_c': round(tmax_by_date.get(d, -9999), 1),
+                'date': d, 'tmax_c': round(tmax_by_date.get(d, -9999), 1),
                 'tmin_c': round(tmin_by_date.get(d, -9999), 1),
                 'precip_mm': round(precip_by_date.get(d, 0), 1),
                 'et_mm': round(et_by_date.get(d, 0), 1),
             })
-
     except Exception as e:
-        print(f"Warning: ERA5 weather failed: {e}")
+        print(f"Warning: ERA5 failed: {e}")
         for k in ['weather_tmax_mean', 'weather_tmin_mean', 'weather_heat_days',
                    'weather_frost_days', 'weather_gdd_base10', 'weather_precip_total_mm',
                    'weather_rain_days', 'weather_et_total_mm', 'weather_water_balance_mm',
                    'weather_wind_mean_ms', 'weather_soil_moisture_mean']:
             weather_kpis.setdefault(k, None)
-
     return weather_kpis, daily_series
 
 
 # ============================================================================
-# PERSISTIR IMÁGENES EN BD
+# PERSISTIR IMÁGENES
 # ============================================================================
 
 def persist_images_to_db(job_id, images_base64, bounds=None):
     if not images_base64:
-        print("⚠️ No images to persist")
         return []
-
     api_base = os.environ.get('API_BASE_URL', 'https://muorbita-api-production.up.railway.app')
     try:
-        payload = json.dumps({
-            'job_id': job_id, 'images': images_base64, 'bounds': bounds
-        }).encode('utf-8')
-        req = urllib.request.Request(
-            f'{api_base}/api/images/store', data=payload,
-            headers={'Content-Type': 'application/json'}, method='POST'
-        )
-        result = json.loads(urllib.request.urlopen(req, timeout=60).read().decode('utf-8'))
+        payload = json.dumps({'job_id': job_id, 'images': images_base64, 'bounds': bounds}).encode()
+        req = urllib.request.Request(f'{api_base}/api/images/store', data=payload,
+            headers={'Content-Type': 'application/json'}, method='POST')
+        result = json.loads(urllib.request.urlopen(req, timeout=60).read().decode())
         if result.get('success'):
             stored = [d['index_type'] for d in result.get('details', [])]
-            total_kb = sum(d.get('size_kb', 0) for d in result.get('details', []))
-            print(f"✅ Persisted {len(stored)} images ({total_kb} KB): {stored}")
+            print(f"✅ Persisted {len(stored)} images: {stored}")
             return stored
-        print(f"⚠️ Store API: {result}")
     except Exception as e:
-        print(f"⚠️ Could not persist images: {e}")
+        print(f"⚠️ Persist failed: {e}")
     return []
 
 
@@ -632,17 +549,23 @@ def persist_images_to_db(job_id, images_base64, bounds=None):
 # GENERADOR DE PNGs — ORQUESTADOR
 # ============================================================================
 
-def generate_flat_pngs(composite, latest_sentinel, roi, kpis,
-                       index_list, vra_image=None, lst=None):
-    """Genera todos los PNGs planos 2D para un análisis."""
+def generate_map_pngs(composite_unclipped, latest_sentinel_unclipped, roi, kpis,
+                      index_list, vra_image=None, lst_unclipped=None):
+    """
+    Genera PNGs estilo GEE Code Editor:
+    - Índice coloreado en TODA el área
+    - Contorno negro de la parcela superpuesto
+    """
     images = {}
 
     for idx in index_list:
         viz = VIZ_PALETTES.get(idx)
         if not viz:
             continue
-        print(f"  Generating flat 2D {idx}...")
-        b64 = get_flat_index_png(composite.select(idx), roi, viz, dimensions=768)
+        print(f"  Generating map-style {idx}...")
+        b64 = get_map_style_png(
+            composite_unclipped.select(idx), roi, viz, dimensions=768
+        )
         if b64:
             mean_key = f'{idx.lower()}_mean'
             b64 = add_legend(b64, idx, kpis.get(mean_key))
@@ -652,26 +575,26 @@ def generate_flat_pngs(composite, latest_sentinel, roi, kpis,
             print(f"  ✗ {idx}: failed")
 
     if vra_image is not None:
-        print("  Generating flat 2D VRA...")
-        b64 = get_flat_index_png(vra_image, roi, VIZ_PALETTES['VRA'], dimensions=768)
+        print("  Generating map-style VRA...")
+        b64 = get_map_style_png(vra_image, roi, VIZ_PALETTES['VRA'], dimensions=768)
         if b64:
             images['VRA'] = add_legend(b64, 'VRA')
             print("  ✓ VRA: OK")
 
-    if lst is not None:
-        print("  Generating flat 2D LST...")
-        b64 = get_flat_index_png(lst, roi, VIZ_PALETTES['LST'], dimensions=512)
+    if lst_unclipped is not None:
+        print("  Generating map-style LST...")
+        b64 = get_map_style_png(lst_unclipped, roi, VIZ_PALETTES['LST'], dimensions=512)
         if b64:
             images['LST'] = add_legend(b64, 'LST', kpis.get('lst_mean_c'))
             print("  ✓ LST: OK")
 
-    print("  Generating flat 2D RGB...")
-    rgb = get_flat_rgb_png(latest_sentinel, roi, dimensions=768)
+    print("  Generating map-style RGB...")
+    rgb = get_map_style_rgb(latest_sentinel_unclipped, roi, dimensions=768)
     if rgb:
         images['RGB'] = rgb
         print("  ✓ RGB: OK")
 
-    print(f"\n  📊 Total: {len(images)} flat 2D maps")
+    print(f"\n  📊 Total: {len(images)} map-style PNGs")
     return images
 
 
@@ -684,18 +607,20 @@ def execute_biweekly_analysis(args):
     job_id = args.job_id
     bounds = get_bounds(roi)
 
-    # Satelital
     collection = get_sentinel2_collection(roi, args.start_date, args.end_date)
     count = collection.size().getInfo()
     if count == 0:
-        return {"error": "No images found", "job_id": job_id,
-                "analysis_type": "biweekly", "start_date": args.start_date,
-                "end_date": args.end_date,
-                "suggestion": "Try extending the date range or check cloud cover"}
+        return {"error": "No images found", "job_id": job_id, "analysis_type": "biweekly",
+                "start_date": args.start_date, "end_date": args.end_date}
 
     indexed = collection.map(calculate_indices)
-    composite = indexed.median().clip(roi)
-    latest_sentinel = indexed.sort('system:time_start', False).first().clip(roi)
+
+    # ── CLAVE v5.4: Dos composites ──────────────────────────────
+    # composite_clipped  → para ESTADÍSTICAS (precisas dentro de la parcela)
+    # composite_viz      → para PNGs (sin clip, llena toda el área)
+    composite_clipped = indexed.median().clip(roi)
+    composite_viz = indexed.median()  # SIN CLIP
+    latest_sentinel_viz = indexed.sort('system:time_start', False).first()  # SIN CLIP
 
     try:
         latest_date = ee.Date(collection.sort('system:time_start', False).first()
@@ -703,68 +628,59 @@ def execute_biweekly_analysis(args):
     except:
         latest_date = args.end_date
 
-    # Estadísticas — 1 solo getInfo()
+    # Estadísticas (con clip)
     print("Computing statistics...")
-    stats = composite.select(['NDVI', 'NDWI', 'EVI', 'NDCI']).reduceRegion(
+    stats = composite_clipped.select(['NDVI', 'NDWI', 'EVI', 'NDCI']).reduceRegion(
         reducer=ee.Reducer.mean()
             .combine(ee.Reducer.percentile([10, 50, 90]), sharedInputs=True)
             .combine(ee.Reducer.stdDev(), sharedInputs=True),
-        geometry=roi, scale=10, maxPixels=1e9
-    ).getInfo()
+        geometry=roi, scale=10, maxPixels=1e9).getInfo()
 
     area_ha = roi.area().divide(10000).getInfo()
-
-    stress_mask = composite.select('NDVI').lt(0.35)
-    stress_ha = stress_mask.multiply(ee.Image.pixelArea()).reduceRegion(
-        reducer=ee.Reducer.sum(), geometry=roi, scale=10, maxPixels=1e9
-    ).getInfo().get('NDVI', 0) / 10000
+    stress_ha = composite_clipped.select('NDVI').lt(0.35).multiply(ee.Image.pixelArea()).reduceRegion(
+        ee.Reducer.sum(), roi, 10, maxPixels=1e9).getInfo().get('NDVI', 0) / 10000
     stress_pct = (stress_ha / area_ha * 100) if area_ha > 0 else 0
 
-    # Z-score
     hist_stats = indexed.select('NDVI').mean().reduceRegion(
-        reducer=ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True),
-        geometry=roi, scale=20, maxPixels=1e9
-    ).getInfo()
+        ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True),
+        roi, 20, maxPixels=1e9).getInfo()
     ndvi_mean = stats.get('NDVI_mean', 0) or 0
     hist_mean = hist_stats.get('NDVI_mean', ndvi_mean) or ndvi_mean
     hist_std = hist_stats.get('NDVI_stdDev', 0.1) or 0.1
     z_score = (ndvi_mean - hist_mean) / hist_std if hist_std > 0 else 0
 
     # ERA5
-    print("Fetching ERA5 weather data...")
+    print("Fetching ERA5...")
     weather_kpis, weather_daily = get_era5_weather(roi, args.start_date, args.end_date)
 
     # LST
     try:
-        lst = get_modis_lst(roi, args.start_date, args.end_date)
-        lst_mean = lst.reduceRegion(ee.Reducer.mean(), roi, 1000, maxPixels=1e9).getInfo().get('LST_C_mean')
+        lst_unclipped = get_modis_lst(roi, args.start_date, args.end_date)
+        lst_clipped = lst_unclipped.clip(roi)
+        lst_mean = lst_clipped.reduceRegion(ee.Reducer.mean(), roi, 1000, maxPixels=1e9).getInfo().get('LST_C_mean')
     except:
-        lst, lst_mean = None, None
+        lst_unclipped, lst_mean = None, None
 
-    # Serie temporal — limitada a 50
+    # Serie temporal
     print("Computing time series...")
     time_series = []
     try:
         ts = indexed.select(['NDVI', 'NDWI', 'EVI']).map(lambda img:
             ee.Feature(None, img.reduceRegion(
                 ee.Reducer.mean(), roi, 20, maxPixels=1e9
-            )).set('date', ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'))
-        )
+            )).set('date', ee.Date(img.get('system:time_start')).format('YYYY-MM-dd')))
         for f in ts.toList(50).getInfo():
             p = f.get('properties', {})
             if p.get('date'):
-                time_series.append({
-                    'date': p['date'],
+                time_series.append({'date': p['date'],
                     'ndvi': round(p.get('NDVI_mean', 0) or 0, 3),
                     'ndwi': round(p.get('NDWI_mean', 0) or 0, 3),
-                    'evi': round(p.get('EVI_mean', 0) or 0, 3)
-                })
+                    'evi': round(p.get('EVI_mean', 0) or 0, 3)})
         time_series.sort(key=lambda x: x['date'])
     except Exception as e:
-        print(f"Warning: time series failed: {e}")
+        print(f"Warning: time series: {e}")
 
-    # PNGs planos 2D
-    print("Generating flat 2D PNG maps...")
+    # KPIs
     kpis = {
         'job_id': job_id, 'crop_type': args.crop, 'analysis_type': 'biweekly',
         'start_date': args.start_date, 'end_date': args.end_date,
@@ -791,9 +707,10 @@ def execute_biweekly_analysis(args):
     }
     kpis.update(weather_kpis)
 
-    images_base64 = generate_flat_pngs(composite, latest_sentinel, roi, kpis,
-                                        index_list=['NDVI', 'NDWI'])
-
+    # PNGs tipo mapa (SIN CLIP)
+    print("Generating map-style PNGs...")
+    images_base64 = generate_map_pngs(composite_viz, latest_sentinel_viz, roi, kpis,
+                                       index_list=['NDVI', 'NDWI'])
     stored = persist_images_to_db(job_id, images_base64, bounds)
 
     return {
@@ -803,7 +720,7 @@ def execute_biweekly_analysis(args):
         'images_stored': stored, 'images_available': list(images_base64.keys()),
         'images_base64': {} if stored else images_base64,
         'tasks': [], 'task_count': 0,
-        'message': f'Biweekly v5.3 complete. {len(stored)} flat 2D images in DB.'
+        'message': f'Biweekly v5.4 complete. {len(stored)} map-style images in DB.'
     }
 
 
@@ -816,7 +733,6 @@ def execute_analysis(args):
     job_id = args.job_id
     bounds = get_bounds(roi)
 
-    # Satelital
     collection = get_sentinel2_collection(roi, args.start_date, args.end_date)
     count = collection.size().getInfo()
     if count == 0:
@@ -824,8 +740,11 @@ def execute_analysis(args):
                 "start_date": args.start_date, "end_date": args.end_date}
 
     indexed = collection.map(calculate_indices)
-    composite = indexed.median().clip(roi)
-    latest_sentinel = indexed.sort('system:time_start', False).first().clip(roi)
+
+    # ── CLAVE v5.4: Composite CON clip (stats) y SIN clip (PNGs) ──
+    composite_clipped = indexed.median().clip(roi)
+    composite_viz = indexed.median()  # SIN CLIP → para PNGs
+    latest_sentinel_viz = indexed.sort('system:time_start', False).first()  # SIN CLIP
 
     try:
         latest_date = ee.Date(collection.sort('system:time_start', False).first()
@@ -833,27 +752,23 @@ def execute_analysis(args):
     except:
         latest_date = args.end_date
 
-    # Estadísticas — 1 getInfo() combinado
+    # Estadísticas (con clip)
     print("Computing statistics...")
-    stats = composite.select(['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI', 'OSAVI']).reduceRegion(
+    stats = composite_clipped.select(['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI', 'OSAVI']).reduceRegion(
         reducer=ee.Reducer.mean()
             .combine(ee.Reducer.percentile([10, 50, 90]), sharedInputs=True)
             .combine(ee.Reducer.stdDev(), sharedInputs=True)
             .combine(ee.Reducer.count(), sharedInputs=True),
-        geometry=roi, scale=10, maxPixels=1e9
-    ).getInfo()
+        geometry=roi, scale=10, maxPixels=1e9).getInfo()
 
     area_ha = roi.area().divide(10000).getInfo()
-
-    stress_ha = composite.select('NDVI').lt(0.35).multiply(ee.Image.pixelArea()).reduceRegion(
-        reducer=ee.Reducer.sum(), geometry=roi, scale=10, maxPixels=1e9
-    ).getInfo().get('NDVI', 0) / 10000
+    stress_ha = composite_clipped.select('NDVI').lt(0.35).multiply(ee.Image.pixelArea()).reduceRegion(
+        ee.Reducer.sum(), roi, 10, maxPixels=1e9).getInfo().get('NDVI', 0) / 10000
     stress_pct = (stress_ha / area_ha * 100) if area_ha > 0 else 0
 
     hist_stats = indexed.select('NDVI').mean().reduceRegion(
-        reducer=ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True),
-        geometry=roi, scale=20, maxPixels=1e9
-    ).getInfo()
+        ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True),
+        roi, 20, maxPixels=1e9).getInfo()
     ndvi_mean = stats.get('NDVI_mean', 0) or 0
     hist_mean = hist_stats.get('NDVI_mean', ndvi_mean) or ndvi_mean
     hist_std = hist_stats.get('NDVI_stdDev', 0.1) or 0.1
@@ -861,26 +776,25 @@ def execute_analysis(args):
 
     # LST
     try:
-        lst = get_modis_lst(roi, args.start_date, args.end_date)
-        lst_stats = lst.reduceRegion(
-            reducer=ee.Reducer.mean().combine(ee.Reducer.minMax(), sharedInputs=True),
-            geometry=roi, scale=1000, maxPixels=1e9
-        ).getInfo()
+        lst_unclipped = get_modis_lst(roi, args.start_date, args.end_date)
+        lst_clipped = lst_unclipped.clip(roi)
+        lst_stats = lst_clipped.reduceRegion(
+            ee.Reducer.mean().combine(ee.Reducer.minMax(), sharedInputs=True),
+            roi, 1000, maxPixels=1e9).getInfo()
         lst_mean = lst_stats.get('LST_C_mean')
         lst_min = lst_stats.get('LST_C_min')
         lst_max = lst_stats.get('LST_C_max')
     except:
-        lst = None
+        lst_unclipped = None
         lst_mean = lst_min = lst_max = None
 
     # VRA
-    print("Computing VRA zones...")
-    vra_image, vra_stats = calculate_vra_zones(composite, roi)
+    print("Computing VRA...")
+    vra_image, vra_stats = calculate_vra_zones(composite_clipped, roi)
 
     # KPIs
     kpis = {
-        'job_id': job_id, 'crop_type': args.crop,
-        'analysis_type': args.analysis_type,
+        'job_id': job_id, 'crop_type': args.crop, 'analysis_type': args.analysis_type,
         'start_date': args.start_date, 'end_date': args.end_date,
         'latest_image_date': latest_date, 'images_processed': count,
         'area_hectares': round(area_ha, 2),
@@ -911,12 +825,12 @@ def execute_analysis(args):
         'valid_pixels': stats.get('NDVI_count', 0)
     }
 
-    # PNGs planos 2D
-    print("Generating flat 2D PNG maps...")
-    images_base64 = generate_flat_pngs(
-        composite, latest_sentinel, roi, kpis,
+    # PNGs tipo mapa (SIN CLIP)
+    print("Generating map-style PNGs...")
+    images_base64 = generate_map_pngs(
+        composite_viz, latest_sentinel_viz, roi, kpis,
         index_list=['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI'],
-        vra_image=vra_image, lst=lst
+        vra_image=vra_image, lst_unclipped=lst_unclipped
     )
 
     # Serie temporal
@@ -925,25 +839,20 @@ def execute_analysis(args):
     try:
         ts = indexed.select(['NDVI', 'NDWI', 'EVI']).map(lambda img:
             ee.Feature(None, img.reduceRegion(
-                reducer=ee.Reducer.mean()
-                    .combine(ee.Reducer.percentile([10, 90]), sharedInputs=True),
+                reducer=ee.Reducer.mean().combine(ee.Reducer.percentile([10, 90]), sharedInputs=True),
                 geometry=roi, scale=20, maxPixels=1e9
-            )).set('date', ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'))
-        )
+            )).set('date', ee.Date(img.get('system:time_start')).format('YYYY-MM-dd')))
         for f in ts.toList(50).getInfo():
             p = f.get('properties', {})
             if p.get('date'):
-                time_series.append({
-                    'date': p['date'],
+                time_series.append({'date': p['date'],
                     'ndvi': round(p.get('NDVI_mean', 0) or 0, 3),
                     'ndwi': round(p.get('NDWI_mean', 0) or 0, 3),
-                    'evi': round(p.get('EVI_mean', 0) or 0, 3)
-                })
+                    'evi': round(p.get('EVI_mean', 0) or 0, 3)})
         time_series.sort(key=lambda x: x['date'])
     except Exception as e:
-        print(f"Warning: time series failed: {e}")
+        print(f"Warning: time series: {e}")
 
-    # Persistir
     stored = persist_images_to_db(job_id, images_base64, bounds)
 
     return {
@@ -953,25 +862,21 @@ def execute_analysis(args):
         'images_stored': stored, 'images_available': list(images_base64.keys()),
         'images_base64': {} if stored else images_base64,
         'tasks': [], 'task_count': 0,
-        'message': f'Baseline v5.3 complete. {len(stored)} flat 2D images in DB.'
+        'message': f'Baseline v5.4 complete. {len(stored)} map-style images in DB.'
     }
 
 
 # ============================================================================
-# LEGACY ENDPOINTS
+# LEGACY
 # ============================================================================
 
 def check_status(args):
-    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100,
-            'message': 'v5.3: Synchronous. No async tasks.'}
-
+    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100, 'message': 'v5.4: Sync.'}
 def download_results(args):
-    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True,
-            'message': 'v5.3: Data in execute response.'}
-
+    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True, 'message': 'v5.4: In response.'}
 def start_tasks(args):
-    return {'job_id': args.job_id, 'started': 0,
-            'message': 'v5.3: No async tasks.'}
+    return {'job_id': args.job_id, 'started': 0, 'message': 'v5.4: No tasks.'}
+
 
 # ============================================================================
 # MAIN
@@ -993,7 +898,6 @@ def main():
             result = start_tasks(args)
         else:
             result = {'error': f'Unknown mode: {args.mode}'}
-
         print(json.dumps(result, indent=2))
     except Exception as e:
         import traceback
