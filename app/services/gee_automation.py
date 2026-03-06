@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-Mu.Orbita GEE Automation Script v5.5 (CARTOGRAPHIC MAP STYLE)
-===============================================================
+Mu.Orbita GEE Automation Script v5.5.1 (ESRI BASEMAP COMPOSITOR)
+==================================================================
 
-CAMBIOS V5.5 vs V5.4.2:
-✅ SATELLITE RGB COMO BASEMAP: índice coloreado sobre imagen real Sentinel-2
-✅ Composición profesional: exterior atenuado + parcela con overlay semitransparente
-✅ Contorno blanco con sombra negra sutil (efecto "recorte cartográfico")
-✅ Opacidad configurable por índice (NDVI=0.65, VRA=0.75, NDWI=0.70, etc.)
-✅ LST con función dedicada (más padding por resolución MODIS 1km)
+CAMBIOS V5.5.1 vs V5.4.2:
+✅ BASEMAP ESRI WORLD IMAGERY: descarga tiles reales de alta resolución
+✅ Dos tipos de imagen por índice:
+   - NDVI_WEB: overlay limpio para Leaflet dashboard (solo colores, sin fondo)
+   - NDVI:     cartográfico para PDF (basemap Esri + índice + leyenda + contorno)
+✅ Composición PIL profesional: basemap atenuado + índice semitransparente + contorno
 ✅ Resultado visual idéntico a GEE Code Editor / QGIS
+✅ Fallback automático si compositor no está disponible
 
-POR QUÉ PARECÍA "PLANO Y ABURRIDO" EN v5.4.2:
-    Se usaba fondo sólido gris (#D0CCC4) en vez de satellite real.
-    El exterior se "blanqueaba" al 50% → sin textura ni contexto geográfico.
+POR QUÉ v5.4.2 y v5.5 NO FUNCIONABAN:
+    Usaban Sentinel-2 RGB como basemap → 10m resolución → sin carreteras/detalles.
+    La composición GEE-side no produce el mismo efecto que un basemap de tiles.
     
-    SOLUCIÓN: Satellite RGB de Sentinel-2 como base en toda el área.
-    El índice se superpone con 65-75% de opacidad SOLO dentro de la parcela.
-    El exterior muestra satellite atenuado → contexto geográfico visible.
+    SOLUCIÓN: Descargar tiles de Esri World Imagery (mismo servicio que Leaflet)
+    y componer el índice encima con PIL. Resultado = mapa profesional con contexto.
+
+NUEVO ARCHIVO REQUERIDO:
+    basemap_compositor.py — debe estar junto a gee_automation.py en el proyecto.
+    Si no está disponible, se usa fallback (overlay GEE + leyenda, sin basemap).
 
 TODO LO DEMÁS IDÉNTICO A v5.4.2 (ERA5, VRA, series temporales, KPIs, etc.)
 """
@@ -718,79 +722,128 @@ def persist_images_to_db(job_id, images_base64, bounds=None):
 
 
 # ============================================================================
-# GENERADOR DE PNGs — ORQUESTADOR (v5.5)
+# GENERADOR DE PNGs — ORQUESTADOR (v5.5.1)
 # ============================================================================
 
-def generate_map_pngs(composite_unclipped, latest_sentinel_unclipped, roi, kpis,
-                      index_list, vra_image=None, lst_unclipped=None):
+def generate_all_images(composite_unclipped, roi, roi_info, kpis, bounds,
+                        index_list, vra_image=None, lst_unclipped=None):
     """
-    v5.5: Genera PNGs cartográficos: satellite RGB basemap + índice overlay.
+    v5.5.1: Genera DOS tipos de imagen por índice:
+    
+    1. NDVI_WEB  → Overlay limpio para Leaflet dashboard (solo colores, sin fondo)
+    2. NDVI      → Cartográfico para PDF (basemap Esri + índice + leyenda + contorno)
+    
+    Args:
+        composite_unclipped: ee.Image composite sin clip (para generar overlays GEE)
+        roi:                 ee.Geometry de la parcela
+        roi_info:            roi.getInfo() (coordenadas para dibujar contorno)
+        kpis:                dict con medias (para leyenda)
+        bounds:              {'south','north','east','west'}
+        index_list:          ['NDVI','NDWI',...]
+        vra_image:           ee.Image de zonas VRA (opcional)
+        lst_unclipped:       ee.Image LST sin clip (opcional)
+    
+    Returns:
+        dict: {
+            'NDVI': base64_cartografico,
+            'NDVI_WEB': base64_overlay,
+            'RGB': base64_satellite,
+            ...
+        }
+    """
+    # Importar compositor (puede no estar disponible si falta PIL o network)
+    try:
+        from basemap_compositor import create_cartographic_png, create_satellite_only_png
+        use_compositor = True
+        print("  ✓ Basemap compositor available")
+    except ImportError:
+        use_compositor = False
+        print("  ⚠ Basemap compositor not available — falling back to GEE-only PNGs")
 
-    CAMBIO CLAVE vs v5.4.2:
-    - get_map_style_png ahora recibe sentinel_unclipped como 2º argumento
-    - El satellite RGB se usa como fondo en vez de gris sólido
-    - Opacidades configuradas por índice
-    """
     images = {}
-
+    
     OPACITY_MAP = {
-        'NDVI': 0.65,
-        'NDWI': 0.70,
-        'EVI':  0.65,
-        'NDCI': 0.65,
-        'SAVI': 0.65,
-        'VRA':  0.75,
+        'NDVI': 0.65, 'NDWI': 0.70, 'EVI': 0.65,
+        'NDCI': 0.65, 'SAVI': 0.65, 'VRA': 0.75, 'LST': 0.60,
     }
 
+    # ── Paso 1: Generar overlays limpios desde GEE (para dashboard + input compositor) ──
+    print("\n  === Generating Leaflet overlays (GEE) ===")
+    web_overlays = {}
+    
     for idx in index_list:
         viz = VIZ_PALETTES.get(idx)
         if not viz:
             continue
-        print(f"  Generating cartographic {idx}...")
-        opacity = OPACITY_MAP.get(idx, 0.65)
-        b64 = get_map_style_png(
-            composite_unclipped.select(idx),
-            latest_sentinel_unclipped,
-            roi, viz,
-            dimensions=768,
-            index_opacity=opacity
-        )
+        print(f"  Generating overlay {idx}_WEB...")
+        b64 = get_leaflet_overlay_png(composite_unclipped.select(idx), roi, viz)
         if b64:
-            mean_key = f'{idx.lower()}_mean'
-            b64 = add_legend(b64, idx, kpis.get(mean_key))
-            images[idx] = b64
-            print(f"  ✓ {idx}: OK (opacity={opacity})")
+            web_overlays[idx] = b64
+            images[f'{idx}_WEB'] = b64
+            print(f"  ✓ {idx}_WEB: OK")
         else:
-            print(f"  ✗ {idx}: failed")
+            print(f"  ✗ {idx}_WEB: failed")
 
     if vra_image is not None:
-        print("  Generating cartographic VRA...")
-        b64 = get_map_style_png(
-            vra_image, latest_sentinel_unclipped, roi,
-            VIZ_PALETTES['VRA'], dimensions=768,
-            index_opacity=OPACITY_MAP.get('VRA', 0.75)
-        )
+        print("  Generating overlay VRA_WEB...")
+        b64 = get_leaflet_overlay_png(vra_image, roi, VIZ_PALETTES['VRA'])
         if b64:
-            images['VRA'] = add_legend(b64, 'VRA')
-            print("  ✓ VRA: OK")
+            web_overlays['VRA'] = b64
+            images['VRA_WEB'] = b64
+            print("  ✓ VRA_WEB: OK")
 
     if lst_unclipped is not None:
-        print("  Generating cartographic LST...")
-        b64 = get_map_style_lst(
-            lst_unclipped, latest_sentinel_unclipped, roi,
-            VIZ_PALETTES['LST'], dimensions=512
-        )
+        print("  Generating overlay LST_WEB...")
+        b64 = get_leaflet_overlay_png(lst_unclipped, roi, VIZ_PALETTES['LST'])
         if b64:
-            images['LST'] = add_legend(b64, 'LST', kpis.get('lst_mean_c'))
-            print("  ✓ LST: OK")
+            web_overlays['LST'] = b64
+            images['LST_WEB'] = b64
+            print("  ✓ LST_WEB: OK")
 
-    print("  Generating satellite RGB...")
-    rgb = get_map_style_rgb(latest_sentinel_unclipped, roi, dimensions=768)
-    if rgb:
-        images['RGB'] = rgb
-        print("  ✓ RGB: OK")
+    # ── Paso 2: Generar cartográficos con basemap Esri (para PDF) ──
+    if use_compositor and bounds:
+        print("\n  === Generating cartographic PNGs (Esri basemap) ===")
+        
+        # Extraer coordenadas del polígono para el contorno
+        roi_geojson = roi_info if roi_info else {}
+        
+        for idx, overlay_b64 in web_overlays.items():
+            opacity = OPACITY_MAP.get(idx, 0.65)
+            mean_key = f'{idx.lower()}_mean'
+            mean_val = kpis.get(mean_key)
+            
+            print(f"  Compositing {idx} over Esri basemap...")
+            carto_b64 = create_cartographic_png(
+                index_b64=overlay_b64,
+                bounds=bounds,
+                roi_coords=roi_geojson,
+                index_name=idx,
+                mean_value=mean_val,
+                opacity=opacity
+            )
+            if carto_b64:
+                images[idx] = carto_b64
+                print(f"  ✓ {idx}: OK (cartographic)")
+            else:
+                # Fallback: usar el overlay con leyenda
+                images[idx] = add_legend(overlay_b64, idx, mean_val)
+                print(f"  ⚠ {idx}: compositor failed, using overlay+legend fallback")
 
-    print(f"\n  📊 Total: {len(images)} cartographic PNGs")
+        # RGB satelital puro
+        print("  Compositing satellite RGB...")
+        rgb_b64 = create_satellite_only_png(bounds, roi_geojson)
+        if rgb_b64:
+            images['RGB'] = rgb_b64
+            print("  ✓ RGB: OK (Esri basemap)")
+    else:
+        # Fallback sin compositor: overlays con leyenda como cartográficos
+        print("\n  === Fallback: overlays + legend as cartographic ===")
+        for idx, overlay_b64 in web_overlays.items():
+            mean_key = f'{idx.lower()}_mean'
+            images[idx] = add_legend(overlay_b64, idx, kpis.get(mean_key))
+
+    print(f"\n  📊 Total: {len(images)} images ({len(web_overlays)} web + "
+          f"{len(images) - len(web_overlays)} carto)")
     return images
 
 
@@ -905,18 +958,16 @@ def execute_biweekly_analysis(args):
     }
     kpis.update(weather_kpis)
 
-    # PNGs cartográficos (satellite basemap) — para PDF
-    print("Generating cartographic PNGs (PDF)...")
-    images_base64 = generate_map_pngs(composite_viz, latest_sentinel_viz, roi, kpis,
-                                       index_list=['NDVI', 'NDWI'])
+    # Obtener geometría para el compositor
+    print("Getting ROI geometry info...")
+    roi_info = roi.getInfo()
 
-    # PNGs overlay limpios — para Leaflet dashboard
-    print("Generating Leaflet overlays (dashboard)...")
-    leaflet_overlays = generate_leaflet_overlays(composite_viz, roi,
-                                                  index_list=['NDVI', 'NDWI'])
-
-    # Unificar y persistir todo (carto + web)
-    all_images = {**images_base64, **leaflet_overlays}
+    # Generar TODAS las imágenes (web overlays + cartográficos con basemap Esri)
+    print("Generating all images...")
+    all_images = generate_all_images(
+        composite_viz, roi, roi_info, kpis, bounds,
+        index_list=['NDVI', 'NDWI']
+    )
     stored = persist_images_to_db(job_id, all_images, bounds)
 
     return {
@@ -1035,24 +1086,17 @@ def execute_analysis(args):
         'valid_pixels': stats.get('NDVI_count', 0)
     }
 
-    # PNGs cartográficos (satellite basemap) — para PDF
-    print("Generating cartographic PNGs (PDF)...")
-    images_base64 = generate_map_pngs(
-        composite_viz, latest_sentinel_viz, roi, kpis,
+    # Obtener geometría para el compositor
+    print("Getting ROI geometry info...")
+    roi_info = roi.getInfo()
+
+    # Generar TODAS las imágenes (web overlays + cartográficos con basemap Esri)
+    print("Generating all images...")
+    all_images = generate_all_images(
+        composite_viz, roi, roi_info, kpis, bounds,
         index_list=['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI'],
         vra_image=vra_image, lst_unclipped=lst_unclipped
     )
-
-    # PNGs overlay limpios — para Leaflet dashboard
-    print("Generating Leaflet overlays (dashboard)...")
-    leaflet_overlays = generate_leaflet_overlays(
-        composite_viz, roi,
-        index_list=['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI'],
-        vra_image=vra_image, lst_unclipped=lst_unclipped
-    )
-
-    # Unificar y persistir todo (carto + web)
-    all_images = {**images_base64, **leaflet_overlays}
 
     # Serie temporal
     print("Computing time series...")
