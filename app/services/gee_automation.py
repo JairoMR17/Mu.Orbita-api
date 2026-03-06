@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Mu.Orbita GEE Automation Script v5.1 (COMPOSITE IMAGES)
-=========================================================
+Mu.Orbita GEE Automation Script v5.2 (FLAT 2D MAPS)
+=====================================================
 
-CAMBIOS V5.1 vs V5.0:
-✅ PNGs ahora son COMPOSITES: Satelital RGB + Overlay índice + Contorno parcela
-✅ Nueva función get_composite_png_base64() reemplaza get_png_base64()
-✅ Imagen RGB satelital de referencia incluida (PNG_RGB)
-✅ Leyenda con colorbar añadida a cada imagen (requiere Pillow)
-✅ Alpha configurable por índice (VRA=0.65, LST=0.70, resto=0.55)
-✅ Buffer geográfico para contexto visual (50m alrededor de parcela)
-✅ Todo lo demás IDÉNTICO a v5.0 (ERA5, VRA, series temporales, etc.)
+CAMBIOS V5.2 vs V5.1:
+✅ MAPAS PLANOS 2D: Vista cenital (bird's eye), NO perspectiva 3D
+✅ Índice clipado a la parcela: píxeles fuera = fondo claro (#F5F5F0)
+✅ Contorno oscuro (#333) de la parcela para delimitación clara
+✅ Región = bounding box rectangular (roi.bounds()) — elimina efecto 3D
+✅ Sin blending con RGB satelital (heatmap puro del índice)
+✅ Leyenda profesional con fondo claro, marcador de media, etiquetas min/max
+✅ RGB satelital también plano 2D con clip + fondo neutro
+✅ Todo lo demás IDÉNTICO a v5.1 (ERA5, VRA, series temporales, persist_images)
 
 MODOS:
-    baseline:   Análisis completo (todos los índices + VRA + imágenes compuestas)
+    baseline:   Análisis completo (todos los índices + VRA + LST + imágenes planas)
     biweekly:   Seguimiento ligero (NDVI + NDWI + weather ERA5)
 """
 
@@ -53,7 +54,7 @@ if not initialize_gee():
     sys.exit(1)
 
 # ============================================================================
-# PALETAS DE VISUALIZACIÓN
+# PALETAS DE VISUALIZACIÓN (v5.2: sin 'alpha', añadido 'unit')
 # ============================================================================
 
 VIZ_PALETTES = {
@@ -61,48 +62,48 @@ VIZ_PALETTES = {
         'min': 0.0, 'max': 0.8,
         'palette': ['8B0000', 'FF0000', 'FF6347', 'FFA500', 'FFFF00', 
                     'ADFF2F', '7CFC00', '32CD32', '228B22', '006400'],
-        'alpha': 0.55,
-        'label': 'NDVI (Vigor Vegetativo)'
+        'label': 'NDVI (Vigor Vegetativo)',
+        'unit': ''
     },
     'NDWI': {
         'min': -0.3, 'max': 0.4,
         'palette': ['8B4513', 'D2691E', 'F4A460', 'FFF8DC', 'E0FFFF', 
                     '87CEEB', '4682B4', '0000CD', '00008B'],
-        'alpha': 0.55,
-        'label': 'NDWI (Estado Hídrico)'
+        'label': 'NDWI (Estado Hídrico)',
+        'unit': ''
     },
     'EVI': {
         'min': 0.0, 'max': 0.6,
         'palette': ['8B0000', 'CD5C5C', 'F08080', 'FFFFE0', 'ADFF2F', 
                     '7FFF00', '32CD32', '228B22', '006400'],
-        'alpha': 0.55,
-        'label': 'EVI (Productividad)'
+        'label': 'EVI (Productividad)',
+        'unit': ''
     },
     'NDCI': {
         'min': -0.2, 'max': 0.6,
         'palette': ['8B0000', 'FF6347', 'FFA500', 'FFFF00', 'ADFF2F', 
                     '7CFC00', '32CD32', '228B22', '006400'],
-        'alpha': 0.55,
-        'label': 'NDCI (Clorofila)'
+        'label': 'NDCI (Clorofila)',
+        'unit': ''
     },
     'SAVI': {
         'min': 0.0, 'max': 0.8,
         'palette': ['8B0000', 'FF0000', 'FF6347', 'FFA500', 'FFFF00', 
                     'ADFF2F', '7CFC00', '32CD32', '228B22', '006400'],
-        'alpha': 0.55,
-        'label': 'SAVI (Vigor Ajustado Suelo)'
+        'label': 'SAVI (Vigor Ajustado Suelo)',
+        'unit': ''
     },
     'VRA': {
         'min': 0, 'max': 2,
         'palette': ['e74c3c', 'f1c40f', '27ae60'],
-        'alpha': 0.65,
-        'label': 'Zonas de Manejo Variable'
+        'label': 'Zonas de Manejo Variable',
+        'unit': ''
     },
     'LST': {
         'min': 15, 'max': 45,
         'palette': ['0000FF', '00FFFF', '00FF00', 'FFFF00', 'FF0000'],
-        'alpha': 0.70,
-        'label': 'Temperatura Superficial (°C)'
+        'label': 'Temperatura Superficial',
+        'unit': '°C'
     }
 }
 
@@ -111,7 +112,7 @@ VIZ_PALETTES = {
 # ============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Mu.Orbita GEE Automation v5.1 (Composite Images)')
+    parser = argparse.ArgumentParser(description='Mu.Orbita GEE Automation v5.2 (Flat 2D Maps)')
     parser.add_argument('--mode', required=True, 
                         choices=['execute', 'check-status', 'download-results', 'start-tasks'])
     parser.add_argument('--job-id', required=True)
@@ -166,56 +167,58 @@ def get_bounds(roi):
 
 
 # ============================================================================
-# GENERACIÓN DE IMÁGENES COMPUESTAS (NUEVO EN V5.1)
+# GENERACIÓN DE IMÁGENES PLANAS 2D (v5.2 — REEMPLAZA v5.1 composites)
 # ============================================================================
 
-def get_composite_png_base64(
-    index_image,
-    sentinel_rgb_image,
-    roi,
-    viz_params,
-    alpha=0.55,
-    dimensions=1024,
-    boundary_color='FFFFFF',
-    boundary_width=2,
-    buffer_meters=50
-):
+def get_flat_index_png(index_image, roi, viz_params, dimensions=1024,
+                       bg_color='F5F5F0', boundary_color='333333',
+                       boundary_width=2):
     """
-    Genera un PNG COMPUESTO: Satelital RGB + Overlay índice + Contorno parcela.
+    Genera un PNG PLANO 2D del índice, vista cenital (bird's eye).
     
-    ANTES (v5.0): Solo el índice coloreado → heatmap pixelado sin contexto.
-    AHORA (v5.1): Imagen satelital real + índice semitransparente + contorno blanco.
+    DIFERENCIAS CON v5.1 (get_composite_png_base64):
+    ✅ SIN mezcla con imagen RGB satelital → heatmap puro
+    ✅ Clip estricto a la parcela → fuera = fondo neutro (#F5F5F0)
+    ✅ Región = roi.bounds() (rectángulo) → NO perspectiva 3D
+    ✅ Contorno oscuro (#333) → mejor contraste sobre colores claros
     
     Args:
-        index_image:        ee.Image con 1 banda del índice (NDVI, NDWI, etc.)
-        sentinel_rgb_image: ee.Image Sentinel-2 con bandas B4, B3, B2 (ya dividida por 10000)
-        roi:                ee.Geometry de la parcela
-        viz_params:         dict con min, max, palette del índice
-        alpha:              peso del overlay (0=solo satélite, 1=solo índice). Default 0.55
-        dimensions:         resolución máxima del PNG. Default 1024
-        boundary_color:     color hex del contorno. Default 'FFFFFF'
-        boundary_width:     grosor del contorno en píxeles. Default 2
-        buffer_meters:      buffer alrededor del ROI para contexto. Default 50
+        index_image:    ee.Image con 1 banda del índice (NDVI, NDWI, etc.)
+        roi:            ee.Geometry de la parcela
+        viz_params:     dict con min, max, palette
+        dimensions:     resolución máxima del PNG (default 1024)
+        bg_color:       hex del fondo fuera de parcela (default F5F5F0)
+        boundary_color: hex del contorno de parcela (default 333333)
+        boundary_width: grosor contorno en píxeles (default 2)
     
     Returns:
         str: PNG en base64, o None si falla
     """
     try:
-        # ── 1. Imagen satelital true-color RGB ──────────────────────
-        # Sentinel-2 ya está en reflectancia (dividido por 10000), escala 0-0.3
-        rgb = sentinel_rgb_image.select(['B4', 'B3', 'B2']).visualize(
-            min=0, max=0.3, gamma=1.3
-        )
+        # ── 1. Clipar índice a la parcela ───────────────────────────
+        clipped = index_image.clip(roi)
         
-        # ── 2. Índice coloreado con paleta ──────────────────────────
+        # ── 2. Fondo sólido del color deseado ───────────────────────
+        bg_r = int(bg_color[0:2], 16)
+        bg_g = int(bg_color[2:4], 16)
+        bg_b = int(bg_color[4:6], 16)
+        
+        bg_image = ee.Image([
+            ee.Image.constant(bg_r).toUint8().rename('vis-red'),
+            ee.Image.constant(bg_g).toUint8().rename('vis-green'),
+            ee.Image.constant(bg_b).toUint8().rename('vis-blue')
+        ])
+        
+        # ── 3. Colorear el índice con la paleta ─────────────────────
         index_viz = {k: v for k, v in viz_params.items() if k in ('min', 'max', 'palette')}
-        index_colored = index_image.visualize(**index_viz)
+        index_colored = clipped.visualize(**index_viz)
         
-        # ── 3. Blending: mezcla satelital + índice ──────────────────
-        # Ambas son imágenes RGB 0-255 (vis-red, vis-green, vis-blue)
-        blended = rgb.multiply(1.0 - alpha).add(index_colored.multiply(alpha)).toUint8()
+        # ── 4. Componer: fondo + índice (solo dentro de parcela) ────
+        # El .clip(roi) hace que fuera de la parcela no haya datos
+        # → .blend() solo pinta donde hay datos → fondo visible fuera
+        composed = bg_image.blend(index_colored)
         
-        # ── 4. Contorno de parcela ──────────────────────────────────
+        # ── 5. Contorno de la parcela ───────────────────────────────
         roi_fc = ee.FeatureCollection([ee.Feature(roi)])
         outline = ee.Image().byte().paint(
             featureCollection=roi_fc,
@@ -223,15 +226,15 @@ def get_composite_png_base64(
             width=boundary_width
         )
         outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
+        final = composed.blend(outline_vis)
         
-        # Superponer contorno sobre el blend
-        final = blended.blend(outline_vis)
+        # ── 6. Región = bounding box RECTANGULAR ────────────────────
+        # CLAVE: roi.bounds() genera un rectángulo perfecto alineado
+        # a los ejes → vista cenital plana, SIN perspectiva 3D
+        bbox = roi.bounds()
+        region_coords = bbox.getInfo()['coordinates']
         
-        # ── 5. Región con buffer para contexto visual ───────────────
-        buffered_region = roi.buffer(buffer_meters).bounds()
-        region_coords = buffered_region.getInfo()['coordinates']
-        
-        # ── 6. Generar thumbnail URL y descargar ────────────────────
+        # ── 7. Generar thumbnail y descargar ────────────────────────
         url = final.getThumbURL({
             'region': region_coords,
             'dimensions': dimensions,
@@ -239,38 +242,55 @@ def get_composite_png_base64(
         })
         
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.1')
+        req.add_header('User-Agent', 'MuOrbita/5.2')
         response = urllib.request.urlopen(req, timeout=60)
         png_bytes = response.read()
         
         if len(png_bytes) < 100:
-            print(f"Warning: Composite PNG too small ({len(png_bytes)} bytes)")
+            print(f"Warning: Flat PNG too small ({len(png_bytes)} bytes)")
             return None
         
         return base64.b64encode(png_bytes).decode('utf-8')
-        
+    
     except Exception as e:
-        print(f"Warning: Could not generate composite PNG: {e}")
+        print(f"Warning: Could not generate flat index PNG: {e}")
         return None
 
 
-def get_rgb_png_base64(sentinel_rgb_image, roi, dimensions=1024, 
-                        boundary_color='FFFFFF', boundary_width=2, buffer_meters=50):
+def get_flat_rgb_png(sentinel_rgb_image, roi, dimensions=1024,
+                     bg_color='F5F5F0', boundary_color='333333',
+                     boundary_width=2):
     """
-    Genera un PNG solo de imagen satelital true-color (referencia visual).
+    Genera un PNG plano 2D de la imagen satelital true-color (RGB).
+    Mismo estilo visual que get_flat_index_png para consistencia.
     """
     try:
-        rgb = sentinel_rgb_image.select(['B4', 'B3', 'B2']).visualize(
+        # Clipar a la parcela y visualizar
+        rgb = sentinel_rgb_image.select(['B4', 'B3', 'B2']).clip(roi).visualize(
             min=0, max=0.3, gamma=1.3
         )
         
+        # Fondo sólido
+        bg_r = int(bg_color[0:2], 16)
+        bg_g = int(bg_color[2:4], 16)
+        bg_b = int(bg_color[4:6], 16)
+        bg_image = ee.Image([
+            ee.Image.constant(bg_r).toUint8().rename('vis-red'),
+            ee.Image.constant(bg_g).toUint8().rename('vis-green'),
+            ee.Image.constant(bg_b).toUint8().rename('vis-blue')
+        ])
+        
+        composed = bg_image.blend(rgb)
+        
+        # Contorno
         roi_fc = ee.FeatureCollection([ee.Feature(roi)])
         outline = ee.Image().byte().paint(roi_fc, 1, boundary_width)
         outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
-        final = rgb.blend(outline_vis)
+        final = composed.blend(outline_vis)
         
-        buffered_region = roi.buffer(buffer_meters).bounds()
-        region_coords = buffered_region.getInfo()['coordinates']
+        # Bounding box rectangular
+        bbox = roi.bounds()
+        region_coords = bbox.getInfo()['coordinates']
         
         url = final.getThumbURL({
             'region': region_coords,
@@ -279,7 +299,7 @@ def get_rgb_png_base64(sentinel_rgb_image, roi, dimensions=1024,
         })
         
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.1')
+        req.add_header('User-Agent', 'MuOrbita/5.2')
         response = urllib.request.urlopen(req, timeout=60)
         png_bytes = response.read()
         
@@ -287,54 +307,31 @@ def get_rgb_png_base64(sentinel_rgb_image, roi, dimensions=1024,
             return None
         
         return base64.b64encode(png_bytes).decode('utf-8')
-        
+    
     except Exception as e:
-        print(f"Warning: Could not generate RGB PNG: {e}")
-        return None
-
-
-def get_plain_png_base64(image, roi, viz_params, dimensions=1024):
-    """
-    FALLBACK: Genera PNG coloreado SIN composición satelital.
-    Idéntico al get_png_base64() de v5.0 — se usa si no hay imagen Sentinel disponible
-    (por ejemplo para LST MODIS que tiene resolución diferente).
-    """
-    try:
-        url = image.visualize(**{k: v for k, v in viz_params.items() 
-                                  if k in ('min', 'max', 'palette')}).getThumbURL({
-            'region': roi,
-            'dimensions': dimensions,
-            'format': 'png'
-        })
-        
-        req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.1')
-        response = urllib.request.urlopen(req, timeout=60)
-        png_bytes = response.read()
-        
-        if len(png_bytes) < 100:
-            return None
-        
-        return base64.b64encode(png_bytes).decode('utf-8')
-        
-    except Exception as e:
-        print(f"Warning: Could not generate plain PNG: {e}")
+        print(f"Warning: Could not generate flat RGB PNG: {e}")
         return None
 
 
 # ============================================================================
-# LEYENDAS CON PIL (OPCIONAL)
+# LEYENDA PROFESIONAL (v5.2 — REEMPLAZA add_legend_to_png)
 # ============================================================================
 
-def add_legend_to_png(png_base64, index_name, mean_value=None):
+def add_professional_legend(png_base64, index_name, mean_value=None):
     """
-    Añade barra de color (leyenda) y título a un PNG compuesto.
-    Requiere Pillow. Si no está instalado, devuelve la imagen original.
+    Añade leyenda profesional al PNG: título, colorbar, estadísticas.
+    
+    Mejoras vs v5.1 (add_legend_to_png):
+    ✅ Fondo claro (#F9F7F2) → legible en PDF e impresión
+    ✅ Texto oscuro para mejor contraste
+    ✅ Marcador triangular del valor medio sobre la barra
+    ✅ Etiquetas min/max en los extremos con unidades
+    ✅ Color de acento marrón Mu.Orbita para el título
     
     Args:
         png_base64:  PNG en base64
         index_name:  'NDVI', 'NDWI', etc.
-        mean_value:  valor medio para mostrar (ej: 0.65)
+        mean_value:  valor medio para marcar en la barra
     
     Returns:
         PNG con leyenda, en base64
@@ -342,48 +339,72 @@ def add_legend_to_png(png_base64, index_name, mean_value=None):
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
+        print("Warning: Pillow not installed, returning PNG without legend")
         return png_base64
     
     viz = VIZ_PALETTES.get(index_name)
     if not viz:
         return png_base64
     
+    # Decodificar imagen
     img_bytes = base64.b64decode(png_base64)
-    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+    img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
     
-    # Dimensiones de la leyenda
-    legend_h = 70
-    pad = 16
-    bar_h = 16
-    bar_w = min(280, img.width - 2 * pad)
+    # ── Dimensiones de la leyenda ───────────────────────────────
+    legend_h = 90
+    pad = 20
+    bar_h = 18
+    bar_w = min(350, img.width - 2 * pad)
     
-    # Nueva imagen con espacio para leyenda
-    new_img = Image.new('RGB', (img.width, img.height + legend_h), (25, 22, 20))
+    # ── Colores ─────────────────────────────────────────────────
+    bg_color = (249, 247, 242, 255)    # #F9F7F2
+    text_color = (51, 51, 51)           # #333333
+    text_muted = (136, 136, 136)        # #888888
+    accent_color = (139, 69, 19)        # #8B4513 (marrón Mu.Orbita)
+    
+    # ── Nueva imagen con leyenda abajo ──────────────────────────
+    new_img = Image.new('RGBA', (img.width, img.height + legend_h), bg_color)
     new_img.paste(img, (0, 0))
     draw = ImageDraw.Draw(new_img)
     
-    # Fuentes
+    # Línea separadora
+    draw.line([(0, img.height), (img.width, img.height)], fill=(200, 195, 185), width=1)
+    
+    # ── Fuentes ─────────────────────────────────────────────────
     try:
-        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 13)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
+        font_value = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11)
     except (OSError, IOError):
         font_title = ImageFont.load_default()
         font_small = font_title
+        font_value = font_title
     
-    y0 = img.height + 6
+    y0 = img.height + 8
     
-    # Título
+    # ── Título del índice ───────────────────────────────────────
     label = viz.get('label', index_name)
-    if mean_value is not None:
-        label += f"  |  Media: {mean_value:.2f}"
-    draw.text((pad, y0), label, fill=(240, 240, 240), font=font_title)
+    draw.text((pad, y0), label, fill=accent_color, font=font_title)
     
-    # Barra de color
-    bar_y = y0 + 22
+    # Valor medio a la derecha del título
+    if mean_value is not None:
+        mean_text = f"Media: {mean_value:.2f}"
+        try:
+            title_bbox = draw.textbbox((0, 0), label, font=font_title)
+            title_w = title_bbox[2] - title_bbox[0]
+        except AttributeError:
+            title_w = len(label) * 8
+        draw.text((pad + title_w + 20, y0 + 1), mean_text, fill=text_color, font=font_value)
+    
+    # ── Barra de color (colorbar) ───────────────────────────────
+    bar_y = y0 + 24
+    bar_x = pad
+    
     colors_hex = viz['palette']
     colors_rgb = [tuple(int(h[i:i+2], 16) for i in (0, 2, 4)) for h in colors_hex]
     n = len(colors_rgb)
     
+    # Dibujar gradiente
     for x in range(bar_w):
         t = x / bar_w
         idx = t * (n - 1)
@@ -391,24 +412,50 @@ def add_legend_to_png(png_base64, index_name, mean_value=None):
         f = idx - i
         c1, c2 = colors_rgb[i], colors_rgb[i + 1]
         color = tuple(int(c1[j] * (1 - f) + c2[j] * f) for j in range(3))
-        draw.rectangle([pad + x, bar_y, pad + x + 1, bar_y + bar_h], fill=color)
+        draw.rectangle([bar_x + x, bar_y, bar_x + x + 1, bar_y + bar_h], fill=color)
     
-    draw.rectangle([pad, bar_y, pad + bar_w, bar_y + bar_h], outline=(120, 120, 120), width=1)
+    # Borde de la barra
+    draw.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], outline=(100, 100, 100), width=1)
     
-    # Etiquetas
-    ey = bar_y + bar_h + 3
-    draw.text((pad, ey), str(viz['min']), fill=(170, 170, 170), font=font_small)
-    max_str = str(viz['max'])
-    draw.text((pad + bar_w - len(max_str) * 7, ey), max_str, fill=(170, 170, 170), font=font_small)
-    mid = (viz['min'] + viz['max']) / 2
-    mid_str = f"{mid:.1f}"
-    draw.text((pad + bar_w // 2 - len(mid_str) * 3, ey), mid_str, fill=(170, 170, 170), font=font_small)
+    # ── Etiquetas min/max ───────────────────────────────────────
+    min_val = viz['min']
+    max_val = viz['max']
+    unit = viz.get('unit', '')
     
-    # Exportar
-    out = io.BytesIO()
-    new_img.save(out, format='PNG', optimize=True)
-    out.seek(0)
-    return base64.b64encode(out.read()).decode('utf-8')
+    draw.text((bar_x, bar_y + bar_h + 3), f"{min_val}{unit}", fill=text_muted, font=font_small)
+    
+    max_text = f"{max_val}{unit}"
+    try:
+        max_bbox = draw.textbbox((0, 0), max_text, font=font_small)
+        max_w = max_bbox[2] - max_bbox[0]
+    except AttributeError:
+        max_w = len(max_text) * 6
+    draw.text((bar_x + bar_w - max_w, bar_y + bar_h + 3), max_text, fill=text_muted, font=font_small)
+    
+    # ── Marcador del valor medio sobre la barra ─────────────────
+    if mean_value is not None:
+        val_range = max_val - min_val
+        if val_range > 0:
+            t = max(0, min(1, (mean_value - min_val) / val_range))
+            marker_x = bar_x + int(t * bar_w)
+            
+            # Triángulo invertido (▼) apuntando a la barra
+            triangle_size = 6
+            draw.polygon([
+                (marker_x, bar_y - 2),
+                (marker_x - triangle_size, bar_y - 2 - triangle_size),
+                (marker_x + triangle_size, bar_y - 2 - triangle_size)
+            ], fill=text_color)
+    
+    # ── Convertir RGBA → RGB para compatibilidad ────────────────
+    final_img = Image.new('RGB', new_img.size, (249, 247, 242))
+    final_img.paste(new_img, mask=new_img.split()[3])
+    
+    buf = io.BytesIO()
+    final_img.save(buf, format='PNG', optimize=True)
+    buf.seek(0)
+    
+    return base64.b64encode(buf.getvalue()).decode('utf-8')
 
 
 # ============================================================================
@@ -833,7 +880,7 @@ def persist_images_to_db(job_id, images_base64, bounds=None):
 
 def execute_biweekly_analysis(args):
     """
-    Análisis BIWEEKLY ligero — PNGs compuestos directos.
+    Análisis BIWEEKLY ligero — PNGs planos 2D (v5.2).
     """
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
@@ -856,7 +903,7 @@ def execute_biweekly_analysis(args):
     indexed_collection = collection.map(calculate_indices)
     composite = indexed_collection.median().clip(roi)
     
-    # ── Imagen Sentinel-2 más reciente (para fondo RGB) ─────────────
+    # ── Imagen Sentinel-2 más reciente (para RGB de referencia) ─────
     latest_sentinel = indexed_collection.sort('system:time_start', False).first().clip(roi)
     
     latest = collection.sort('system:time_start', False).first()
@@ -928,46 +975,35 @@ def execute_biweekly_analysis(args):
     except Exception as e:
         print(f"Warning: Could not get time series: {e}")
     
-    # ========== GENERAR PNGs COMPUESTOS (v5.1) ==========
-    print("Generating COMPOSITE PNG images (satellite + overlay)...")
+    # ========== GENERAR PNGs PLANOS 2D (v5.2) ==========
+    print("Generating FLAT 2D PNG maps (bird's eye view)...")
     
     images_base64 = {}
     
-    # KPIs para leyendas
-    kpi_means = {
-        'NDVI': stats.get('NDVI_mean'),
-        'NDWI': stats.get('NDWI_mean'),
-    }
-    
     for idx_name in ['NDVI', 'NDWI']:
-        print(f"  Generating composite {idx_name}...")
+        print(f"  Generating flat 2D {idx_name}...")
         viz = VIZ_PALETTES[idx_name]
-        b64 = get_composite_png_base64(
+        b64 = get_flat_index_png(
             index_image=composite.select(idx_name),
-            sentinel_rgb_image=latest_sentinel,
             roi=roi,
             viz_params=viz,
-            alpha=viz.get('alpha', 0.55),
             dimensions=1024
         )
         if b64:
-            # Añadir leyenda
-            b64 = add_legend_to_png(b64, idx_name, kpi_means.get(idx_name))
+            b64 = add_professional_legend(b64, idx_name, stats.get(f'{idx_name}_mean'))
             images_base64[idx_name] = b64
-            print(f"  ✓ {idx_name}: composite + legend OK")
+            print(f"  ✓ {idx_name}: flat 2D + legend OK")
         else:
-            print(f"  ✗ {idx_name}: failed, trying plain fallback...")
-            b64 = get_plain_png_base64(composite.select(idx_name), roi, viz)
-            if b64:
-                images_base64[idx_name] = b64
-                print(f"  ✓ {idx_name}: plain fallback OK")
+            print(f"  ✗ {idx_name}: generation failed")
     
-    # Imagen RGB de referencia
-    print("  Generating RGB reference...")
-    rgb_b64 = get_rgb_png_base64(latest_sentinel, roi, dimensions=1024)
+    # Imagen RGB de referencia (plana)
+    print("  Generating flat 2D RGB reference...")
+    rgb_b64 = get_flat_rgb_png(latest_sentinel, roi, dimensions=1024)
     if rgb_b64:
         images_base64['RGB'] = rgb_b64
-        print("  ✓ RGB: OK")
+        print("  ✓ RGB: flat 2D OK")
+    
+    print(f"\n  Total flat 2D images: {len(images_base64)}")
     
     # ========== KPIs ==========
     kpis = {
@@ -1000,7 +1036,7 @@ def execute_biweekly_analysis(args):
     }
     kpis.update(weather_kpis)
     
-    # ========== PERSISTIR IMÁGENES EN BD (v5.2) ==========
+    # ========== PERSISTIR IMÁGENES EN BD ==========
     stored = persist_images_to_db(job_id, images_base64, bounds)
     
     # ========== RESULTADO ==========
@@ -1014,7 +1050,6 @@ def execute_biweekly_analysis(args):
         'bounds': bounds,
         'time_series': time_series,
         
-        # v5.2: Metadata de imágenes (ligero, para n8n)
         'images_stored': stored,
         'images_available': list(images_base64.keys()),
         
@@ -1025,10 +1060,10 @@ def execute_biweekly_analysis(args):
         'task_count': 0,
         'message': (
             f'Biweekly analysis complete. '
-            f'{len(stored)} images persisted in DB.'
+            f'{len(stored)} flat 2D images persisted in DB.'
             if stored else
             f'Biweekly analysis complete. '
-            f'{len(images_base64)} images in response (DB store failed).'
+            f'{len(images_base64)} flat 2D images in response (DB store failed).'
         )
     }
     
@@ -1041,7 +1076,7 @@ def execute_biweekly_analysis(args):
 
 def execute_analysis(args):
     """
-    Análisis BASELINE completo — PNGs compuestos directos.
+    Análisis BASELINE completo — PNGs planos 2D (v5.2).
     """
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
@@ -1062,7 +1097,7 @@ def execute_analysis(args):
     indexed_collection = collection.map(calculate_indices)
     composite = indexed_collection.median().clip(roi)
     
-    # ── Imagen Sentinel-2 más reciente (para fondo RGB de composites) ──
+    # ── Imagen Sentinel-2 más reciente (para RGB de referencia) ──
     latest_sentinel = indexed_collection.sort('system:time_start', False).first().clip(roi)
     
     latest = collection.sort('system:time_start', False).first()
@@ -1153,89 +1188,69 @@ def execute_analysis(args):
         'valid_pixels': stats.get('NDVI_count', 0)
     }
     
-    # ========== GENERAR PNGs COMPUESTOS (v5.1) ==========
-    print("Generating COMPOSITE PNG images (satellite + overlay + boundary)...")
+    # ========== GENERAR PNGs PLANOS 2D (v5.2) ==========
+    print("Generating FLAT 2D PNG maps (bird's eye view)...")
     
     images_base64 = {}
     
-    # Dict de valores medios para leyendas
-    kpi_means = {
-        'NDVI': kpis.get('ndvi_mean'),
-        'NDWI': kpis.get('ndwi_mean'),
-        'EVI':  kpis.get('evi_mean'),
-        'NDCI': kpis.get('ndci_mean'),
-        'SAVI': kpis.get('savi_mean'),
-        'LST':  kpis.get('lst_mean_c'),
-    }
-    
-    # ── Índices vegetativos (composite: satélite + overlay + contorno) ──
+    # ── Índices vegetativos (mapas planos 2D) ───────────────────
     for idx_name in ['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI']:
-        print(f"  Generating composite {idx_name}...")
+        print(f"  Generating flat 2D {idx_name}...")
         viz = VIZ_PALETTES[idx_name]
         
-        b64 = get_composite_png_base64(
+        b64 = get_flat_index_png(
             index_image=composite.select(idx_name),
-            sentinel_rgb_image=latest_sentinel,
             roi=roi,
             viz_params=viz,
-            alpha=viz.get('alpha', 0.55),
             dimensions=1024
         )
         
         if b64:
-            b64 = add_legend_to_png(b64, idx_name, kpi_means.get(idx_name))
+            mean_key = f'{idx_name.lower()}_mean'
+            b64 = add_professional_legend(b64, idx_name, kpis.get(mean_key))
             images_base64[idx_name] = b64
-            print(f"  ✓ {idx_name}: composite + legend OK")
+            print(f"  ✓ {idx_name}: flat 2D + legend OK")
         else:
-            # Fallback: PNG plano sin fondo satelital
-            print(f"  ✗ {idx_name}: composite failed, trying plain fallback...")
-            b64 = get_plain_png_base64(composite.select(idx_name), roi, viz)
-            if b64:
-                b64 = add_legend_to_png(b64, idx_name, kpi_means.get(idx_name))
-                images_base64[idx_name] = b64
-                print(f"  ✓ {idx_name}: plain fallback + legend OK")
-            else:
-                print(f"  ✗ {idx_name}: all methods failed")
+            print(f"  ✗ {idx_name}: generation failed")
     
-    # ── VRA (composite con alpha más alto para zonas claras) ────────
+    # ── VRA (mapa plano 2D) ─────────────────────────────────────
     if vra_image is not None:
-        print("  Generating composite VRA...")
+        print("  Generating flat 2D VRA...")
         viz = VIZ_PALETTES['VRA']
-        b64 = get_composite_png_base64(
+        b64 = get_flat_index_png(
             index_image=vra_image,
-            sentinel_rgb_image=latest_sentinel,
             roi=roi,
             viz_params=viz,
-            alpha=viz.get('alpha', 0.65),
             dimensions=1024
         )
         if b64:
-            b64 = add_legend_to_png(b64, 'VRA')
+            b64 = add_professional_legend(b64, 'VRA')
             images_base64['VRA'] = b64
-            print("  ✓ VRA: composite + legend OK")
-        else:
-            b64 = get_plain_png_base64(vra_image, roi, viz)
-            if b64:
-                images_base64['VRA'] = b64
+            print("  ✓ VRA: flat 2D + legend OK")
     
-    # ── LST (plain — resolución MODIS 1km no encaja bien con Sentinel 10m) ──
+    # ── LST (mapa plano 2D — resolución MODIS 1km) ─────────────
     if lst is not None:
-        print("  Generating LST PNG (plain — different resolution)...")
+        print("  Generating flat 2D LST...")
         viz = VIZ_PALETTES['LST']
-        b64 = get_plain_png_base64(lst, roi, viz, dimensions=512)
+        b64 = get_flat_index_png(
+            index_image=lst,
+            roi=roi,
+            viz_params=viz,
+            dimensions=512  # Menor resolución (MODIS = 1km)
+        )
         if b64:
-            b64 = add_legend_to_png(b64, 'LST', kpi_means.get('LST'))
+            b64 = add_professional_legend(b64, 'LST', kpis.get('lst_mean_c'))
             images_base64['LST'] = b64
-            print("  ✓ LST: plain + legend OK")
+            print("  ✓ LST: flat 2D + legend OK")
     
-    # ── Imagen RGB satelital de referencia ──────────────────────────
-    print("  Generating RGB reference image...")
-    rgb_b64 = get_rgb_png_base64(latest_sentinel, roi, dimensions=1024)
+    # ── Imagen RGB satelital de referencia (plana) ──────────────
+    print("  Generating flat 2D RGB reference...")
+    rgb_b64 = get_flat_rgb_png(latest_sentinel, roi, dimensions=1024)
     if rgb_b64:
         images_base64['RGB'] = rgb_b64
-        print("  ✓ RGB: OK")
+        print("  ✓ RGB: flat 2D OK")
     
-    print(f"\n  Total images generated: {len(images_base64)}")
+    print(f"\n  Total flat 2D images: {len(images_base64)}")
     
     # ========== SERIE TEMPORAL ==========
     time_series = []
@@ -1261,7 +1276,7 @@ def execute_analysis(args):
     except Exception as e:
         print(f"Warning: Could not get time series: {e}")
     
-  # ========== PERSISTIR IMÁGENES EN BD (v5.2) ==========
+    # ========== PERSISTIR IMÁGENES EN BD ==========
     stored = persist_images_to_db(job_id, images_base64, bounds)
     
     # ========== RESULTADO ==========
@@ -1274,7 +1289,6 @@ def execute_analysis(args):
         'bounds': bounds,
         'time_series': time_series,
         
-        # v5.2: Metadata de imágenes (ligero, para n8n)
         'images_stored': stored,
         'images_available': list(images_base64.keys()),
         
@@ -1285,7 +1299,7 @@ def execute_analysis(args):
         'task_count': 0,
         'message': (
             f'Baseline analysis complete. '
-            f'{len(stored)} images persisted in DB.'
+            f'{len(stored)} flat 2D images persisted in DB.'
         )
     }
     
@@ -1309,7 +1323,7 @@ def check_status(args):
         'png_complete': True,
         'any_failed': False,
         'progress_pct': 100,
-        'message': 'v5.1: No async tasks. All data returned immediately in execute response.'
+        'message': 'v5.2: No async tasks. All data returned immediately in execute response.'
     }
 
 # ============================================================================
@@ -1323,7 +1337,7 @@ def download_results(args):
         'analysis_type': getattr(args, 'analysis_type', 'baseline'),
         'status': 'ready',
         'download_ready': True,
-        'message': 'v5.1: All data returned directly in execute response. No Drive downloads needed.'
+        'message': 'v5.2: All data returned directly in execute response. No Drive downloads needed.'
     }
 
 # ============================================================================
@@ -1335,7 +1349,7 @@ def start_tasks(args):
     return {
         'job_id': args.job_id,
         'started': 0,
-        'message': 'v5.1: No async tasks to start. All processing is synchronous.'
+        'message': 'v5.2: No async tasks to start. All processing is synchronous.'
     }
 
 # ============================================================================
