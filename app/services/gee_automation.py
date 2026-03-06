@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
-Mu.Orbita GEE Automation Script v5.4 (TRUE FLAT 2D MAPS)
-==========================================================
+Mu.Orbita GEE Automation Script v5.5 (CARTOGRAPHIC MAP STYLE)
+===============================================================
 
-CAMBIOS V5.4 vs V5.3:
-✅ PNGs COMO GEE CODE EDITOR: índice coloreado en TODA el área + contorno parcela
-✅ NO se clipan las imágenes para visualización → llena todo el rectángulo de color
-✅ Se usa composite SIN clip para PNGs (el clip era la causa del efecto 3D)
-✅ Contorno negro grueso (3px) de la parcela sobre el mapa de colores
-✅ Padding de 150m alrededor de la parcela para contexto visual
-✅ Optimización ERA5 mantenida de v5.3 (batched queries)
+CAMBIOS V5.5 vs V5.4.2:
+✅ SATELLITE RGB COMO BASEMAP: índice coloreado sobre imagen real Sentinel-2
+✅ Composición profesional: exterior atenuado + parcela con overlay semitransparente
+✅ Contorno blanco con sombra negra sutil (efecto "recorte cartográfico")
+✅ Opacidad configurable por índice (NDVI=0.65, VRA=0.75, NDWI=0.70, etc.)
+✅ LST con función dedicada (más padding por resolución MODIS 1km)
+✅ Resultado visual idéntico a GEE Code Editor / QGIS
 
-POR QUÉ PARECÍA 3D:
-    El polígono de la parcela está rotado geográficamente.
-    Al hacer clip(roi) + fondo sólido, se genera una forma geométrica aislada
-    que el cerebro interpreta como un objeto 3D flotando.
+POR QUÉ PARECÍA "PLANO Y ABURRIDO" EN v5.4.2:
+    Se usaba fondo sólido gris (#D0CCC4) en vez de satellite real.
+    El exterior se "blanqueaba" al 50% → sin textura ni contexto geográfico.
     
-    SOLUCIÓN: NO clipar. Colorear toda el área (como GEE Code Editor).
-    La parcela se muestra como un CONTORNO sobre el mapa de colores.
+    SOLUCIÓN: Satellite RGB de Sentinel-2 como base en toda el área.
+    El índice se superpone con 65-75% de opacidad SOLO dentro de la parcela.
+    El exterior muestra satellite atenuado → contexto geográfico visible.
+
+TODO LO DEMÁS IDÉNTICO A v5.4.2 (ERA5, VRA, series temporales, KPIs, etc.)
 """
 
 import argparse
@@ -106,7 +108,7 @@ VIZ_PALETTES = {
 # ============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.4')
+    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.5')
     parser.add_argument('--mode', required=True,
                         choices=['execute', 'check-status', 'download-results', 'start-tasks'])
     parser.add_argument('--job-id', required=True)
@@ -151,92 +153,172 @@ def get_bounds(roi):
 
 
 # ============================================================================
-# PNG ESTILO MAPA PROFESIONAL (v5.4.2) — CERO PÍXELES VACÍOS
+# PNG CARTOGRÁFICO PROFESIONAL (v5.5) — SATELLITE RGB BASEMAP
 # ============================================================================
 
-def get_map_style_png(index_image_unclipped, roi, viz_params, dimensions=768,
-                      boundary_color='000000', boundary_width=4,
-                      padding_meters=100):
+def get_map_style_png(index_image_unclipped, sentinel_unclipped, roi, viz_params,
+                      dimensions=768, index_opacity=0.65,
+                      boundary_color='FFFFFF', boundary_width=3,
+                      padding_meters=150, dim_factor=0.45):
     """
-    v5.4.2: Garantiza CERO píxeles vacíos en la imagen final.
+    v5.5: PNG cartográfico — índice coloreado sobre imagen satelital real.
 
-    Técnica:
-    1. bg sólido gris (#D0CCC4) cubre TODO el rectángulo
-    2. Índice coloreado en toda el área → .unmask(bg) rellena huecos de nubes
-    3. Se atenúa al 50% (mezcla con blanco)
-    4. Índice clipado a la parcela (colores 100%) se pinta encima
-    5. Contorno negro grueso delimita la parcela
+    Capas (de abajo a arriba):
+    1. Satellite RGB atenuado en toda el área (contexto geográfico)
+    2. Índice coloreado blended con satellite DENTRO de parcela
+    3. Contorno blanco con sombra negra
 
-    Resultado: rectángulo COMPLETAMENTE relleno de color.
-    Parcela = colores vivos. Entorno = colores apagados. Sin huecos.
+    Args:
+        index_image_unclipped: ee.Image con 1 banda del índice (sin clip)
+        sentinel_unclipped:    ee.Image Sentinel-2 con B4/B3/B2 (sin clip)
+        roi:                   ee.Geometry de la parcela
+        viz_params:            dict con min, max, palette
+        dimensions:            resolución máx del PNG
+        index_opacity:         peso del índice vs satellite dentro de parcela
+        boundary_color:        color hex del contorno
+        boundary_width:        grosor contorno en px
+        padding_meters:        buffer visual alrededor de parcela
+        dim_factor:            brillo exterior (0.45 = 45% del original)
     """
     try:
-        print(f"  [v5.4.2] Generating map-style PNG...")
+        print(f"  [v5.5] Generating cartographic PNG (satellite basemap)...")
         viz_kw = {k: v for k, v in viz_params.items() if k in ('min', 'max', 'palette')}
 
-        # 1. Fondo sólido gris claro (cubre TODO, sin huecos posibles)
-        bg = ee.Image([208, 204, 196]).toUint8().rename(
+        # 1. Base: Satellite RGB para TODA el área
+        rgb_full = sentinel_unclipped.select(['B4', 'B3', 'B2']).visualize(
+            min=0, max=0.3, gamma=1.3)
+
+        # Fondo sólido donde no hay datos de satélite (nubes, bordes)
+        bg = ee.Image([180, 176, 168]).toUint8().rename(
             ['vis-red', 'vis-green', 'vis-blue'])
+        rgb_full = rgb_full.unmask(bg)
 
-        # 2. Índice coloreado en toda el área + rellenar huecos de nubes
-        index_full = index_image_unclipped.visualize(**viz_kw).unmask(bg)
-
-        # 3. Atenuar: 50% índice + 50% blanco → entorno apagado
-        white = ee.Image([255, 255, 255]).toUint8().rename(
+        # 2. Exterior: satellite atenuado (mezcla con gris)
+        grey_overlay = ee.Image([220, 218, 212]).toUint8().rename(
             ['vis-red', 'vis-green', 'vis-blue'])
-        index_dimmed = index_full.multiply(0.5).add(white.multiply(0.5)).toUint8()
+        exterior = (rgb_full.multiply(dim_factor)
+                    .add(grey_overlay.multiply(1 - dim_factor))
+                    .toUint8())
 
-        # 4. Parcela con colores vivos (100% saturación)
-        index_bright = index_image_unclipped.clip(roi).visualize(**viz_kw)
+        # 3. Interior parcela: índice + satellite blended
+        index_colored = index_image_unclipped.clip(roi).visualize(**viz_kw)
+        rgb_parcel = sentinel_unclipped.select(['B4', 'B3', 'B2']).clip(roi).visualize(
+            min=0, max=0.3, gamma=1.3)
 
-        # 5. Componer: dimmed base + bright parcela encima
-        #    .blend() solo sobreescribe donde index_bright tiene datos (= dentro de parcela)
-        composed = index_dimmed.blend(index_bright)
+        parcel_composite = (index_colored.multiply(index_opacity)
+                           .add(rgb_parcel.multiply(1 - index_opacity))
+                           .toUint8())
 
-        # 6. Contorno negro grueso
+        # 4. Componer exterior + parcela
+        composed = exterior.blend(parcel_composite)
+
+        # 5. Contorno con sombra
         roi_fc = ee.FeatureCollection([ee.Feature(roi)])
+        if boundary_color == 'FFFFFF':
+            shadow = ee.Image().byte().paint(roi_fc, 1, boundary_width + 2)
+            shadow_vis = shadow.visualize(palette=['000000'], min=0, max=1)
+            composed = composed.blend(shadow_vis)
+
         outline = ee.Image().byte().paint(roi_fc, 1, boundary_width)
         outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
         final = composed.blend(outline_vis)
 
-        # 7. Región con padding
+        # 6. Región con padding
         region_coords = roi.buffer(padding_meters).bounds().getInfo()['coordinates']
 
-        # 8. Descargar thumbnail
+        # 7. Descargar thumbnail
         url = final.getThumbURL({
             'region': region_coords, 'dimensions': dimensions, 'format': 'png'
         })
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.4.2')
+        req.add_header('User-Agent', 'MuOrbita/5.5')
         png_bytes = urllib.request.urlopen(req, timeout=60).read()
-        print(f"  [v5.4.2] PNG size: {len(png_bytes)} bytes")
+        print(f"  [v5.5] PNG size: {len(png_bytes)} bytes")
 
         if len(png_bytes) < 100:
             return None
         return base64.b64encode(png_bytes).decode('utf-8')
 
     except Exception as e:
-        print(f"Warning: [v5.4.2] get_map_style_png failed: {e}")
+        print(f"Warning: [v5.5] get_map_style_png failed: {e}")
         return None
 
 
 def get_map_style_rgb(sentinel_unclipped, roi, dimensions=768,
-                      boundary_color='FFFFFF', boundary_width=4,
-                      padding_meters=100):
-    """PNG RGB satelital — parcela destacada, entorno atenuado, cero huecos."""
+                      boundary_color='FFFFFF', boundary_width=3,
+                      padding_meters=150, dim_factor=0.45):
+    """v5.5: PNG satellite RGB — parcela a brillo completo, exterior atenuado."""
     try:
-        print(f"  [v5.4.2] Generating map-style RGB...")
-        bg = ee.Image([208, 204, 196]).toUint8().rename(
+        print(f"  [v5.5] Generating satellite RGB PNG...")
+        bg = ee.Image([180, 176, 168]).toUint8().rename(
             ['vis-red', 'vis-green', 'vis-blue'])
-        white = ee.Image([255, 255, 255]).toUint8().rename(
+        grey_overlay = ee.Image([220, 218, 212]).toUint8().rename(
             ['vis-red', 'vis-green', 'vis-blue'])
 
         rgb_full = sentinel_unclipped.select(['B4', 'B3', 'B2']).visualize(
             min=0, max=0.3, gamma=1.3).unmask(bg)
-        rgb_dimmed = rgb_full.multiply(0.5).add(white.multiply(0.5)).toUint8()
+
+        exterior = (rgb_full.multiply(dim_factor)
+                    .add(grey_overlay.multiply(1 - dim_factor))
+                    .toUint8())
+
         rgb_bright = sentinel_unclipped.select(['B4', 'B3', 'B2']).clip(roi).visualize(
             min=0, max=0.3, gamma=1.3)
-        composed = rgb_dimmed.blend(rgb_bright)
+        composed = exterior.blend(rgb_bright)
+
+        roi_fc = ee.FeatureCollection([ee.Feature(roi)])
+        if boundary_color == 'FFFFFF':
+            shadow = ee.Image().byte().paint(roi_fc, 1, boundary_width + 2)
+            shadow_vis = shadow.visualize(palette=['000000'], min=0, max=1)
+            composed = composed.blend(shadow_vis)
+
+        outline = ee.Image().byte().paint(roi_fc, 1, boundary_width)
+        outline_vis = outline.visualize(palette=[boundary_color], min=0, max=1)
+        final = composed.blend(outline_vis)
+
+        region_coords = roi.buffer(padding_meters).bounds().getInfo()['coordinates']
+        url = final.getThumbURL({
+            'region': region_coords, 'dimensions': dimensions, 'format': 'png'})
+        req = urllib.request.Request(url)
+        req.add_header('User-Agent', 'MuOrbita/5.5')
+        png_bytes = urllib.request.urlopen(req, timeout=60).read()
+        print(f"  [v5.5] RGB PNG size: {len(png_bytes)} bytes")
+        if len(png_bytes) < 100:
+            return None
+        return base64.b64encode(png_bytes).decode('utf-8')
+    except Exception as e:
+        print(f"Warning: [v5.5] get_map_style_rgb failed: {e}")
+        return None
+
+
+def get_map_style_lst(lst_unclipped, sentinel_unclipped, roi, viz_params,
+                      dimensions=512, index_opacity=0.60,
+                      boundary_color='FFFFFF', boundary_width=3,
+                      padding_meters=200):
+    """v5.5: LST sobre satellite — más padding por resolución MODIS 1km."""
+    try:
+        print(f"  [v5.5] Generating LST cartographic PNG...")
+        viz_kw = {k: v for k, v in viz_params.items() if k in ('min', 'max', 'palette')}
+
+        rgb_full = sentinel_unclipped.select(['B4', 'B3', 'B2']).visualize(
+            min=0, max=0.3, gamma=1.3)
+        bg = ee.Image([180, 176, 168]).toUint8().rename(
+            ['vis-red', 'vis-green', 'vis-blue'])
+        rgb_full = rgb_full.unmask(bg)
+
+        grey_overlay = ee.Image([220, 218, 212]).toUint8().rename(
+            ['vis-red', 'vis-green', 'vis-blue'])
+        exterior = (rgb_full.multiply(0.45)
+                    .add(grey_overlay.multiply(0.55)).toUint8())
+
+        lst_colored = lst_unclipped.clip(roi).visualize(**viz_kw)
+        rgb_parcel = sentinel_unclipped.select(['B4', 'B3', 'B2']).clip(roi).visualize(
+            min=0, max=0.3, gamma=1.3)
+        parcel_composite = (lst_colored.multiply(index_opacity)
+                           .add(rgb_parcel.multiply(1 - index_opacity))
+                           .toUint8())
+
+        composed = exterior.blend(parcel_composite)
 
         roi_fc = ee.FeatureCollection([ee.Feature(roi)])
         outline = ee.Image().byte().paint(roi_fc, 1, boundary_width)
@@ -247,19 +329,100 @@ def get_map_style_rgb(sentinel_unclipped, roi, dimensions=768,
         url = final.getThumbURL({
             'region': region_coords, 'dimensions': dimensions, 'format': 'png'})
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.4.2')
+        req.add_header('User-Agent', 'MuOrbita/5.5')
         png_bytes = urllib.request.urlopen(req, timeout=60).read()
-        print(f"  [v5.4.2] RGB PNG size: {len(png_bytes)} bytes")
         if len(png_bytes) < 100:
             return None
         return base64.b64encode(png_bytes).decode('utf-8')
     except Exception as e:
-        print(f"Warning: [v5.4.2] get_map_style_rgb failed: {e}")
+        print(f"Warning: [v5.5] LST PNG failed: {e}")
         return None
 
 
 # ============================================================================
-# LEYENDA PROFESIONAL
+# LEAFLET OVERLAY PNGs — PARA DASHBOARD WEB (v5.5)
+# ============================================================================
+
+def get_leaflet_overlay_png(index_image_unclipped, roi, viz_params, dimensions=512):
+    """
+    Genera PNG limpio para Leaflet imageOverlay:
+    - Solo colores del índice DENTRO de la parcela
+    - Sin satellite background (Leaflet ya tiene basemap)
+    - Sin contorno (Leaflet puede dibujar el polígono por separado)
+    - Sin padding (bounds = exactos de la parcela → alineación perfecta)
+    - Sin leyenda (la leyenda se muestra en el UI del dashboard)
+
+    Returns:
+        str: PNG base64, o None si falla
+    """
+    try:
+        viz_kw = {k: v for k, v in viz_params.items() if k in ('min', 'max', 'palette')}
+
+        # Índice coloreado, clipado a la parcela
+        index_clipped = index_image_unclipped.clip(roi).visualize(**viz_kw)
+
+        # Región = bounds exactos de la parcela (SIN padding)
+        region_coords = roi.bounds().getInfo()['coordinates']
+
+        url = index_clipped.getThumbURL({
+            'region': region_coords,
+            'dimensions': dimensions,
+            'format': 'png'
+        })
+        req = urllib.request.Request(url)
+        req.add_header('User-Agent', 'MuOrbita/5.5-web')
+        png_bytes = urllib.request.urlopen(req, timeout=60).read()
+
+        if len(png_bytes) < 100:
+            return None
+        return base64.b64encode(png_bytes).decode('utf-8')
+
+    except Exception as e:
+        print(f"Warning: [v5.5] Leaflet overlay failed: {e}")
+        return None
+
+
+def generate_leaflet_overlays(composite_unclipped, roi, index_list,
+                              vra_image=None, lst_unclipped=None):
+    """
+    Genera PNGs limpios para el dashboard Leaflet.
+    Se almacenan con sufijo _WEB (e.g. NDVI_WEB) para diferenciarlos
+    de los cartográficos usados en el PDF.
+    """
+    overlays = {}
+
+    for idx in index_list:
+        viz = VIZ_PALETTES.get(idx)
+        if not viz:
+            continue
+        print(f"  Generating Leaflet overlay {idx}_WEB...")
+        b64 = get_leaflet_overlay_png(composite_unclipped.select(idx), roi, viz)
+        if b64:
+            overlays[f'{idx}_WEB'] = b64
+            print(f"  ✓ {idx}_WEB: OK")
+        else:
+            print(f"  ✗ {idx}_WEB: failed")
+
+    if vra_image is not None:
+        print("  Generating Leaflet overlay VRA_WEB...")
+        b64 = get_leaflet_overlay_png(vra_image, roi, VIZ_PALETTES['VRA'])
+        if b64:
+            overlays['VRA_WEB'] = b64
+            print("  ✓ VRA_WEB: OK")
+
+    if lst_unclipped is not None:
+        print("  Generating Leaflet overlay LST_WEB...")
+        b64 = get_leaflet_overlay_png(lst_unclipped, roi, VIZ_PALETTES['LST'])
+        if b64:
+            overlays['LST_WEB'] = b64
+            print("  ✓ LST_WEB: OK")
+
+    print(f"  📊 Leaflet overlays: {len(overlays)}")
+    return overlays
+
+
+# ============================================================================
+# LEYENDA PROFESIONAL (sin cambios vs v5.4.2)
 # ============================================================================
 
 def add_legend(png_base64, index_name, mean_value=None):
@@ -338,7 +501,7 @@ def add_legend(png_base64, index_name, mean_value=None):
 
 
 # ============================================================================
-# COLECCIONES DE DATOS
+# COLECCIONES DE DATOS (sin cambios)
 # ============================================================================
 
 def get_sentinel2_collection(roi, start_date, end_date):
@@ -375,11 +538,11 @@ def get_modis_lst(roi, start_date, end_date):
         .select('LST_Day_1km')
         .map(lambda img: img.multiply(0.02).subtract(273.15).rename('LST_C')
              .copyProperties(img, ['system:time_start']))
-    ).median()  # NOTE: NO .clip(roi) aquí — se clipará para stats pero no para PNG
+    ).median()
 
 
 # ============================================================================
-# VRA ZONIFICACIÓN
+# VRA ZONIFICACIÓN (sin cambios)
 # ============================================================================
 
 def calculate_vra_zones(composite_clipped, roi):
@@ -415,7 +578,7 @@ def calculate_vra_zones(composite_clipped, roi):
 
 
 # ============================================================================
-# ERA5 WEATHER — OPTIMIZADO (v5.3)
+# ERA5 WEATHER — OPTIMIZADO (sin cambios vs v5.3+)
 # ============================================================================
 
 def get_era5_weather(roi, start_date, end_date):
@@ -425,7 +588,6 @@ def get_era5_weather(roi, start_date, end_date):
         era5 = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
             .filterDate(start_date, end_date).filterBounds(roi))
 
-        # Temperatura
         temp = era5.select(['temperature_2m_max', 'temperature_2m_min']).map(
             lambda img: img.subtract(273.15).copyProperties(img, ['system:time_start']))
         temp_feat = temp.map(lambda img: ee.Feature(None, {
@@ -436,7 +598,6 @@ def get_era5_weather(roi, start_date, end_date):
                 ee.Reducer.mean(), roi, 11132, maxPixels=1e9).get('temperature_2m_min'),
         }))
 
-        # Precipitación + ET
         water = era5.select(['total_precipitation_sum', 'total_evaporation_sum']).map(
             lambda img: ee.Image([
                 img.select('total_precipitation_sum').multiply(1000).rename('precip_mm'),
@@ -498,7 +659,6 @@ def get_era5_weather(roi, start_date, end_date):
         weather_kpis['weather_et_total_mm'] = round(ett, 1) if et_vals else None
         weather_kpis['weather_water_balance_mm'] = round(pt - ett, 1)
 
-        # Viento + Suelo (1 getInfo)
         print("  Fetching ERA5 wind + soil...")
         try:
             wu = era5.select('u_component_of_wind_10m').mean()
@@ -536,7 +696,7 @@ def get_era5_weather(roi, start_date, end_date):
 
 
 # ============================================================================
-# PERSISTIR IMÁGENES
+# PERSISTIR IMÁGENES (sin cambios)
 # ============================================================================
 
 def persist_images_to_db(job_id, images_base64, bounds=None):
@@ -558,55 +718,79 @@ def persist_images_to_db(job_id, images_base64, bounds=None):
 
 
 # ============================================================================
-# GENERADOR DE PNGs — ORQUESTADOR
+# GENERADOR DE PNGs — ORQUESTADOR (v5.5)
 # ============================================================================
 
 def generate_map_pngs(composite_unclipped, latest_sentinel_unclipped, roi, kpis,
                       index_list, vra_image=None, lst_unclipped=None):
     """
-    Genera PNGs estilo GEE Code Editor:
-    - Índice coloreado en TODA el área
-    - Contorno negro de la parcela superpuesto
+    v5.5: Genera PNGs cartográficos: satellite RGB basemap + índice overlay.
+
+    CAMBIO CLAVE vs v5.4.2:
+    - get_map_style_png ahora recibe sentinel_unclipped como 2º argumento
+    - El satellite RGB se usa como fondo en vez de gris sólido
+    - Opacidades configuradas por índice
     """
     images = {}
+
+    OPACITY_MAP = {
+        'NDVI': 0.65,
+        'NDWI': 0.70,
+        'EVI':  0.65,
+        'NDCI': 0.65,
+        'SAVI': 0.65,
+        'VRA':  0.75,
+    }
 
     for idx in index_list:
         viz = VIZ_PALETTES.get(idx)
         if not viz:
             continue
-        print(f"  Generating map-style {idx}...")
+        print(f"  Generating cartographic {idx}...")
+        opacity = OPACITY_MAP.get(idx, 0.65)
         b64 = get_map_style_png(
-            composite_unclipped.select(idx), roi, viz, dimensions=768
+            composite_unclipped.select(idx),
+            latest_sentinel_unclipped,
+            roi, viz,
+            dimensions=768,
+            index_opacity=opacity
         )
         if b64:
             mean_key = f'{idx.lower()}_mean'
             b64 = add_legend(b64, idx, kpis.get(mean_key))
             images[idx] = b64
-            print(f"  ✓ {idx}: OK")
+            print(f"  ✓ {idx}: OK (opacity={opacity})")
         else:
             print(f"  ✗ {idx}: failed")
 
     if vra_image is not None:
-        print("  Generating map-style VRA...")
-        b64 = get_map_style_png(vra_image, roi, VIZ_PALETTES['VRA'], dimensions=768)
+        print("  Generating cartographic VRA...")
+        b64 = get_map_style_png(
+            vra_image, latest_sentinel_unclipped, roi,
+            VIZ_PALETTES['VRA'], dimensions=768,
+            index_opacity=OPACITY_MAP.get('VRA', 0.75)
+        )
         if b64:
             images['VRA'] = add_legend(b64, 'VRA')
             print("  ✓ VRA: OK")
 
     if lst_unclipped is not None:
-        print("  Generating map-style LST...")
-        b64 = get_map_style_png(lst_unclipped, roi, VIZ_PALETTES['LST'], dimensions=512)
+        print("  Generating cartographic LST...")
+        b64 = get_map_style_lst(
+            lst_unclipped, latest_sentinel_unclipped, roi,
+            VIZ_PALETTES['LST'], dimensions=512
+        )
         if b64:
             images['LST'] = add_legend(b64, 'LST', kpis.get('lst_mean_c'))
             print("  ✓ LST: OK")
 
-    print("  Generating map-style RGB...")
+    print("  Generating satellite RGB...")
     rgb = get_map_style_rgb(latest_sentinel_unclipped, roi, dimensions=768)
     if rgb:
         images['RGB'] = rgb
         print("  ✓ RGB: OK")
 
-    print(f"\n  📊 Total: {len(images)} map-style PNGs")
+    print(f"\n  📊 Total: {len(images)} cartographic PNGs")
     return images
 
 
@@ -616,8 +800,8 @@ def generate_map_pngs(composite_unclipped, latest_sentinel_unclipped, roi, kpis,
 
 def execute_biweekly_analysis(args):
     print("=" * 60)
-    print("  Mu.Orbita GEE v5.4.2 — BIWEEKLY ANALYSIS")
-    print("  Map style: dimmed exterior + bright parcel + black border")
+    print("  Mu.Orbita GEE v5.5 — BIWEEKLY ANALYSIS")
+    print("  Cartographic style: satellite basemap + index overlay")
     print("=" * 60)
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
@@ -631,12 +815,10 @@ def execute_biweekly_analysis(args):
 
     indexed = collection.map(calculate_indices)
 
-    # ── CLAVE v5.4: Dos composites ──────────────────────────────
-    # composite_clipped  → para ESTADÍSTICAS (precisas dentro de la parcela)
-    # composite_viz      → para PNGs (sin clip, llena toda el área)
-    composite_clipped = indexed.median().clip(roi)
-    composite_viz = indexed.median()  # SIN CLIP
-    latest_sentinel_viz = indexed.sort('system:time_start', False).first()  # SIN CLIP
+    # ── v5.5: Dos composites + sentinel sin clip ─────────────────
+    composite_clipped = indexed.median().clip(roi)          # → estadísticas
+    composite_viz = indexed.median()                         # → PNGs (sin clip)
+    latest_sentinel_viz = indexed.sort('system:time_start', False).first()  # → basemap RGB
 
     try:
         latest_date = ee.Date(collection.sort('system:time_start', False).first()
@@ -723,20 +905,28 @@ def execute_biweekly_analysis(args):
     }
     kpis.update(weather_kpis)
 
-    # PNGs tipo mapa (SIN CLIP)
-    print("Generating map-style PNGs...")
+    # PNGs cartográficos (satellite basemap) — para PDF
+    print("Generating cartographic PNGs (PDF)...")
     images_base64 = generate_map_pngs(composite_viz, latest_sentinel_viz, roi, kpis,
                                        index_list=['NDVI', 'NDWI'])
-    stored = persist_images_to_db(job_id, images_base64, bounds)
+
+    # PNGs overlay limpios — para Leaflet dashboard
+    print("Generating Leaflet overlays (dashboard)...")
+    leaflet_overlays = generate_leaflet_overlays(composite_viz, roi,
+                                                  index_list=['NDVI', 'NDWI'])
+
+    # Unificar y persistir todo (carto + web)
+    all_images = {**images_base64, **leaflet_overlays}
+    stored = persist_images_to_db(job_id, all_images, bounds)
 
     return {
         'success': True, 'job_id': job_id, 'analysis_type': 'biweekly',
         'kpis': kpis, 'weather': weather_kpis, 'weather_daily': weather_daily,
         'bounds': bounds, 'time_series': time_series,
-        'images_stored': stored, 'images_available': list(images_base64.keys()),
-        'images_base64': {} if stored else images_base64,
+        'images_stored': stored, 'images_available': list(all_images.keys()),
+        'images_base64': {} if stored else all_images,
         'tasks': [], 'task_count': 0,
-        'message': f'Biweekly v5.4 complete. {len(stored)} map-style images in DB.'
+        'message': f'Biweekly v5.5 complete. {len(stored)} images in DB (carto + web).'
     }
 
 
@@ -746,8 +936,8 @@ def execute_biweekly_analysis(args):
 
 def execute_analysis(args):
     print("=" * 60)
-    print("  Mu.Orbita GEE v5.4.2 — BASELINE ANALYSIS")
-    print("  Map style: dimmed exterior + bright parcel + black border")
+    print("  Mu.Orbita GEE v5.5 — BASELINE ANALYSIS")
+    print("  Cartographic style: satellite basemap + index overlay")
     print("=" * 60)
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
@@ -761,12 +951,10 @@ def execute_analysis(args):
 
     indexed = collection.map(calculate_indices)
 
-    # ── v5.4.2: Dos composites ──────────────────────────────────
-    # composite_clipped → ESTADÍSTICAS (valores precisos dentro de la parcela)
-    # composite_viz     → PNGs (sin clip → colores en toda el área)
+    # ── v5.5: Dos composites + sentinel sin clip ─────────────────
     composite_clipped = indexed.median().clip(roi)
-    composite_viz = indexed.median()  # SIN CLIP → para PNGs
-    latest_sentinel_viz = indexed.sort('system:time_start', False).first()  # SIN CLIP
+    composite_viz = indexed.median()
+    latest_sentinel_viz = indexed.sort('system:time_start', False).first()
 
     try:
         latest_date = ee.Date(collection.sort('system:time_start', False).first()
@@ -847,13 +1035,24 @@ def execute_analysis(args):
         'valid_pixels': stats.get('NDVI_count', 0)
     }
 
-    # PNGs tipo mapa (SIN CLIP)
-    print("Generating map-style PNGs...")
+    # PNGs cartográficos (satellite basemap) — para PDF
+    print("Generating cartographic PNGs (PDF)...")
     images_base64 = generate_map_pngs(
         composite_viz, latest_sentinel_viz, roi, kpis,
         index_list=['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI'],
         vra_image=vra_image, lst_unclipped=lst_unclipped
     )
+
+    # PNGs overlay limpios — para Leaflet dashboard
+    print("Generating Leaflet overlays (dashboard)...")
+    leaflet_overlays = generate_leaflet_overlays(
+        composite_viz, roi,
+        index_list=['NDVI', 'NDWI', 'EVI', 'NDCI', 'SAVI'],
+        vra_image=vra_image, lst_unclipped=lst_unclipped
+    )
+
+    # Unificar y persistir todo (carto + web)
+    all_images = {**images_base64, **leaflet_overlays}
 
     # Serie temporal
     print("Computing time series...")
@@ -875,16 +1074,16 @@ def execute_analysis(args):
     except Exception as e:
         print(f"Warning: time series: {e}")
 
-    stored = persist_images_to_db(job_id, images_base64, bounds)
+    stored = persist_images_to_db(job_id, all_images, bounds)
 
     return {
         'success': True, 'job_id': job_id, 'analysis_type': 'baseline',
         'kpis': kpis, 'vra_stats': vra_stats, 'bounds': bounds,
         'time_series': time_series,
-        'images_stored': stored, 'images_available': list(images_base64.keys()),
-        'images_base64': {} if stored else images_base64,
+        'images_stored': stored, 'images_available': list(all_images.keys()),
+        'images_base64': {} if stored else all_images,
         'tasks': [], 'task_count': 0,
-        'message': f'Baseline v5.4 complete. {len(stored)} map-style images in DB.'
+        'message': f'Baseline v5.5 complete. {len(stored)} images in DB (carto + web).'
     }
 
 
@@ -893,11 +1092,11 @@ def execute_analysis(args):
 # ============================================================================
 
 def check_status(args):
-    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100, 'message': 'v5.4: Sync.'}
+    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100, 'message': 'v5.5: Sync.'}
 def download_results(args):
-    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True, 'message': 'v5.4: In response.'}
+    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True, 'message': 'v5.5: In response.'}
 def start_tasks(args):
-    return {'job_id': args.job_id, 'started': 0, 'message': 'v5.4: No tasks.'}
+    return {'job_id': args.job_id, 'started': 0, 'message': 'v5.5: No tasks.'}
 
 
 # ============================================================================
