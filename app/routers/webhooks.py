@@ -1,15 +1,16 @@
 """
 Mu.Orbita API - Webhooks Router
 Endpoints para recibir datos de n8n
-VERSIÓN 4.0 - Auto-creación de Report + Kpi en job-completed
+VERSIÓN 4.1 - Auto-creación de Report + Kpi en job-completed
+             - Resolución automática de client_id/parcel_id por email
              - Poblado automático de tablas para dashboard
 
-CAMBIOS vs v3.2:
-  1. job-completed ahora crea automáticamente un registro Report en la BD
-  2. job-completed ahora crea/actualiza un registro Kpi (última observación)
-  3. Esto garantiza que /dashboard/summary, /dashboard/reports y /dashboard/alerts
-     tengan datos incluso si n8n no llama a /webhooks/kpis por separado
-  4. El endpoint /webhooks/kpis sigue existiendo para la time_series completa (gráfico)
+CAMBIOS vs v4.0:
+  1. WebhookJobCompletedV2 ahora acepta client_email y client_name
+  2. Si el job no tiene client_id, lo resuelve automáticamente por client_email
+  3. Si el job no tiene parcel_id, busca la primera parcela activa del cliente
+  4. ndvi_current se guarda como número (no string) — compatible con columna numeric
+  5. Esto garantiza que jobs creados sin job-started tengan datos completos
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, Header
@@ -65,6 +66,26 @@ def parse_roi_geojson(roi_data):
         except:
             return None
     return None
+
+
+def resolve_client_and_parcel(db: Session, email: str):
+    """
+    Dado un email, resuelve client_id y parcel_id.
+    Retorna (client_id, parcel_id) o (None, None).
+    """
+    if not email:
+        return None, None
+    
+    client = db.query(Client).filter(Client.email == email).first()
+    if not client:
+        return None, None
+    
+    parcel = db.query(Parcel).filter(
+        Parcel.client_id == client.id,
+        Parcel.is_active == True
+    ).first()
+    
+    return client.id, (parcel.id if parcel else None)
 
 
 # ============================================================
@@ -138,20 +159,25 @@ async def webhook_job_started(
 
 
 # ============================================================
-# JOB-COMPLETED v4.0
-# Con auto-creación de Report + Kpi
+# JOB-COMPLETED v4.1
+# Con auto-creación de Report + Kpi + resolución por email
 # ============================================================
 
 class WebhookJobCompletedV2(BaseModel):
     """
-    Payload para webhook job-completed v4.0.
-    Incluye campos fenológicos + datos para auto-crear Report y Kpi.
+    Payload para webhook job-completed v4.1.
+    Incluye client_email para resolución automática de client_id/parcel_id,
+    campos fenológicos, y datos para auto-crear Report y Kpi.
     """
     job_id: str
     status: str
     pdf_url: Optional[str] = None
     google_drive_folder_id: Optional[str] = None
     error_message: Optional[str] = None
+    
+    # Identificación del cliente (v4.1 — para resolver client_id/parcel_id)
+    client_email: Optional[str] = None
+    client_name: Optional[str] = None
     
     # KPIs básicos
     ndvi_mean: Optional[float] = None
@@ -184,24 +210,52 @@ async def webhook_job_completed(
     """
     n8n notifica que un job ha terminado.
     
-    VERSIÓN 4.0 - Además de actualizar el job, ahora:
-    1. Crea automáticamente un registro Report (para /dashboard/reports)
-    2. Crea/actualiza un registro Kpi (para /dashboard/summary y /dashboard/alerts)
+    VERSIÓN 4.1 — Además de actualizar el job, ahora:
+    1. Resuelve client_id y parcel_id desde client_email si faltan
+    2. Crea automáticamente un registro Report (para /dashboard/reports)
+    3. Crea/actualiza un registro Kpi (para /dashboard/summary y /dashboard/alerts)
     
-    Esto garantiza que el dashboard SIEMPRE tenga datos tras un análisis exitoso.
+    Esto garantiza que el dashboard SIEMPRE tenga datos tras un análisis exitoso,
+    incluso si el job no pasó por /webhooks/job-started.
     """
     job = db.query(Job).filter(Job.job_id == payload.job_id).first()
     
-    # Si no existe el job, crearlo con datos mínimos
+    # ── 0. Si no existe el job, crearlo resolviendo client/parcel por email ──
     if not job:
+        resolved_client_id, resolved_parcel_id = resolve_client_and_parcel(
+            db, payload.client_email
+        )
+        
         job = Job(
             job_id=payload.job_id,
+            client_id=resolved_client_id,
+            parcel_id=resolved_parcel_id,
+            client_email=payload.client_email,
+            client_name=payload.client_name,
             status=payload.status,
             completed_at=datetime.utcnow() if payload.status == "completed" else None
         )
         db.add(job)
         db.commit()
         db.refresh(job)
+        
+        if resolved_client_id:
+            print(f"✅ Job {payload.job_id} creado con client={resolved_client_id}, parcel={resolved_parcel_id}")
+        else:
+            print(f"⚠️ Job {payload.job_id} creado sin client_id (email: {payload.client_email})")
+    
+    # ── 0b. Si el job existe pero no tiene client_id, resolverlo ahora ──
+    if not job.client_id and payload.client_email:
+        resolved_client_id, resolved_parcel_id = resolve_client_and_parcel(
+            db, payload.client_email
+        )
+        if resolved_client_id:
+            job.client_id = resolved_client_id
+            if not job.parcel_id and resolved_parcel_id:
+                job.parcel_id = resolved_parcel_id
+            db.commit()
+            db.refresh(job)
+            print(f"🔗 Job {payload.job_id} vinculado a client={resolved_client_id}, parcel={resolved_parcel_id}")
     
     # ── 1. Actualizar campos del Job ──────────────────────────
     job.status = payload.status
@@ -213,6 +267,10 @@ async def webhook_job_completed(
         job.google_drive_folder_id = payload.google_drive_folder_id
     if payload.error_message:
         job.error_message = payload.error_message
+    if payload.client_email and not job.client_email:
+        job.client_email = payload.client_email
+    if payload.client_name and not job.client_name:
+        job.client_name = payload.client_name
     
     # KPIs básicos en la tabla jobs
     if payload.ndvi_mean is not None:
@@ -245,11 +303,10 @@ async def webhook_job_completed(
     db.commit()
     db.refresh(job)
     
-    # ── 2. Auto-crear Report (NUEVO v4.0) ─────────────────────
+    # ── 2. Auto-crear Report (v4.0) ──────────────────────────
     report_created = False
     if payload.status == "completed" and job.client_id:
         try:
-            # Verificar si ya existe un Report para este job
             existing_report = db.query(Report).filter(
                 Report.job_id == job.id
             ).first()
@@ -263,7 +320,7 @@ async def webhook_job_completed(
                     period_start=getattr(job, 'start_date', None),
                     period_end=getattr(job, 'end_date', None),
                     generated_at=datetime.utcnow(),
-                    ndvi_current=str(round(payload.ndvi_mean, 2)) if payload.ndvi_mean is not None else None,
+                    ndvi_current=round(payload.ndvi_mean, 2) if payload.ndvi_mean is not None else None,
                     main_findings=payload.main_findings,
                     priority_actions=payload.priority_actions,
                 )
@@ -272,33 +329,30 @@ async def webhook_job_completed(
                 report_created = True
                 print(f"✅ Report auto-creado para job {payload.job_id}")
             else:
-                # Actualizar el Report existente con datos nuevos
                 if payload.pdf_url:
                     existing_report.pdf_url = payload.pdf_url
                 if payload.ndvi_mean is not None:
-                    existing_report.ndvi_current = str(round(payload.ndvi_mean, 2))
+                    existing_report.ndvi_current = round(payload.ndvi_mean, 2)
                 db.commit()
                 print(f"📝 Report existente actualizado para job {payload.job_id}")
                 
         except Exception as e:
             print(f"⚠️ Error creando Report para job {payload.job_id}: {e}")
+            print(traceback.format_exc())
             db.rollback()
     
-    # ── 3. Auto-crear/actualizar Kpi (NUEVO v4.0) ────────────
+    # ── 3. Auto-crear/actualizar Kpi (v4.0) ──────────────────
     kpi_created = False
     if payload.status == "completed" and job.parcel_id:
         try:
-            # Usar end_date del job como observation_date, o fecha actual
             obs_date = getattr(job, 'end_date', None) or date_type.today()
             
-            # Buscar KPI existente para esta parcela y fecha
             existing_kpi = db.query(Kpi).filter(
                 Kpi.parcel_id == job.parcel_id,
                 Kpi.observation_date == obs_date
             ).first()
             
             if existing_kpi:
-                # Actualizar KPI existente
                 if payload.ndvi_mean is not None:
                     existing_kpi.ndvi_mean = payload.ndvi_mean
                 if payload.ndvi_p10 is not None:
@@ -316,7 +370,6 @@ async def webhook_job_completed(
                 db.commit()
                 print(f"📝 KPI actualizado para parcela {job.parcel_id} fecha {obs_date}")
             else:
-                # Crear nuevo KPI
                 new_kpi = Kpi(
                     parcel_id=job.parcel_id,
                     job_id=job.id,
@@ -352,6 +405,10 @@ async def webhook_job_completed(
         extras.append("Report creado")
     if kpi_created:
         extras.append("KPI creado")
+    if job.client_id:
+        extras.append(f"client={str(job.client_id)[:8]}")
+    if job.parcel_id:
+        extras.append(f"parcel={str(job.parcel_id)[:8]}")
     extras_str = f" | {', '.join(extras)}" if extras else ""
     
     return MessageResponse(
@@ -530,4 +587,4 @@ async def webhook_client_created(
 
 @router.get("/health")
 async def webhooks_health():
-    return {"status": "ok", "service": "webhooks", "version": "4.0"}
+    return {"status": "ok", "service": "webhooks", "version": "4.1"}
