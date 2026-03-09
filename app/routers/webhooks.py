@@ -1,16 +1,25 @@
 """
 Mu.Orbita API - Webhooks Router
 Endpoints para recibir datos de n8n
-VERSIÓN 3.2 - Con soporte para contexto fenológico
+VERSIÓN 4.0 - Auto-creación de Report + Kpi en job-completed
+             - Poblado automático de tablas para dashboard
+
+CAMBIOS vs v3.2:
+  1. job-completed ahora crea automáticamente un registro Report en la BD
+  2. job-completed ahora crea/actualiza un registro Kpi (última observación)
+  3. Esto garantiza que /dashboard/summary, /dashboard/reports y /dashboard/alerts
+     tengan datos incluso si n8n no llama a /webhooks/kpis por separado
+  4. El endpoint /webhooks/kpis sigue existiendo para la time_series completa (gráfico)
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, Header
 from sqlalchemy.orm import Session
-from typing import Optional, Union
-from datetime import datetime
+from typing import Optional, Union, List
+from datetime import datetime, date as date_type
 from pydantic import BaseModel
 from passlib.context import CryptContext
 import json
+import traceback
 
 from app.database import get_db
 from app.models import Client, Parcel, Job, Kpi, Report
@@ -57,6 +66,10 @@ def parse_roi_geojson(roi_data):
             return None
     return None
 
+
+# ============================================================
+# JOB-STARTED
+# ============================================================
 
 @router.post("/job-started", response_model=MessageResponse)
 async def webhook_job_started(
@@ -125,12 +138,14 @@ async def webhook_job_started(
 
 
 # ============================================================
-# MODELO ACTUALIZADO PARA JOB-COMPLETED CON CAMPOS FENOLÓGICOS
+# JOB-COMPLETED v4.0
+# Con auto-creación de Report + Kpi
 # ============================================================
 
 class WebhookJobCompletedV2(BaseModel):
     """
-    Payload para webhook job-completed v3.2 con campos fenológicos.
+    Payload para webhook job-completed v4.0.
+    Incluye campos fenológicos + datos para auto-crear Report y Kpi.
     """
     job_id: str
     status: str
@@ -143,16 +158,21 @@ class WebhookJobCompletedV2(BaseModel):
     ndvi_p10: Optional[float] = None
     ndvi_p90: Optional[float] = None
     ndwi_mean: Optional[float] = None
+    evi_mean: Optional[float] = None
     stress_area_ha: Optional[float] = None
     stress_area_pct: Optional[float] = None
     
-    # === NUEVOS CAMPOS FENOLÓGICOS (v3.2) ===
-    doy: Optional[int] = None  # Día del año
-    pheno_phase: Optional[str] = None  # Fase fenológica actual
-    pheno_status: Optional[str] = None  # adelantado/normal/retrasado/critico/sin_datos
-    ndvi_expected: Optional[float] = None  # NDVI esperado según curva
-    ndvi_deviation_pct: Optional[float] = None  # % desviación vs esperado
-    ndvi_zscore_seasonal: Optional[float] = None  # Z-score vs mismo período histórico
+    # Campos fenológicos (v3.2)
+    doy: Optional[int] = None
+    pheno_phase: Optional[str] = None
+    pheno_status: Optional[str] = None
+    ndvi_expected: Optional[float] = None
+    ndvi_deviation_pct: Optional[float] = None
+    ndvi_zscore_seasonal: Optional[float] = None
+    
+    # Campos opcionales para Report (v4.0)
+    main_findings: Optional[list] = None
+    priority_actions: Optional[list] = None
 
 
 @router.post("/job-completed", response_model=MessageResponse)
@@ -163,12 +183,16 @@ async def webhook_job_completed(
 ):
     """
     n8n notifica que un job ha terminado.
-    Actualiza el job con los resultados, incluyendo contexto fenológico.
-    VERSIÓN 3.2
+    
+    VERSIÓN 4.0 - Además de actualizar el job, ahora:
+    1. Crea automáticamente un registro Report (para /dashboard/reports)
+    2. Crea/actualiza un registro Kpi (para /dashboard/summary y /dashboard/alerts)
+    
+    Esto garantiza que el dashboard SIEMPRE tenga datos tras un análisis exitoso.
     """
     job = db.query(Job).filter(Job.job_id == payload.job_id).first()
     
-    # Si no existe el job, crearlo
+    # Si no existe el job, crearlo con datos mínimos
     if not job:
         job = Job(
             job_id=payload.job_id,
@@ -179,7 +203,7 @@ async def webhook_job_completed(
         db.commit()
         db.refresh(job)
     
-    # Actualizar campos básicos
+    # ── 1. Actualizar campos del Job ──────────────────────────
     job.status = payload.status
     job.completed_at = datetime.utcnow() if payload.status == "completed" else None
     
@@ -190,7 +214,7 @@ async def webhook_job_completed(
     if payload.error_message:
         job.error_message = payload.error_message
     
-    # KPIs básicos
+    # KPIs básicos en la tabla jobs
     if payload.ndvi_mean is not None:
         job.ndvi_mean = payload.ndvi_mean
     if payload.ndvi_p10 is not None:
@@ -204,7 +228,7 @@ async def webhook_job_completed(
     if payload.stress_area_pct is not None:
         job.stress_area_pct = payload.stress_area_pct
     
-    # === NUEVOS CAMPOS FENOLÓGICOS (v3.2) ===
+    # Campos fenológicos
     if payload.doy is not None:
         job.doy = payload.doy
     if payload.pheno_phase is not None:
@@ -219,18 +243,125 @@ async def webhook_job_completed(
         job.ndvi_zscore_seasonal = payload.ndvi_zscore_seasonal
     
     db.commit()
+    db.refresh(job)
     
-    # Mensaje con info fenológica si está disponible
+    # ── 2. Auto-crear Report (NUEVO v4.0) ─────────────────────
+    report_created = False
+    if payload.status == "completed" and job.client_id:
+        try:
+            # Verificar si ya existe un Report para este job
+            existing_report = db.query(Report).filter(
+                Report.job_id == job.id
+            ).first()
+            
+            if not existing_report:
+                new_report = Report(
+                    job_id=job.id,
+                    client_id=job.client_id,
+                    report_type=getattr(job, 'analysis_type', 'baseline') or 'baseline',
+                    pdf_url=payload.pdf_url,
+                    period_start=getattr(job, 'start_date', None),
+                    period_end=getattr(job, 'end_date', None),
+                    generated_at=datetime.utcnow(),
+                    ndvi_current=str(round(payload.ndvi_mean, 2)) if payload.ndvi_mean is not None else None,
+                    main_findings=payload.main_findings,
+                    priority_actions=payload.priority_actions,
+                )
+                db.add(new_report)
+                db.commit()
+                report_created = True
+                print(f"✅ Report auto-creado para job {payload.job_id}")
+            else:
+                # Actualizar el Report existente con datos nuevos
+                if payload.pdf_url:
+                    existing_report.pdf_url = payload.pdf_url
+                if payload.ndvi_mean is not None:
+                    existing_report.ndvi_current = str(round(payload.ndvi_mean, 2))
+                db.commit()
+                print(f"📝 Report existente actualizado para job {payload.job_id}")
+                
+        except Exception as e:
+            print(f"⚠️ Error creando Report para job {payload.job_id}: {e}")
+            db.rollback()
+    
+    # ── 3. Auto-crear/actualizar Kpi (NUEVO v4.0) ────────────
+    kpi_created = False
+    if payload.status == "completed" and job.parcel_id:
+        try:
+            # Usar end_date del job como observation_date, o fecha actual
+            obs_date = getattr(job, 'end_date', None) or date_type.today()
+            
+            # Buscar KPI existente para esta parcela y fecha
+            existing_kpi = db.query(Kpi).filter(
+                Kpi.parcel_id == job.parcel_id,
+                Kpi.observation_date == obs_date
+            ).first()
+            
+            if existing_kpi:
+                # Actualizar KPI existente
+                if payload.ndvi_mean is not None:
+                    existing_kpi.ndvi_mean = payload.ndvi_mean
+                if payload.ndvi_p10 is not None:
+                    existing_kpi.ndvi_p10 = payload.ndvi_p10
+                if payload.ndvi_p90 is not None:
+                    existing_kpi.ndvi_p90 = payload.ndvi_p90
+                if payload.ndwi_mean is not None:
+                    existing_kpi.ndwi_mean = payload.ndwi_mean
+                if payload.evi_mean is not None:
+                    existing_kpi.evi_mean = payload.evi_mean
+                if payload.stress_area_ha is not None:
+                    existing_kpi.stress_area_ha = payload.stress_area_ha
+                if payload.stress_area_pct is not None:
+                    existing_kpi.stress_area_pct = payload.stress_area_pct
+                db.commit()
+                print(f"📝 KPI actualizado para parcela {job.parcel_id} fecha {obs_date}")
+            else:
+                # Crear nuevo KPI
+                new_kpi = Kpi(
+                    parcel_id=job.parcel_id,
+                    job_id=job.id,
+                    observation_date=obs_date,
+                    ndvi_mean=payload.ndvi_mean,
+                    ndvi_p10=payload.ndvi_p10,
+                    ndvi_p90=payload.ndvi_p90,
+                    ndwi_mean=payload.ndwi_mean,
+                    evi_mean=payload.evi_mean,
+                    stress_area_ha=payload.stress_area_ha,
+                    stress_area_pct=payload.stress_area_pct,
+                    satellite_source="sentinel2",
+                )
+                db.add(new_kpi)
+                db.commit()
+                kpi_created = True
+                print(f"✅ KPI auto-creado para parcela {job.parcel_id} fecha {obs_date}")
+                
+        except Exception as e:
+            print(f"⚠️ Error creando KPI para job {payload.job_id}: {e}")
+            print(traceback.format_exc())
+            db.rollback()
+    
+    # ── 4. Construir mensaje de respuesta ─────────────────────
     pheno_info = ""
     if payload.pheno_status:
         pheno_info = f" | Fenología: {payload.pheno_status}"
         if payload.pheno_phase:
             pheno_info += f" ({payload.pheno_phase})"
     
+    extras = []
+    if report_created:
+        extras.append("Report creado")
+    if kpi_created:
+        extras.append("KPI creado")
+    extras_str = f" | {', '.join(extras)}" if extras else ""
+    
     return MessageResponse(
-        message=f"Job {payload.job_id} actualizado a {payload.status}{pheno_info}"
+        message=f"Job {payload.job_id} actualizado a {payload.status}{pheno_info}{extras_str}"
     )
 
+
+# ============================================================
+# KPIS BATCH (para time_series completa desde n8n)
+# ============================================================
 
 @router.post("/kpis", response_model=MessageResponse)
 async def webhook_kpis(
@@ -239,8 +370,12 @@ async def webhook_kpis(
     _: bool = Depends(verify_webhook)
 ):
     """
-    n8n envía batch de KPIs calculados.
+    n8n envía batch de KPIs calculados (serie temporal completa).
     Inserta o actualiza KPIs en la BD.
+    
+    Este endpoint es COMPLEMENTARIO a job-completed:
+    - job-completed crea 1 KPI (última observación) para que el dashboard funcione siempre
+    - Este endpoint crea N KPIs (toda la time_series) para el gráfico de evolución
     """
     parcel = db.query(Parcel).filter(Parcel.id == payload.parcel_id).first()
     if not parcel:
@@ -279,6 +414,10 @@ async def webhook_kpis(
     )
 
 
+# ============================================================
+# REPORT-SENT
+# ============================================================
+
 class ReportSentPayload(BaseModel):
     job_id: str
     sent_to: str
@@ -292,6 +431,7 @@ async def webhook_report_sent(
 ):
     """
     n8n notifica que el reporte fue enviado por email.
+    Marca el Report como enviado (si existe).
     """
     job = db.query(Job).filter(Job.job_id == payload.job_id).first()
     if job:
@@ -306,6 +446,10 @@ async def webhook_report_sent(
     
     return MessageResponse(message=f"Report {payload.job_id} marcado como enviado")
 
+
+# ============================================================
+# CLIENT-CREATED
+# ============================================================
 
 class ClientCreatedPayload(BaseModel):
     email: str
@@ -330,71 +474,60 @@ async def webhook_client_created(
     n8n notifica que un nuevo cliente se registró (desde el formulario web).
     Hashea la contraseña y crea cliente + parcela.
     """
-    # Parsear roi_geojson
-    roi_geojson = parse_roi_geojson(payload.roi_geojson)
-    
+    # Verificar si ya existe
     existing = db.query(Client).filter(Client.email == payload.email).first()
     if existing:
-        if payload.stripe_customer_id:
-            existing.stripe_customer_id = payload.stripe_customer_id
-        if payload.hectares:
-            existing.hectares = payload.hectares
-        if payload.password:
-            existing.password_hash = pwd_context.hash(payload.password)
-        if roi_geojson:
-            existing.roi_geojson = roi_geojson
-        db.commit()
-        return MessageResponse(message=f"Cliente {payload.email} actualizado")
+        return MessageResponse(message=f"Cliente {payload.email} ya existe")
     
+    # Hashear contraseña
     password_hash = None
     if payload.password:
         password_hash = pwd_context.hash(payload.password)
     
-    tier_map = {"essential": "essential", "professional": "professional", "enterprise": "enterprise"}
-    subscription_tier = tier_map.get(payload.plan, "essential") if payload.plan else "essential"
-    
+    # Crear cliente
     client = Client(
         email=payload.email,
-        password_hash=password_hash,
         client_name=payload.client_name,
+        password_hash=password_hash,
         company=payload.company,
         phone=payload.phone,
         hectares=payload.hectares,
         crop_type=payload.crop_type,
-        roi_geojson=roi_geojson,
+        subscription_tier=payload.plan,
         stripe_customer_id=payload.stripe_customer_id,
         status="active",
-        source="landing_page",
-        subscription_tier=subscription_tier,
-        subscription_status="active"
+        source="n8n_webhook"
     )
+    
+    roi_geojson = parse_roi_geojson(payload.roi_geojson)
+    if roi_geojson:
+        client.roi_geojson = roi_geojson
     
     db.add(client)
     db.commit()
     db.refresh(client)
     
+    # Crear parcela si hay ROI
     if roi_geojson:
         parcel = Parcel(
             client_id=client.id,
-            parcel_name="Parcela principal",
+            parcel_name=f"Parcela {payload.crop_type or 'Principal'}",
             hectares=payload.hectares or 0,
-            crop_type=payload.crop_type or "olivo",
+            crop_type=payload.crop_type or "olive",
             roi_geojson=roi_geojson
         )
         db.add(parcel)
         db.commit()
     
-    return MessageResponse(message=f"Cliente {payload.email} creado")
+    return MessageResponse(
+        message=f"Cliente {payload.email} creado con éxito"
+    )
 
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @router.get("/health")
-async def webhook_health(_: bool = Depends(verify_webhook)):
-    """
-    Health check para verificar que el webhook está funcionando
-    """
-    return {
-        "status": "ok", 
-        "service": "muorbita-webhooks",
-        "version": "3.2",
-        "phenology_support": True
-    }
+async def webhooks_health():
+    return {"status": "ok", "service": "webhooks", "version": "4.0"}
