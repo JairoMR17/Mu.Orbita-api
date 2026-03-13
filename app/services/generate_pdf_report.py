@@ -1,12 +1,14 @@
 """
-Mu.Orbita PDF Report Generator v4.0
+Mu.Orbita PDF Report Generator v5.0
 ====================================
-v4.0: Carga imágenes desde PostgreSQL por job_id (prioridad 1),
-      con fallback a datos inline del payload (prioridad 2).
+v5.0: Reordenamiento de secciones, fix tabla portada, fix gauge NDVI,
+      mapas EVI + NDCI añadidos.
 
 Changelog:
 - v3.2: Key aliases para mapeo GEE → PDF
 - v4.0: Carga imágenes desde BD por job_id
+- v5.0: Nuevo orden de secciones, 4 mapas (NDVI, NDWI, EVI, NDCI),
+        fix tabla portada cortada, fix gauge NDVI texto superpuesto
 
 Autor: Mu.Orbita
 Fecha: 2026-03
@@ -429,7 +431,12 @@ def generate_ts_chart(time_series: List[Dict], crop_type: str = 'olivar',
     return buf.getvalue()
 
 
-def generate_ndvi_gauge(ndvi_mean, ndvi_p10, ndvi_p90, width_px=520, height_px=120) -> bytes:
+# ── v5.0: GAUGE NDVI CORREGIDO ──────────────────────────────
+def generate_ndvi_gauge(ndvi_mean, ndvi_p10, ndvi_p90, width_px=520, height_px=140) -> bytes:
+    """
+    v5.0: Fixed overlapping labels. Zone labels moved above Media annotation.
+    height_px increased from 120→140, ylim expanded to (-1.3, 3.2).
+    """
     _chart_style()
     fig, ax = plt.subplots(figsize=(width_px/100, height_px/100), dpi=180)
 
@@ -439,28 +446,38 @@ def generate_ndvi_gauge(ndvi_mean, ndvi_p10, ndvi_p90, width_px=520, height_px=1
                  (0.7, C['green']), (1.0, '#2D5016')])
     ax.imshow(gradient, aspect='auto', cmap=cmap, extent=[0, 1, 0, 1])
 
-    ax.plot([ndvi_p10, ndvi_p10], [-0.3, 1.3], color=C['brown_dark'], linewidth=1.5, linestyle='--', alpha=0.7)
-    ax.plot([ndvi_p90, ndvi_p90], [-0.3, 1.3], color=C['brown_dark'], linewidth=1.5, linestyle='--', alpha=0.7)
-    ax.annotate(f'P10: {ndvi_p10:.2f}', xy=(ndvi_p10, -0.5), ha='center', fontsize=8, color=C['text_light'])
-    ax.annotate(f'P90: {ndvi_p90:.2f}', xy=(ndvi_p90, -0.5), ha='center', fontsize=8, color=C['text_light'])
+    # P10 / P90 dashed lines
+    ax.plot([ndvi_p10, ndvi_p10], [-0.3, 1.3], color=C['brown_dark'],
+            linewidth=1.5, linestyle='--', alpha=0.7)
+    ax.plot([ndvi_p90, ndvi_p90], [-0.3, 1.3], color=C['brown_dark'],
+            linewidth=1.5, linestyle='--', alpha=0.7)
+    ax.annotate(f'P10: {ndvi_p10:.2f}', xy=(ndvi_p10, -0.5),
+                ha='center', fontsize=8, color=C['text_light'])
+    ax.annotate(f'P90: {ndvi_p90:.2f}', xy=(ndvi_p90, -0.5),
+                ha='center', fontsize=8, color=C['text_light'])
 
+    # Mean marker (triangle pointing down)
     ax.plot(ndvi_mean, 0.5, marker='v', markersize=14, color=C['brown_dark'], zorder=5)
-    ax.annotate(f'Media: {ndvi_mean:.2f}', xy=(ndvi_mean, 1.5), ha='center',
+
+    # v5.0: Media label at y=1.6
+    ax.annotate(f'Media: {ndvi_mean:.2f}', xy=(ndvi_mean, 1.6), ha='center',
                 fontsize=10, fontweight='bold', color=C['brown_dark'])
 
-    for v in [0, 0.2, 0.35, 0.45, 0.6, 0.8, 1.0]:
+    # Tick values at bottom
+    for v in [0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]:
         ax.text(v, -1.0, f'{v:.1f}', ha='center', fontsize=7, color=C['text_muted'])
 
-    ax.text(0.175, 1.6, 'Estrés', ha='center', fontsize=7, color=C['red'], alpha=0.7)
-    ax.text(0.40, 1.6, 'Bajo', ha='center', fontsize=7, color=C['yellow'], alpha=0.7)
-    ax.text(0.525, 1.6, 'Moderado', ha='center', fontsize=7, color=C['yellow'], alpha=0.7)
-    ax.text(0.72, 1.6, 'Alto', ha='center', fontsize=7, color=C['green'], alpha=0.7)
+    # v5.0: Zone labels ABOVE Media (y=2.5) to prevent overlap
+    ax.text(0.10, 2.5, 'Estrés', ha='center', fontsize=7.5, color=C['red'], alpha=0.8)
+    ax.text(0.375, 2.5, 'Bajo', ha='center', fontsize=7.5, color='#E8A838', alpha=0.8)
+    ax.text(0.525, 2.5, 'Moderado', ha='center', fontsize=7.5, color=C['yellow'], alpha=0.8)
+    ax.text(0.72, 2.5, 'Alto', ha='center', fontsize=7.5, color=C['green'], alpha=0.8)
 
     ax.set_xlim(-0.02, 1.02)
-    ax.set_ylim(-1.3, 2.2)
+    ax.set_ylim(-1.3, 3.2)
     ax.axis('off')
     ax.set_title('Distribución NDVI en parcela', fontsize=10, fontweight='bold',
-                 color=C['brown_dark'], pad=2)
+                 color=C['brown_dark'], pad=10)
 
     plt.tight_layout()
     buf = io.BytesIO()
@@ -562,9 +579,9 @@ class MuOrbitaPDFGenerator:
         # Log resultado
         if self.png_map:
             sources = list(self.png_map.keys())
-            print(f"✅ PDF v4.0: png_map con {len(self.png_map)} imágenes: {sources}")
+            print(f"✅ PDF v5.0: png_map con {len(self.png_map)} imágenes: {sources}")
         else:
-            print("⚠️ PDF v4.0: png_map VACÍO — se usarán gráficos matplotlib")
+            print("⚠️ PDF v5.0: png_map VACÍO — se usarán gráficos matplotlib")
 
     def _load_images_from_db(self, job_id: str):
         """
@@ -677,6 +694,7 @@ class MuOrbitaPDFGenerator:
         cvs.restoreState()
 
     # --- Cover Page ---
+    # v5.0: card_h increased from 72→80mm, row spacing 8→9mm
     def _draw_cover(self, cvs, doc):
         cvs.saveState()
 
@@ -720,7 +738,8 @@ class MuOrbitaPDFGenerator:
 
         card_x = self.M + 8*mm
         card_w = self.W - 2*self.M - 16*mm
-        card_h = 72*mm
+        # v5.0: card_h 72→80mm to fix last row being cut off
+        card_h = 80*mm
         card_y = band_y - 15*mm - card_h
 
         cvs.setFillColor(hex_color('white'))
@@ -756,11 +775,12 @@ class MuOrbitaPDFGenerator:
             val_display = value if len(str(value)) < 42 else str(value)[:39] + '...'
             cvs.drawRightString(card_x + card_w - 14*mm, row_y, val_display)
 
+            # v5.0: row spacing 8→9mm for breathing room
             row_y -= 3*mm
             cvs.setStrokeColor(hex_color('cream_dark'))
             cvs.setLineWidth(0.3)
             cvs.line(card_x + 14*mm, row_y, card_x + card_w - 14*mm, row_y)
-            row_y -= 8*mm
+            row_y -= 9*mm
 
         cvs.setFillColor(hex_color('text_light'))
         cvs.setFont('Helvetica', 9)
@@ -1014,9 +1034,19 @@ class MuOrbitaPDFGenerator:
         return elements
 
     # =====================================================
-    # MAIN BUILD METHOD
+    # MAIN BUILD METHOD — v5.0 NEW ORDER
     # =====================================================
     def generate(self) -> bytes:
+        """
+        v5.0: New section order:
+        1. Cover (Page 1)
+        2. Resumen Ejecutivo: KPIs + Interpretación + Detalle + Gauge (Page 2)
+        3. Mapas: NDVI, NDWI, EVI, NDCI en grid 2×2 (Page 3)
+        4. Evolución Temporal de Índices (Page 4)
+        5. Análisis Agronómico — Claude AI markdown (Page 5+)
+        6. Evaluación de Riesgos + Recomendaciones Prioritarias (Page N)
+        7. Anexo Técnico (Last page)
+        """
         d = self.d
         s = self.styles
 
@@ -1030,7 +1060,11 @@ class MuOrbitaPDFGenerator:
         elements = []
         elements.append(PageBreak())
 
-        # ======== PAGE 2: KPI DASHBOARD ========
+        ct = crop_label(d.get('crop_type', ''))
+
+        # ════════════════════════════════════════════════════
+        # PAGE 2: RESUMEN EJECUTIVO (KPIs + Detalle + Gauge)
+        # ════════════════════════════════════════════════════
         elements.append(Spacer(1, 3*mm))
         elements.append(Paragraph('Indicadores Clave de Rendimiento', s['SectionTitle']))
         elements.append(SectionDivider(self.content_w))
@@ -1038,9 +1072,9 @@ class MuOrbitaPDFGenerator:
         elements.append(self._kpi_cards())
         elements.append(Spacer(1, 4*mm))
 
+        # Interpretación integrada
         ndvi_m = d.get('ndvi_mean', 0)
         stress_pct = d.get('stress_area_pct', 0)
-        ct = crop_label(d.get('crop_type',''))
         hetero = d.get('ndvi_p90', 0) - d.get('ndvi_p10', 0)
 
         if stress_pct > 40:
@@ -1073,59 +1107,57 @@ class MuOrbitaPDFGenerator:
         elements.append(CalloutBox(interp_text, s, accent=accent, width=self.content_w))
         elements.append(Spacer(1, 4*mm))
 
+        # Detalle de Índices
         elements.append(Paragraph('Detalle de Índices Vegetativos', s['SubsectionTitle']))
         elements.append(self._detail_table())
         elements.append(Spacer(1, 4*mm))
 
-        # ── GAUGE: real PNG si existe, fallback a matplotlib ──
+        # Gauge NDVI — v5.0: height 36→42mm
         gauge_bytes = generate_ndvi_gauge(
             d.get('ndvi_mean', 0.3), d.get('ndvi_p10', 0.2), d.get('ndvi_p90', 0.4))
-        elements.append(self._real_or_generated('NDVI_DISTRIBUTION', gauge_bytes, 155, 36))
+        elements.append(self._real_or_generated('NDVI_DISTRIBUTION', gauge_bytes, 155, 42))
 
-        # ======== PAGE 3: EVOLUCIÓN + MAPAS ========
+        # ════════════════════════════════════════════════════
+        # PAGE 3: MAPAS — NDVI, NDWI, EVI, NDCI (2×2)
+        # ════════════════════════════════════════════════════
         elements.append(PageBreak())
         elements.append(Spacer(1, 3*mm))
-
-        elements.append(Paragraph('Evolución Temporal de Índices', s['SectionTitle']))
-        elements.append(SectionDivider(self.content_w))
-        elements.append(Spacer(1, 2*mm))
-
-        # ── TIME SERIES: real PNG si existe, fallback a matplotlib ──
-        ts = d.get('time_series', [])
-        chart_bytes = generate_ts_chart(ts, d.get('crop_type', 'olivar'))
-        elements.append(self._real_or_generated('TIME_SERIES', chart_bytes, 165, 60))
-        elements.append(Spacer(1, 2*mm))
-
-        chart_note = (
-            f'<b>Lectura del gráfico:</b> Verde = NDVI (vigor); Azul = NDWI (agua); '
-            f'Dorado = EVI (productividad). La franja roja inferior marca estrés severo '
-            f'(NDVI &lt;0.35). La franja verde marca el rango óptimo para {ct.lower()}.'
-        )
-        if len(ts or []) < 5:
-            chart_note += ' Nota: los datos acumulados son aún insuficientes para tendencias robustas.'
-        elements.append(CalloutBox(chart_note, s, accent='gold', width=self.content_w))
-        elements.append(Spacer(1, 5*mm))
 
         elements.append(Paragraph('Mapas de Vigor y Estado Hídrico', s['SectionTitle']))
         elements.append(SectionDivider(self.content_w))
         elements.append(Spacer(1, 2*mm))
 
-        # ── MAPAS: v3.2 busca 'NDVI_MAP' Y 'NDVI' via aliases ──
+        # Row 1: NDVI + NDWI
         ndvi_map_bytes = generate_heatmap('NDVI (Vigor)', d.get('ndvi_mean', 0.3), 'RdYlGn')
         ndwi_map_bytes = generate_heatmap('NDWI (Agua)', max(0, d.get('ndwi_mean', 0)), 'YlGnBu')
 
-        maps_tbl = Table([
+        maps_row1 = Table([
             [self._real_or_generated('NDVI_MAP', ndvi_map_bytes, 78, 55),
              self._real_or_generated('NDWI_MAP', ndwi_map_bytes, 78, 55)]
         ], colWidths=[83*mm, 83*mm])
-        maps_tbl.setStyle(TableStyle([
+        maps_row1.setStyle(TableStyle([
             ('ALIGN',(0,0),(-1,-1),'CENTER'),
             ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
         ]))
-        elements.append(maps_tbl)
+        elements.append(maps_row1)
+        elements.append(Spacer(1, 4*mm))
+
+        # v5.0: Row 2: EVI + NDCI (NEW MAPS)
+        evi_map_bytes = generate_heatmap('EVI (Productividad)', d.get('evi_mean', 0.25), 'YlOrRd')
+        ndci_map_bytes = generate_heatmap('NDCI (Clorofila)', d.get('ndci_mean', 0.2), 'YlGn')
+
+        maps_row2 = Table([
+            [self._real_or_generated('EVI_MAP', evi_map_bytes, 78, 55),
+             self._real_or_generated('NDCI_MAP', ndci_map_bytes, 78, 55)]
+        ], colWidths=[83*mm, 83*mm])
+        maps_row2.setStyle(TableStyle([
+            ('ALIGN',(0,0),(-1,-1),'CENTER'),
+            ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+        ]))
+        elements.append(maps_row2)
         elements.append(Spacer(1, 2*mm))
 
-        # ── v3.2: Nota dinámica según fuente de imágenes ──
+        # Dynamic note based on image source
         has_real_maps = any(
             alias in self.png_map
             for aliases in [self.KEY_ALIASES.get('NDVI_MAP', []), self.KEY_ALIASES.get('NDWI_MAP', [])]
@@ -1141,7 +1173,33 @@ class MuOrbitaPDFGenerator:
         elements.append(Paragraph(f'<font size="8" color="{C["text_muted"]}">{map_note}</font>',
                                   s['Footnote']))
 
-        # ======== PAGE 4: AI ANALYSIS ========
+        # ════════════════════════════════════════════════════
+        # PAGE 4: EVOLUCIÓN TEMPORAL
+        # ════════════════════════════════════════════════════
+        elements.append(PageBreak())
+        elements.append(Spacer(1, 3*mm))
+
+        elements.append(Paragraph('Evolución Temporal de Índices', s['SectionTitle']))
+        elements.append(SectionDivider(self.content_w))
+        elements.append(Spacer(1, 2*mm))
+
+        ts = d.get('time_series', [])
+        chart_bytes = generate_ts_chart(ts, d.get('crop_type', 'olivar'))
+        elements.append(self._real_or_generated('TIME_SERIES', chart_bytes, 165, 60))
+        elements.append(Spacer(1, 2*mm))
+
+        chart_note = (
+            f'<b>Lectura del gráfico:</b> Verde = NDVI (vigor); Azul = NDWI (agua); '
+            f'Dorado = EVI (productividad). La franja roja inferior marca estrés severo '
+            f'(NDVI &lt;0.35). La franja verde marca el rango óptimo para {ct.lower()}.'
+        )
+        if len(ts or []) < 5:
+            chart_note += ' Nota: los datos acumulados son aún insuficientes para tendencias robustas.'
+        elements.append(CalloutBox(chart_note, s, accent='gold', width=self.content_w))
+
+        # ════════════════════════════════════════════════════
+        # PAGE 5+: ANÁLISIS AGRONÓMICO (Claude AI)
+        # ════════════════════════════════════════════════════
         elements.append(PageBreak())
         elements.append(Spacer(1, 3*mm))
 
@@ -1155,7 +1213,9 @@ class MuOrbitaPDFGenerator:
         else:
             elements.extend(self._auto_analysis())
 
-        # ======== PAGE 5: RIESGOS + RECOMENDACIONES + ANEXO ========
+        # ════════════════════════════════════════════════════
+        # PAGE N: RIESGOS + RECOMENDACIONES
+        # ════════════════════════════════════════════════════
         elements.append(PageBreak())
         elements.append(Spacer(1, 3*mm))
 
@@ -1170,6 +1230,12 @@ class MuOrbitaPDFGenerator:
         elements.append(Spacer(1, 2*mm))
         elements.extend(self._recommendations())
         elements.append(Spacer(1, 6*mm))
+
+        # ════════════════════════════════════════════════════
+        # LAST PAGE: ANEXO TÉCNICO
+        # ════════════════════════════════════════════════════
+        elements.append(PageBreak())
+        elements.append(Spacer(1, 3*mm))
 
         elements.append(Paragraph('Anexo Técnico', s['SectionTitle']))
         elements.append(SectionDivider(self.content_w))
@@ -1186,6 +1252,7 @@ class MuOrbitaPDFGenerator:
         elements.append(Paragraph(f'<font size="7.5" color="{C["text_muted"]}">{disclaimer}</font>',
                                   s['Footnote']))
 
+        # ── Build ──
         def first_page(cvs, doc):
             self._draw_cover(cvs, doc)
 
@@ -1274,33 +1341,38 @@ if __name__ == '__main__':
     import sys
 
     test_data = {
-        "job_id": "MUORBITA_TEST_001",
+        "job_id": "MUORBITA_TEST_V5",
         "client_name": "Cliente Test",
         "crop_type": "olive",
         "analysis_type": "baseline",
-        "area_hectares": 26.9,
-        "start_date": "2025-08-15",
-        "end_date": "2026-02-15",
-        "images_processed": 24,
-        "latest_image_date": "2026-02-12",
-        "ndvi_mean": 0.30, "ndvi_p10": 0.24, "ndvi_p50": 0.29,
-        "ndvi_p90": 0.39, "ndvi_stddev": 0.06, "ndvi_zscore": -1.2,
-        "ndwi_mean": 0.01, "ndwi_p10": -0.05, "ndwi_p90": 0.06,
-        "evi_mean": 0.27, "evi_p10": 0.22, "evi_p90": 0.32,
-        "ndci_mean": 0.13, "savi_mean": 0.23,
-        "stress_area_ha": 21.1, "stress_area_pct": 78.5,
-        "lst_mean_c": 18.2, "lst_min_c": 4.5, "lst_max_c": 32.8,
-        "heterogeneity": 0.15,
+        "area_hectares": 19.9,
+        "start_date": "2025-09-13",
+        "end_date": "2026-03-13",
+        "images_processed": 43,
+        "latest_image_date": "2026-03-11",
+        "ndvi_mean": 0.49, "ndvi_p10": 0.39, "ndvi_p50": 0.49,
+        "ndvi_p90": 0.61, "ndvi_stddev": 0.092, "ndvi_zscore": 0.20,
+        "ndwi_mean": 0.01, "ndwi_p10": -0.069, "ndwi_p90": 0.122,
+        "evi_mean": 0.26, "evi_p10": 0.208, "evi_p90": 0.335,
+        "ndci_mean": 0.20, "savi_mean": 0.28,
+        "stress_area_ha": 1.1, "stress_area_pct": 5.8,
+        "lst_mean_c": 13.7,
         "png_images": [],
         "time_series": [
-            {"date": "2025-09-01", "ndvi": 0.35, "ndwi": 0.03, "evi": 0.30},
-            {"date": "2025-10-01", "ndvi": 0.31, "ndwi": 0.01, "evi": 0.27},
-            {"date": "2025-11-01", "ndvi": 0.29, "ndwi": 0.00, "evi": 0.25},
-            {"date": "2025-12-01", "ndvi": 0.27, "ndwi": 0.00, "evi": 0.24},
-            {"date": "2026-01-01", "ndvi": 0.29, "ndwi": 0.01, "evi": 0.26},
-            {"date": "2026-02-12", "ndvi": 0.30, "ndwi": 0.01, "evi": 0.27},
+            {"date": "2025-09-20", "ndvi": 0.45, "ndwi": 0.02, "evi": 0.24},
+            {"date": "2025-10-05", "ndvi": 0.44, "ndwi": 0.01, "evi": 0.23},
+            {"date": "2025-10-20", "ndvi": 0.43, "ndwi": 0.00, "evi": 0.23},
+            {"date": "2025-11-04", "ndvi": 0.44, "ndwi": 0.01, "evi": 0.24},
+            {"date": "2025-11-19", "ndvi": 0.45, "ndwi": 0.01, "evi": 0.24},
+            {"date": "2025-12-04", "ndvi": 0.46, "ndwi": 0.01, "evi": 0.25},
+            {"date": "2025-12-19", "ndvi": 0.47, "ndwi": 0.01, "evi": 0.25},
+            {"date": "2026-01-03", "ndvi": 0.47, "ndwi": 0.01, "evi": 0.25},
+            {"date": "2026-01-18", "ndvi": 0.48, "ndwi": 0.01, "evi": 0.26},
+            {"date": "2026-02-02", "ndvi": 0.48, "ndwi": 0.01, "evi": 0.26},
+            {"date": "2026-02-17", "ndvi": 0.49, "ndwi": 0.01, "evi": 0.26},
+            {"date": "2026-03-11", "ndvi": 0.49, "ndwi": 0.01, "evi": 0.26},
         ],
-        "markdown_analysis": "## Resumen Ejecutivo\n\nAnálisis de prueba."
+        "markdown_analysis": ""
     }
 
     if len(sys.argv) > 1:
@@ -1313,7 +1385,7 @@ if __name__ == '__main__':
         out_path = f"/tmp/{result['filename']}"
         with open(out_path, 'wb') as f:
             f.write(base64.b64decode(result['pdf_base64']))
-        print(f"✅ PDF generado: {out_path} ({result['pdf_size']:,} bytes)")
+        print(f"✅ PDF v5.0 generado: {out_path} ({result['pdf_size']:,} bytes)")
         print(f"   Imágenes usadas: {result['images_used']}")
     else:
         print(f"❌ Error: {result['error']}")
