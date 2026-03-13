@@ -1,19 +1,14 @@
 """
 Mu.Orbita API - Webhooks Router
 Endpoints para recibir datos de n8n
-VERSIÓN 4.1 - Auto-creación de Report + Kpi en job-completed
-             - Resolución automática de client_id/parcel_id por email
-             - Poblado automático de tablas para dashboard
+VERSIÓN 4.2 - Añade /resolve-parcel para n8n KPI batch
 
-CAMBIOS vs v4.0:
-  1. WebhookJobCompletedV2 ahora acepta client_email y client_name
-  2. Si el job no tiene client_id, lo resuelve automáticamente por client_email
-  3. Si el job no tiene parcel_id, busca la primera parcela activa del cliente
-  4. ndvi_current se guarda como número (no string) — compatible con columna numeric
-  5. Esto garantiza que jobs creados sin job-started tengan datos completos
+CAMBIOS vs v4.1:
+  1. Nuevo endpoint GET /resolve-parcel?email=... para resolver parcel_id desde n8n
+  2. Resto del archivo idéntico a v4.1
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status, Header
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Header
 from sqlalchemy.orm import Session
 from typing import Optional, Union, List
 from datetime import datetime, date as date_type
@@ -214,9 +209,6 @@ async def webhook_job_completed(
     1. Resuelve client_id y parcel_id desde client_email si faltan
     2. Crea automáticamente un registro Report (para /dashboard/reports)
     3. Crea/actualiza un registro Kpi (para /dashboard/summary y /dashboard/alerts)
-    
-    Esto garantiza que el dashboard SIEMPRE tenga datos tras un análisis exitoso,
-    incluso si el job no pasó por /webhooks/job-started.
     """
     job = db.query(Job).filter(Job.job_id == payload.job_id).first()
     
@@ -415,13 +407,14 @@ async def webhook_job_completed(
         message=f"Job {payload.job_id} actualizado a {payload.status}{pheno_info}{extras_str}"
     )
 
+
 # ============================================================
-# RESOLVE-PARCEL (para n8n KPI batch)
+# RESOLVE-PARCEL (v4.2 — para n8n KPI batch)
 # ============================================================
 
 @router.get("/resolve-parcel")
 async def resolve_parcel_by_email(
-    email: str,
+    email: str = Query(..., description="Email del cliente"),
     db: Session = Depends(get_db),
     _: bool = Depends(verify_webhook)
 ):
@@ -449,16 +442,6 @@ async def resolve_parcel_by_email(
     }
 
 
-# ============================================================
-# KPIS BATCH (para time_series completa desde n8n)
-# ============================================================
-```
-
-Reutiliza directamente `resolve_client_and_parcel()` que ya tienes definida en el mismo archivo, así no hay código duplicado.
-
-Después de desplegar, verifica con:
-```
-curl "https://muorbita-api-production.up.railway.app/api/v1/webhooks/resolve-parcel?email=jairo.mejias.reyes.@gmail.com" -H "X-Webhook-Secret: TU_SECRET"
 # ============================================================
 # KPIS BATCH (para time_series completa desde n8n)
 # ============================================================
@@ -630,4 +613,4 @@ async def webhook_client_created(
 
 @router.get("/health")
 async def webhooks_health():
-    return {"status": "ok", "service": "webhooks", "version": "4.1"}
+    return {"status": "ok", "service": "webhooks", "version": "4.2"}
