@@ -560,13 +560,15 @@ async def download_report(
         )
     
     if not report.pdf_url:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="PDF no disponible"
-        )
+    raise HTTPException(status_code=404, detail="PDF no disponible")
+
+    # Convertir URL de vista de Drive a URL de descarga directa
+    pdf_url = report.pdf_url
+    if 'drive.google.com/file/d/' in pdf_url:
+        file_id = pdf_url.split('/file/d/')[1].split('/')[0]
+        pdf_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     
-    # Redirigir a la URL del PDF (Google Drive u otro storage)
-    return RedirectResponse(url=report.pdf_url)
+    return RedirectResponse(url=pdf_url)
 
 
 # ============================================================================
