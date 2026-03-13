@@ -415,7 +415,50 @@ async def webhook_job_completed(
         message=f"Job {payload.job_id} actualizado a {payload.status}{pheno_info}{extras_str}"
     )
 
+# ============================================================
+# RESOLVE-PARCEL (para n8n KPI batch)
+# ============================================================
 
+@router.get("/resolve-parcel")
+async def resolve_parcel_by_email(
+    email: str,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_webhook)
+):
+    """
+    Resuelve parcel_id a partir de client_email.
+    Usado por n8n cuando parcel_id no está disponible en el job metadata.
+    """
+    client_id, parcel_id = resolve_client_and_parcel(db, email)
+    
+    if not client_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Cliente no encontrado: {email}"
+        )
+    
+    if not parcel_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Sin parcela activa para {email}"
+        )
+    
+    return {
+        "client_id": str(client_id),
+        "parcel_id": str(parcel_id)
+    }
+
+
+# ============================================================
+# KPIS BATCH (para time_series completa desde n8n)
+# ============================================================
+```
+
+Reutiliza directamente `resolve_client_and_parcel()` que ya tienes definida en el mismo archivo, así no hay código duplicado.
+
+Después de desplegar, verifica con:
+```
+curl "https://muorbita-api-production.up.railway.app/api/v1/webhooks/resolve-parcel?email=jairo.mejias.reyes.@gmail.com" -H "X-Webhook-Secret: TU_SECRET"
 # ============================================================
 # KPIS BATCH (para time_series completa desde n8n)
 # ============================================================
