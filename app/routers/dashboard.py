@@ -736,11 +736,11 @@ async def get_parcel_map_data(
         try:
             gee_images = db.query(GEEImage).filter(
                 GEEImage.job_id == job_id,
-                GEEImage.gdrive_folder == "WEB"
+                GEEImage.png_base64.isnot(None)   # solo imágenes que realmente tienen datos
             ).all()
-            
+
             for img in gee_images:
-                images[img.index_type] = f"/api/v1/images/{job_id}/{img.filename}"
+                images[img.index_type] = f"/api/images/{job_id}/{img.filename}"
         except Exception as e:
             # Si la tabla GEEImage no existe o hay error, continuar sin imágenes
             print(f"Warning: Could not fetch GEE images: {e}")
