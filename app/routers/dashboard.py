@@ -542,6 +542,7 @@ async def get_reports(
 @router.get("/reports/{report_id}/download")
 async def download_report(
     report_id: str,
+    token: Optional[str] = None,  
     current_client: Client = Depends(get_current_active_client),
     db: Session = Depends(get_db)
 ):
