@@ -50,7 +50,10 @@ async def get_satellite_image(
     # Validar filename
     valid_files = [
         'PNG_NDVI.png', 'PNG_NDWI.png', 'PNG_EVI.png',
-        'PNG_NDCI.png', 'PNG_SAVI.png', 'PNG_VRA.png', 'PNG_LST.png'
+        'PNG_NDCI.png', 'PNG_SAVI.png', 'PNG_VRA.png', 'PNG_LST.png',
+        # Versiones _WEB (overlay limpio para Leaflet):
+        'PNG_NDVI_WEB.png', 'PNG_NDWI_WEB.png', 'PNG_EVI_WEB.png',
+        'PNG_NDCI_WEB.png', 'PNG_SAVI_WEB.png', 'PNG_VRA_WEB.png', 'PNG_LST_WEB.png',
     ]
     if filename not in valid_files:
         raise HTTPException(status_code=400, detail=f"Invalid filename: {filename}")
