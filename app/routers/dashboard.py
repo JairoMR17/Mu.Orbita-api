@@ -554,30 +554,22 @@ async def download_report(
             detail="Reporte no encontrado"
         )
     
-@router.get("/reports/{report_id}/download")
-async def download_report(
-    report_id: str,
-    current_client: Client = Depends(get_current_active_client),
-    db: Session = Depends(get_db)
-):
-    report = db.query(Report).filter(
-        Report.id == report_id,
-        Report.client_id == current_client.id
-    ).first()
-
-    if not report:
-        raise HTTPException(status_code=404, detail="Reporte no encontrado")
-
-    if not report.pdf_url:
-        raise HTTPException(status_code=404, detail="PDF no disponible")
-
-    # Convertir URL de vista de Drive a URL de descarga directa
-    pdf_url = report.pdf_url
-    if 'drive.google.com/file/d/' in pdf_url:
-        file_id = pdf_url.split('/file/d/')[1].split('/')[0]
-        pdf_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-
-    return RedirectResponse(url=pdf_url)
+    @router.get("/reports/{report_id}/download")
+    async def download_report(
+        report_id: str,
+        db: Session = Depends(get_db)
+    ):
+        report = db.query(Report).filter(Report.id == report_id).first()
+        
+        if not report or not report.pdf_url:
+            raise HTTPException(status_code=404, detail="PDF no disponible")
+        
+        pdf_url = report.pdf_url
+        if 'drive.google.com/file/d/' in pdf_url:
+            file_id = pdf_url.split('/file/d/')[1].split('/')[0]
+            pdf_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        
+        return {"url": pdf_url}
 
 
 # ============================================================================
