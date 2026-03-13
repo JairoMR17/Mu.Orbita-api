@@ -11,6 +11,7 @@ from typing import List, Optional
 from datetime import date, datetime, timedelta
 from pydantic import BaseModel
 import json
+import uuid
 
 from app.database import get_db
 from app.models import Client, Parcel, Job, Kpi, Report
