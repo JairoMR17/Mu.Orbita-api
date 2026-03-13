@@ -453,8 +453,8 @@ async def get_parcel_kpis(
     
     # Por defecto, últimos 6 meses
     if not start_date and not end_date:
-        six_months_ago = date.today() - timedelta(days=180)
-        query = query.filter(Kpi.observation_date >= six_months_ago)
+        one_year_ago = date.today() - timedelta(days=365)
+        query = query.filter(Kpi.observation_date >= one_year_ago)
     
     kpis = query.order_by(Kpi.observation_date).all()
     
