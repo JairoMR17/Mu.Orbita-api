@@ -554,23 +554,22 @@ async def download_report(
             detail="Reporte no encontrado"
         )
     
-    @router.get("/reports/{report_id}/download")
-    async def download_report(
-        report_id: str,
-        db: Session = Depends(get_db)
-    ):
-        report = db.query(Report).filter(Report.id == report_id).first()
-        
-        if not report or not report.pdf_url:
-            raise HTTPException(status_code=404, detail="PDF no disponible")
-        
-        pdf_url = report.pdf_url
-        if 'drive.google.com/file/d/' in pdf_url:
-            file_id = pdf_url.split('/file/d/')[1].split('/')[0]
-            pdf_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-        
-        return {"url": pdf_url}
-
+        @router.get("/reports/{report_id}/download")
+        async def download_report(
+            report_id: str,
+            db: Session = Depends(get_db)
+        ):
+            report = db.query(Report).filter(Report.id == report_id).first()
+            
+            if not report or not report.pdf_url:
+                raise HTTPException(status_code=404, detail="PDF no disponible")
+            
+            pdf_url = report.pdf_url
+            if 'drive.google.com/file/d/' in pdf_url:
+                file_id = pdf_url.split('/file/d/')[1].split('/')[0]
+                pdf_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+            
+            return {"url": pdf_url}
 
 # ============================================================================
 # REPORTS - Guardar Link en BD (llamado desde n8n)
