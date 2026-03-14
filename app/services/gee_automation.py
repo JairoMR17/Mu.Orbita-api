@@ -648,29 +648,67 @@ def get_modis_lst(roi, start_date, end_date):
 
 def calculate_vra_zones(composite_clipped, roi):
     try:
-        training = composite_clipped.select(['NDVI','EVI','NDWI'])
-        valid = training.mask().reduce(ee.Reducer.min())
-        masked = training.updateMask(valid)
-        sample = masked.sample(region=roi, scale=20, numPixels=5000, geometries=False)
-        clusterer = ee.Clusterer.wekaKMeans(3).train(sample)
-        vra = masked.cluster(clusterer).rename('zone')
+        ndvi = composite_clipped.select('NDVI')
+        ndwi = composite_clipped.select('NDWI')
+        evi  = composite_clipped.select('EVI')
+
+        # Normalizar cada índice a 0-1 dentro de la parcela
+        def normalize(img, name):
+            stats = img.reduceRegion(
+                ee.Reducer.minMax(), roi, 10, maxPixels=1e9).getInfo()
+            mn = stats.get(f'{name}_min', 0) or 0
+            mx = stats.get(f'{name}_max', 1) or 1
+            if mx == mn:
+                mx = mn + 0.001  # evitar división por cero
+            return img.subtract(mn).divide(mx - mn).rename(name + '_norm')
+
+        ndvi_n = normalize(ndvi, 'NDVI')
+        ndwi_n = normalize(ndwi, 'NDWI')
+        evi_n  = normalize(evi,  'EVI')
+
+        # Score compuesto: NDVI 60% + NDWI 25% + EVI 15%
+        score = (ndvi_n.multiply(0.60)
+                 .add(ndwi_n.multiply(0.25))
+                 .add(evi_n.multiply(0.15))
+                 .rename('score'))
+
+        # Umbrales por percentiles del score
+        percs = score.reduceRegion(
+            ee.Reducer.percentile([33, 66]), roi, 10, maxPixels=1e9
+        ).getInfo()
+        p33 = percs.get('score_p33', 0.33)
+        p66 = percs.get('score_p66', 0.66)
+
+        print(f"  VRA score thresholds — P33: {p33:.3f}, P66: {p66:.3f}")
+
+        vra = (score.lt(p33).multiply(0)
+               .add(score.gte(p33).And(score.lt(p66)).multiply(1))
+               .add(score.gte(p66).multiply(2))
+               .rename('zone')
+               .updateMask(ndvi.mask()))
+
+        # Estadísticas por zona
         vra_stats = []
-        for z in range(3):
+        for z, label, rec in [(0, 'Bajo vigor', 'Dosis alta'),
+                               (1, 'Vigor medio', 'Dosis media'),
+                               (2, 'Alto vigor', 'Dosis baja')]:
             zm = vra.eq(z)
             area = zm.multiply(ee.Image.pixelArea()).reduceRegion(
-                ee.Reducer.sum(), roi, 20, maxPixels=1e9).getInfo()
-            idx = composite_clipped.select(['NDVI','NDWI','EVI']).updateMask(zm).reduceRegion(
-                ee.Reducer.mean(), roi, 20, maxPixels=1e9).getInfo()
+                ee.Reducer.sum(), roi, 10, maxPixels=1e9).getInfo()
+            idx = composite_clipped.select(['NDVI', 'NDWI', 'EVI']).updateMask(zm).reduceRegion(
+                ee.Reducer.mean(), roi, 10, maxPixels=1e9).getInfo()
             vra_stats.append({
-                'zone': z, 'area_ha': round(area.get('zone',0)/10000, 2),
-                'ndvi_mean': round(idx.get('NDVI',0) or 0, 3),
-                'ndwi_mean': round(idx.get('NDWI',0) or 0, 3),
-                'evi_mean': round(idx.get('EVI',0) or 0, 3)})
-        vra_stats.sort(key=lambda x: x['ndvi_mean'])
-        for i, s in enumerate(vra_stats):
-            s['label'] = ['Bajo vigor','Vigor medio','Alto vigor'][i]
-            s['recommendation'] = ['Dosis alta','Dosis media','Dosis baja'][i]
+                'zone': z,
+                'label': label,
+                'recommendation': rec,
+                'area_ha': round(area.get('zone', 0) / 10000, 2),
+                'ndvi_mean': round(idx.get('NDVI', 0) or 0, 3),
+                'ndwi_mean': round(idx.get('NDWI', 0) or 0, 3),
+                'evi_mean':  round(idx.get('EVI',  0) or 0, 3),
+            })
+
         return vra, vra_stats
+
     except Exception as e:
         print(f"Warning: VRA failed: {e}")
         return None, []
