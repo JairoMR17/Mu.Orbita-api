@@ -194,6 +194,33 @@ class KpiCreate(KpiBase):
     ndwi_zscore: Optional[float] = None
     cloud_cover_pct: Optional[float] = None
 
+class KpiBatchItem(BaseModel):
+    """Item individual en batch — sin parcel_id/job_id (vienen del padre)"""
+    observation_date: date
+    ndvi_mean: Optional[float] = None
+    ndvi_min: Optional[float] = None
+    ndvi_max: Optional[float] = None
+    ndvi_std: Optional[float] = None
+    ndvi_p10: Optional[float] = None
+    ndvi_p50: Optional[float] = None
+    ndvi_p90: Optional[float] = None
+    ndwi_mean: Optional[float] = None
+    ndwi_min: Optional[float] = None
+    ndwi_max: Optional[float] = None
+    evi_mean: Optional[float] = None
+    ndci_mean: Optional[float] = None
+    lst_mean: Optional[float] = None
+    lst_max: Optional[float] = None
+    tmax_mean: Optional[float] = None
+    precip_mm: Optional[float] = None
+    gdd_accumulated: Optional[float] = None
+    stress_area_ha: Optional[float] = None
+    stress_area_pct: Optional[float] = None
+    low_vigor_area_ha: Optional[float] = None
+    ndvi_zscore: Optional[float] = None
+    ndwi_zscore: Optional[float] = None
+    cloud_cover_pct: Optional[float] = None
+    satellite_source: Optional[str] = None
 
 class KpiResponse(KpiBase):
     id: UUID
@@ -362,8 +389,8 @@ class WebhookJobCompleted(BaseModel):
 class WebhookKpiBatch(BaseModel):
     """Batch de KPIs que envía n8n"""
     parcel_id: UUID
-    job_id: Optional[UUID] = None
-    kpis: List[KpiCreate]
+    job_id: Optional[str] = None       # ← str en vez de UUID
+    kpis: List[KpiBatchItem]           # ← KpiBatchItem en vez de KpiCreate
 
 
 # ============================================================================
