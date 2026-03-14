@@ -453,12 +453,8 @@ async def webhook_kpis(
     _: bool = Depends(verify_webhook)
 ):
     """
-    n8n envía batch de KPIs calculados (serie temporal completa).
-    Inserta o actualiza KPIs en la BD.
-    
-    Este endpoint es COMPLEMENTARIO a job-completed:
-    - job-completed crea 1 KPI (última observación) para que el dashboard funcione siempre
-    - Este endpoint crea N KPIs (toda la time_series) para el gráfico de evolución
+    n8n envía batch de KPIs (serie temporal completa).
+    job_id viene como string MUORBITA_... → se resuelve al UUID interno.
     """
     parcel = db.query(Parcel).filter(Parcel.id == payload.parcel_id).first()
     if not parcel:
@@ -466,6 +462,13 @@ async def webhook_kpis(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Parcela {payload.parcel_id} no encontrada"
         )
+    
+    # Resolver job_id string → UUID de la BD
+    job_uuid = None
+    if payload.job_id:
+        job = db.query(Job).filter(Job.job_id == payload.job_id).first()
+        if job:
+            job_uuid = job.id
     
     inserted = 0
     updated = 0
@@ -477,25 +480,25 @@ async def webhook_kpis(
         ).first()
         
         if existing:
-            for field, value in kpi_data.model_dump(exclude={"parcel_id"}).items():
+            for field, value in kpi_data.model_dump().items():
                 if value is not None:
                     setattr(existing, field, value)
+            if job_uuid:
+                existing.job_id = job_uuid
             updated += 1
         else:
             kpi = Kpi(
                 parcel_id=payload.parcel_id,
-                job_id=payload.job_id,
-                **kpi_data.model_dump(exclude={"parcel_id", "job_id"})
+                job_id=job_uuid,
+                **kpi_data.model_dump()
             )
             db.add(kpi)
             inserted += 1
     
     db.commit()
-    
     return MessageResponse(
         message=f"KPIs procesados: {inserted} insertados, {updated} actualizados"
     )
-
 
 # ============================================================
 # REPORT-SENT
