@@ -583,7 +583,8 @@ async def create_report_link(
     db: Session = Depends(get_db)
 ):
     """
-    Crea registro de reporte con link de Google Drive (llamado desde n8n)
+    Crea o actualiza registro de reporte con link de Google Drive (llamado desde n8n).
+    UPSERT: si job-completed ya creó el report, solo actualiza pdf_url/pdf_drive_id.
     """
     # Buscar job por job_id string
     job = db.query(Job).filter(Job.job_id == data.job_id_string).first()
@@ -601,13 +602,33 @@ async def create_report_link(
             detail=f"Cliente no encontrado: {data.client_email}"
         )
     
-    # Crear registro en reports
+    # ── UPSERT: buscar report existente por job_id ──
+    existing_report = db.query(Report).filter(
+        Report.job_id == job.id
+    ).first()
+    
+    if existing_report:
+        # Ya existe (creado por job-completed) → actualizar con datos de Drive
+        if data.pdf_url:
+            existing_report.pdf_url = data.pdf_url
+        if data.pdf_drive_id:
+            existing_report.pdf_drive_id = data.pdf_drive_id
+        db.commit()
+        db.refresh(existing_report)
+        print(f"📝 Report actualizado con Drive URL para job {data.job_id_string}")
+        return {
+            "success": True,
+            "report_id": str(existing_report.id),
+            "pdf_url": existing_report.pdf_url,
+            "action": "updated"
+        }
+    
+    # No existe → crear nuevo
     new_report = Report(
         job_id=job.id,
         client_id=client.id,
         report_type=data.report_type,
         pdf_url=data.pdf_url,
-        
     )
     
     db.add(new_report)
@@ -617,7 +638,8 @@ async def create_report_link(
     return {
         "success": True,
         "report_id": str(new_report.id),
-        "pdf_url": data.pdf_url
+        "pdf_url": data.pdf_url,
+        "action": "created"
     }
 
 
