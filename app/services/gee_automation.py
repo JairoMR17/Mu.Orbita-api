@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Mu.Orbita GEE Automation Script v5.6 (INLINE ESRI BASEMAP)
+Mu.Orbita GEE Automation Script v5.7
 =============================================================
+
+CAMBIOS V5.7:
+✅ VRA: Score compuesto determinista (NDVI 60% + NDWI 25% + EVI 15%)
+   reemplaza K-Means no determinista
+✅ Serie temporal desacoplada: 1 año para gráfico histórico
+   mientras composite/mapas/VRA usan 6 meses (época coherente)
+✅ Biweekly: serie temporal también extendida a 1 año
 
 CAMBIOS V5.6:
 ✅ Compositor de basemap Esri INTEGRADO (todo en un solo archivo)
@@ -106,7 +113,7 @@ VIZ_PALETTES = {
 # ============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.6')
+    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.7')
     parser.add_argument('--mode', required=True,
                         choices=['execute','check-status','download-results','start-tasks'])
     parser.add_argument('--job-id', required=True)
@@ -168,7 +175,7 @@ def get_leaflet_overlay_png(index_image_unclipped, roi, viz_params, dimensions=5
             'region': region_coords, 'dimensions': dimensions, 'format': 'png'
         })
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.6')
+        req.add_header('User-Agent', 'MuOrbita/5.7')
         png_bytes = urllib.request.urlopen(req, timeout=60).read()
         if len(png_bytes) < 100:
             return None
@@ -186,7 +193,6 @@ def get_leaflet_overlay_png(index_image_unclipped, roi, viz_params, dimensions=5
 # ############################################################################
 
 def _lat_lon_to_tile(lat, lon, zoom):
-    """Lat/lon → tile x,y."""
     lat_rad = math.radians(lat)
     n = 2 ** zoom
     x = int((lon + 180.0) / 360.0 * n)
@@ -194,14 +200,12 @@ def _lat_lon_to_tile(lat, lon, zoom):
     return x, y
 
 def _tile_to_lat_lon(x, y, zoom):
-    """Tile x,y → lat/lon (esquina NW)."""
     n = 2 ** zoom
     lon = x / n * 360.0 - 180.0
     lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
     return math.degrees(lat_rad), lon
 
 def _get_optimal_zoom(bounds, target_width=768):
-    """Zoom óptimo para que la parcela tenga buena resolución (~4-8 tiles)."""
     for z in range(17, 10, -1):
         x1, _ = _lat_lon_to_tile(bounds['south'], bounds['west'], z)
         x2, _ = _lat_lon_to_tile(bounds['south'], bounds['east'], z)
@@ -210,30 +214,22 @@ def _get_optimal_zoom(bounds, target_width=768):
     return 14
 
 def _fetch_tile(x, y, z):
-    """Descarga un tile de Esri World Imagery."""
     url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
     try:
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.6')
+        req.add_header('User-Agent', 'MuOrbita/5.7')
         req.add_header('Referer', 'https://muorbita.com')
         return urllib.request.urlopen(req, timeout=15).read()
     except Exception as e:
         return None
 
 def _geo_to_pixel(lat, lon, geo_bounds, img_w, img_h):
-    """Coordenadas geográficas → píxeles."""
     x = int((lon - geo_bounds['west']) / (geo_bounds['east'] - geo_bounds['west']) * img_w)
     y = int((geo_bounds['north'] - lat) / (geo_bounds['north'] - geo_bounds['south']) * img_h)
     return max(0, min(x, img_w-1)), max(0, min(y, img_h-1))
 
 
 def fetch_esri_basemap(bounds, padding_tiles=1):
-    """
-    Descarga y stitchea tiles de Esri World Imagery para el bbox dado.
-    
-    Returns:
-        (PIL.Image, geo_bounds) o (None, None) si falla
-    """
     from PIL import Image as PILImage
 
     zoom = _get_optimal_zoom(bounds)
@@ -283,86 +279,57 @@ def fetch_esri_basemap(bounds, padding_tiles=1):
 def compose_cartographic_png(basemap_img, geo_bounds, index_b64, parcel_bounds,
                              roi_coords, index_name='NDVI', mean_value=None,
                              opacity=0.65, dim_factor=0.40, max_dim=768):
-    """
-    Compone la imagen cartográfica final:
-      basemap atenuado + índice semitransparente + contorno + leyenda
-    
-    Args:
-        basemap_img:     PIL.Image del basemap (de fetch_esri_basemap)
-        geo_bounds:      bounds geográficos del basemap stitcheado
-        index_b64:       PNG base64 del índice (de get_leaflet_overlay_png)
-        parcel_bounds:   {'south','north','east','west'} de la parcela
-        roi_coords:      coordenadas del polígono para contorno
-        index_name:      nombre del índice (para leyenda)
-        mean_value:      valor medio (para leyenda)
-        opacity:         opacidad del índice (0.65 = 65% índice, 35% basemap)
-        dim_factor:      brillo exterior (0.40 = 40% original)
-        max_dim:         tamaño máximo del resultado
-    """
     from PIL import Image as PILImage, ImageDraw, ImageFont
 
     bw, bh = basemap_img.size
 
-    # ── 1. Atenuar exterior de la parcela ─────────────────────────
-    # Overlay blanco semitransparente sobre TODO, luego "agujero" en la parcela
     dim_overlay = PILImage.new('RGBA', (bw, bh), (255, 255, 255, int(255 * (1 - dim_factor))))
     x1, y1 = _geo_to_pixel(parcel_bounds['north'], parcel_bounds['west'], geo_bounds, bw, bh)
     x2, y2 = _geo_to_pixel(parcel_bounds['south'], parcel_bounds['east'], geo_bounds, bw, bh)
     dim_draw = ImageDraw.Draw(dim_overlay)
-    dim_draw.rectangle([x1, y1, x2, y2], fill=(255, 255, 255, 0))  # transparente en parcela
-    
+    dim_draw.rectangle([x1, y1, x2, y2], fill=(255, 255, 255, 0))
+
     result = basemap_img.convert('RGBA')
     result = PILImage.alpha_composite(result, dim_overlay)
 
-    # ── 2. Superponer índice semitransparente DENTRO de parcela ───
     index_bytes = base64.b64decode(index_b64)
     index_img = PILImage.open(io.BytesIO(index_bytes)).convert('RGBA')
-    
+
     target_w = max(x2 - x1, 1)
     target_h = max(y2 - y1, 1)
     index_resized = index_img.resize((target_w, target_h), PILImage.LANCZOS)
-    
-    # Aplicar opacidad: solo donde hay píxeles de color (no transparentes)
+
     r, g, b, a = index_resized.split()
-    # Píxeles con alpha > 10 (datos válidos) → aplicar opacidad
-    # Píxeles con alpha <= 10 (sin datos, fuera de parcela) → mantener transparentes
     a_adjusted = a.point(lambda p: int(p * opacity) if p > 10 else 0)
     index_resized.putalpha(a_adjusted)
-    
+
     result.paste(index_resized, (x1, y1), index_resized)
 
-    # ── 3. Dibujar contorno de la parcela ─────────────────────────
     draw = ImageDraw.Draw(result)
     poly_points = _extract_polygon_pixels(roi_coords, geo_bounds, bw, bh)
     if poly_points and len(poly_points) >= 3:
-        # Sombra negra
         shadow = [(p[0]+2, p[1]+2) for p in poly_points]
         for i in range(len(shadow)-1):
             draw.line([shadow[i], shadow[i+1]], fill=(0,0,0,200), width=4)
         draw.line([shadow[-1], shadow[0]], fill=(0,0,0,200), width=4)
-        # Contorno blanco
         for i in range(len(poly_points)-1):
             draw.line([poly_points[i], poly_points[i+1]], fill=(255,255,255,255), width=3)
         draw.line([poly_points[-1], poly_points[0]], fill=(255,255,255,255), width=3)
 
-    # ── 4. Recortar al área de interés + padding ──────────────────
     pad = 80
     crop_x1 = max(0, x1 - pad)
     crop_y1 = max(0, y1 - pad)
     crop_x2 = min(bw, x2 + pad)
     crop_y2 = min(bh, y2 + pad)
     cropped = result.crop((crop_x1, crop_y1, crop_x2, crop_y2)).convert('RGB')
-    
-    # Resize si muy grande
+
     cw, ch = cropped.size
     if max(cw, ch) > max_dim:
         ratio = max_dim / max(cw, ch)
         cropped = cropped.resize((int(cw * ratio), int(ch * ratio)), PILImage.LANCZOS)
 
-    # ── 5. Leyenda ────────────────────────────────────────────────
     cropped = _add_legend_pil(cropped, index_name, mean_value)
 
-    # ── 6. Exportar base64 ───────────────────────────────────────
     buf = io.BytesIO()
     cropped.save(buf, format='PNG', optimize=True)
     buf.seek(0)
@@ -370,7 +337,6 @@ def compose_cartographic_png(basemap_img, geo_bounds, index_b64, parcel_bounds,
 
 
 def _extract_polygon_pixels(roi_coords, geo_bounds, img_w, img_h):
-    """Extrae las coordenadas del polígono como píxeles."""
     coords = None
     if isinstance(roi_coords, dict):
         c = roi_coords.get('coordinates', [[]])
@@ -387,7 +353,7 @@ def _extract_polygon_pixels(roi_coords, geo_bounds, img_w, img_h):
                 coords = roi_coords
     if not coords:
         return []
-    
+
     points = []
     for c in coords:
         if isinstance(c, (list, tuple)) and len(c) >= 2:
@@ -397,31 +363,30 @@ def _extract_polygon_pixels(roi_coords, geo_bounds, img_w, img_h):
 
 
 def _add_legend_pil(img, index_name, mean_value=None):
-    """Añade leyenda profesional debajo de la imagen."""
     from PIL import Image as PILImage, ImageDraw, ImageFont
-    
+
     viz = VIZ_PALETTES.get(index_name)
     if not viz:
         return img
-    
+
     legend_h, pad, bar_h = 90, 20, 18
     bar_w = min(350, img.width - 2*pad)
-    
+
     new_img = PILImage.new('RGB', (img.width, img.height + legend_h), (249,247,242))
     new_img.paste(img, (0, 0))
     draw = ImageDraw.Draw(new_img)
     draw.line([(0, img.height), (img.width, img.height)], fill=(200,195,185), width=1)
-    
+
     try:
         ft = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 13)
         fs = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
         fv = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11)
     except (OSError, IOError):
         ft = fs = fv = ImageFont.load_default()
-    
+
     y0 = img.height + 8
     accent, dark, muted = (139,69,19), (51,51,51), (136,136,136)
-    
+
     label = viz.get('label', index_name)
     draw.text((pad, y0), label, fill=accent, font=ft)
     if mean_value is not None:
@@ -430,7 +395,7 @@ def _add_legend_pil(img, index_name, mean_value=None):
         except AttributeError:
             tw = len(label) * 8
         draw.text((pad + tw + 20, y0 + 1), f"Media: {mean_value:.2f}", fill=dark, font=fv)
-    
+
     bar_y, bar_x = y0 + 24, pad
     colors = [tuple(int(h[i:i+2], 16) for i in (0,2,4)) for h in viz['palette']]
     n = len(colors)
@@ -442,7 +407,7 @@ def _add_legend_pil(img, index_name, mean_value=None):
         c = tuple(int(colors[i][j]*(1-f) + colors[i+1][j]*f) for j in range(3))
         draw.rectangle([bar_x+x, bar_y, bar_x+x+1, bar_y+bar_h], fill=c)
     draw.rectangle([bar_x, bar_y, bar_x+bar_w, bar_y+bar_h], outline=(100,100,100), width=1)
-    
+
     unit = viz.get('unit', '')
     draw.text((bar_x, bar_y + bar_h + 3), f"{viz['min']}{unit}", fill=muted, font=fs)
     mx_txt = f"{viz['max']}{unit}"
@@ -451,14 +416,14 @@ def _add_legend_pil(img, index_name, mean_value=None):
     except AttributeError:
         mx_w = len(mx_txt) * 6
     draw.text((bar_x + bar_w - mx_w, bar_y + bar_h + 3), mx_txt, fill=muted, font=fs)
-    
+
     if mean_value is not None:
         rng = viz['max'] - viz['min']
         if rng > 0:
             t = max(0, min(1, (mean_value - viz['min']) / rng))
             mx = bar_x + int(t * bar_w)
             draw.polygon([(mx, bar_y-2), (mx-6, bar_y-8), (mx+6, bar_y-8)], fill=dark)
-    
+
     return new_img
 
 
@@ -470,11 +435,6 @@ def _add_legend_pil(img, index_name, mean_value=None):
 
 def generate_all_images(composite_unclipped, roi, bounds, kpis,
                         index_list, vra_image=None, lst_unclipped=None):
-    """
-    Genera DOS tipos de imagen por índice:
-    - NDVI_WEB: overlay limpio (Leaflet dashboard)
-    - NDVI:     cartográfico (PDF report con basemap Esri)
-    """
     images = {}
 
     OPACITY_MAP = {
@@ -482,7 +442,6 @@ def generate_all_images(composite_unclipped, roi, bounds, kpis,
         'NDCI': 0.65, 'SAVI': 0.65, 'VRA': 0.75, 'LST': 0.60,
     }
 
-    # ── Paso 1: Overlays limpios desde GEE (para dashboard) ──────
     print("\n  === Step 1: GEE overlays for Leaflet ===")
     web_overlays = {}
 
@@ -510,7 +469,6 @@ def generate_all_images(composite_unclipped, roi, bounds, kpis,
             images['LST_WEB'] = b64
             print(f"  ✓ LST_WEB")
 
-    # ── Paso 2: Descargar basemap Esri (1 vez, reutilizar) ───────
     print("\n  === Step 2: Fetch Esri basemap ===")
     basemap_img = None
     geo_bounds = None
@@ -521,11 +479,9 @@ def generate_all_images(composite_unclipped, roi, bounds, kpis,
         except Exception as e:
             print(f"  ⚠ Basemap fetch failed: {e}")
 
-    # ── Paso 3: Componer cartográficos (para PDF) ────────────────
     if basemap_img and geo_bounds:
         print("\n  === Step 3: Compositing cartographic PNGs ===")
 
-        # Obtener coordenadas del polígono para el contorno
         try:
             roi_info = roi.getInfo()
         except:
@@ -538,7 +494,7 @@ def generate_all_images(composite_unclipped, roi, bounds, kpis,
 
             try:
                 carto_b64 = compose_cartographic_png(
-                    basemap_img=basemap_img.copy(),  # copy para no mutar
+                    basemap_img=basemap_img.copy(),
                     geo_bounds=geo_bounds,
                     index_b64=overlay_b64,
                     parcel_bounds=bounds,
@@ -557,7 +513,6 @@ def generate_all_images(composite_unclipped, roi, bounds, kpis,
                 print(f"  ⚠ {idx} compositor error: {e}")
                 images[idx] = _fallback_with_legend(overlay_b64, idx, mean_val)
 
-        # RGB satelital puro (basemap sin overlay)
         try:
             from PIL import Image as PILImage
             bw, bh = basemap_img.size
@@ -579,7 +534,6 @@ def generate_all_images(composite_unclipped, roi, bounds, kpis,
         except Exception as e:
             print(f"  ⚠ RGB failed: {e}")
     else:
-        # Fallback: overlays con leyenda
         print("\n  === Step 3: FALLBACK (no basemap) ===")
         for idx, overlay_b64 in web_overlays.items():
             mean_key = f'{idx.lower()}_mean'
@@ -593,7 +547,6 @@ def generate_all_images(composite_unclipped, roi, bounds, kpis,
 
 
 def _fallback_with_legend(overlay_b64, index_name, mean_value):
-    """Fallback: overlay GEE + leyenda PIL (sin basemap)."""
     try:
         from PIL import Image as PILImage
         img_bytes = base64.b64decode(overlay_b64)
@@ -608,7 +561,7 @@ def _fallback_with_legend(overlay_b64, index_name, mean_value):
 
 # ############################################################################
 #
-#  SECCIÓN 4: COLECCIONES GEE, ÍNDICES, ERA5, VRA (sin cambios)
+#  SECCIÓN 4: COLECCIONES GEE, ÍNDICES, ERA5, VRA
 #
 # ############################################################################
 
@@ -646,7 +599,13 @@ def get_modis_lst(roi, start_date, end_date):
              .copyProperties(img, ['system:time_start']))
     ).median()
 
+
 def calculate_vra_zones(composite_clipped, roi):
+    """
+    VRA v5.7: Score compuesto determinista (NDVI 60% + NDWI 25% + EVI 15%)
+    Clasificación por percentiles P33/P66 del score.
+    Reemplaza K-Means no determinista de v5.6.
+    """
     try:
         ndvi = composite_clipped.select('NDVI')
         ndwi = composite_clipped.select('NDWI')
@@ -666,13 +625,13 @@ def calculate_vra_zones(composite_clipped, roi):
         ndwi_n = normalize(ndwi, 'NDWI')
         evi_n  = normalize(evi,  'EVI')
 
-        # Score compuesto: NDVI 60% + NDWI 25% + EVI 15%
+        # Score compuesto ponderado
         score = (ndvi_n.multiply(0.60)
                  .add(ndwi_n.multiply(0.25))
                  .add(evi_n.multiply(0.15))
                  .rename('score'))
 
-        # Umbrales por percentiles del score
+        # Umbrales por percentiles del score calculados sobre la parcela
         percs = score.reduceRegion(
             ee.Reducer.percentile([33, 66]), roi, 10, maxPixels=1e9
         ).getInfo()
@@ -681,6 +640,7 @@ def calculate_vra_zones(composite_clipped, roi):
 
         print(f"  VRA score thresholds — P33: {p33:.3f}, P66: {p66:.3f}")
 
+        # Clasificación: 0=bajo, 1=medio, 2=alto
         vra = (score.lt(p33).multiply(0)
                .add(score.gte(p33).And(score.lt(p66)).multiply(1))
                .add(score.gte(p66).multiply(2))
@@ -715,7 +675,7 @@ def calculate_vra_zones(composite_clipped, roi):
 
 
 # ############################################################################
-#  ERA5 WEATHER (sin cambios)
+#  ERA5 WEATHER
 # ############################################################################
 
 def get_era5_weather(roi, start_date, end_date):
@@ -825,7 +785,7 @@ def get_era5_weather(roi, start_date, end_date):
 
 
 # ############################################################################
-#  PERSISTIR IMÁGENES (sin cambios)
+#  PERSISTIR IMÁGENES
 # ############################################################################
 
 def persist_images_to_db(job_id, images_base64, bounds=None):
@@ -852,13 +812,14 @@ def persist_images_to_db(job_id, images_base64, bounds=None):
 
 def execute_biweekly_analysis(args):
     print("=" * 60)
-    print("  Mu.Orbita GEE v5.6 — BIWEEKLY ANALYSIS")
-    print("  Esri basemap compositor (inline)")
+    print("  Mu.Orbita GEE v5.7 — BIWEEKLY ANALYSIS")
+    print("  VRA determinista + serie temporal 1 año")
     print("=" * 60)
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
     bounds = get_bounds(roi)
 
+    # ── Colección principal: período del job (30 días) ──
     collection = get_sentinel2_collection(roi, args.start_date, args.end_date)
     count = collection.size().getInfo()
     if count == 0:
@@ -868,6 +829,13 @@ def execute_biweekly_analysis(args):
     indexed = collection.map(calculate_indices)
     composite_clipped = indexed.median().clip(roi)
     composite_viz = indexed.median()
+
+    # ── Colección extendida: 1 año para serie temporal ──
+    end_dt = datetime.strptime(args.end_date, '%Y-%m-%d')
+    start_1y = (end_dt - timedelta(days=365)).strftime('%Y-%m-%d')
+    print(f"  Time series period: {start_1y} → {args.end_date} (1 year)")
+    collection_ts = get_sentinel2_collection(roi, start_1y, args.end_date)
+    indexed_ts = collection_ts.map(calculate_indices)
 
     try:
         latest_date = ee.Date(collection.sort('system:time_start', False).first()
@@ -887,7 +855,7 @@ def execute_biweekly_analysis(args):
         ee.Reducer.sum(), roi, 10, maxPixels=1e9).getInfo().get('NDVI', 0) / 10000
     stress_pct = (stress_ha / area_ha * 100) if area_ha > 0 else 0
 
-    hist_stats = indexed.select('NDVI').mean().reduceRegion(
+    hist_stats = indexed_ts.select('NDVI').mean().reduceRegion(
         ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True),
         roi, 20, maxPixels=1e9).getInfo()
     ndvi_mean = stats.get('NDVI_mean', 0) or 0
@@ -905,14 +873,15 @@ def execute_biweekly_analysis(args):
     except:
         lst_unclipped, lst_mean = None, None
 
-    print("Computing time series...")
+    # ── Serie temporal: usa colección de 1 año ──
+    print("Computing time series (1 year)...")
     time_series = []
     try:
-        ts = indexed.select(['NDVI','NDWI','EVI']).map(lambda img:
+        ts = indexed_ts.select(['NDVI','NDWI','EVI']).map(lambda img:
             ee.Feature(None, img.reduceRegion(
                 ee.Reducer.mean(), roi, 20, maxPixels=1e9
             )).set('date', ee.Date(img.get('system:time_start')).format('YYYY-MM-dd')))
-        for f in ts.toList(50).getInfo():
+        for f in ts.toList(100).getInfo():
             p = f.get('properties', {})
             if p.get('date'):
                 time_series.append({'date': p['date'],
@@ -920,6 +889,7 @@ def execute_biweekly_analysis(args):
                     'ndwi': round(p.get('NDWI_mean',0) or 0, 3),
                     'evi': round(p.get('EVI_mean',0) or 0, 3)})
         time_series.sort(key=lambda x: x['date'])
+        print(f"  ✓ Time series: {len(time_series)} points over 1 year")
     except Exception as e:
         print(f"Warning: time series: {e}")
 
@@ -961,7 +931,7 @@ def execute_biweekly_analysis(args):
         'images_stored': stored, 'images_available': list(all_images.keys()),
         'images_base64': {} if stored else all_images,
         'tasks': [], 'task_count': 0,
-        'message': f'Biweekly v5.6 complete. {len(stored)} images in DB.'
+        'message': f'Biweekly v5.7 complete. {len(stored)} images in DB.'
     }
 
 
@@ -971,13 +941,14 @@ def execute_biweekly_analysis(args):
 
 def execute_analysis(args):
     print("=" * 60)
-    print("  Mu.Orbita GEE v5.6 — BASELINE ANALYSIS")
-    print("  Esri basemap compositor (inline)")
+    print("  Mu.Orbita GEE v5.7 — BASELINE ANALYSIS")
+    print("  VRA determinista + serie temporal 1 año")
     print("=" * 60)
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
     bounds = get_bounds(roi)
 
+    # ── Colección principal: 6 meses (composite, mapas, VRA, KPIs) ──
     collection = get_sentinel2_collection(roi, args.start_date, args.end_date)
     count = collection.size().getInfo()
     if count == 0:
@@ -987,6 +958,14 @@ def execute_analysis(args):
     indexed = collection.map(calculate_indices)
     composite_clipped = indexed.median().clip(roi)
     composite_viz = indexed.median()
+
+    # ── Colección extendida: 1 año para serie temporal del gráfico ──
+    end_dt = datetime.strptime(args.end_date, '%Y-%m-%d')
+    start_1y = (end_dt - timedelta(days=365)).strftime('%Y-%m-%d')
+    print(f"  Composite period:    {args.start_date} → {args.end_date} (6 months)")
+    print(f"  Time series period:  {start_1y} → {args.end_date} (1 year)")
+    collection_ts = get_sentinel2_collection(roi, start_1y, args.end_date)
+    indexed_ts = collection_ts.map(calculate_indices)
 
     try:
         latest_date = ee.Date(collection.sort('system:time_start', False).first()
@@ -1007,7 +986,8 @@ def execute_analysis(args):
         ee.Reducer.sum(), roi, 10, maxPixels=1e9).getInfo().get('NDVI', 0) / 10000
     stress_pct = (stress_ha / area_ha * 100) if area_ha > 0 else 0
 
-    hist_stats = indexed.select('NDVI').mean().reduceRegion(
+    # Z-score histórico: usa colección de 1 año para más contexto
+    hist_stats = indexed_ts.select('NDVI').mean().reduceRegion(
         ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True),
         roi, 20, maxPixels=1e9).getInfo()
     ndvi_mean = stats.get('NDVI_mean', 0) or 0
@@ -1028,7 +1008,8 @@ def execute_analysis(args):
         lst_unclipped = None
         lst_mean = lst_min = lst_max = None
 
-    print("Computing VRA...")
+    # VRA: sobre composite de 6 meses (coherente con mapas)
+    print("Computing VRA (deterministic score)...")
     vra_image, vra_stats = calculate_vra_zones(composite_clipped, roi)
 
     kpis = {
@@ -1070,15 +1051,16 @@ def execute_analysis(args):
         vra_image=vra_image, lst_unclipped=lst_unclipped
     )
 
-    print("Computing time series...")
+    # ── Serie temporal: usa colección de 1 año ──
+    print("Computing time series (1 year)...")
     time_series = []
     try:
-        ts = indexed.select(['NDVI','NDWI','EVI']).map(lambda img:
+        ts = indexed_ts.select(['NDVI','NDWI','EVI']).map(lambda img:
             ee.Feature(None, img.reduceRegion(
                 reducer=ee.Reducer.mean().combine(ee.Reducer.percentile([10,90]), sharedInputs=True),
                 geometry=roi, scale=20, maxPixels=1e9
             )).set('date', ee.Date(img.get('system:time_start')).format('YYYY-MM-dd')))
-        for f in ts.toList(50).getInfo():
+        for f in ts.toList(100).getInfo():
             p = f.get('properties', {})
             if p.get('date'):
                 time_series.append({'date': p['date'],
@@ -1086,6 +1068,7 @@ def execute_analysis(args):
                     'ndwi': round(p.get('NDWI_mean',0) or 0, 3),
                     'evi': round(p.get('EVI_mean',0) or 0, 3)})
         time_series.sort(key=lambda x: x['date'])
+        print(f"  ✓ Time series: {len(time_series)} points over 1 year")
     except Exception as e:
         print(f"Warning: time series: {e}")
 
@@ -1098,7 +1081,7 @@ def execute_analysis(args):
         'images_stored': stored, 'images_available': list(all_images.keys()),
         'images_base64': {} if stored else all_images,
         'tasks': [], 'task_count': 0,
-        'message': f'Baseline v5.6 complete. {len(stored)} images in DB.'
+        'message': f'Baseline v5.7 complete. {len(stored)} images in DB.'
     }
 
 
@@ -1107,11 +1090,11 @@ def execute_analysis(args):
 # ############################################################################
 
 def check_status(args):
-    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100, 'message': 'v5.6: Sync.'}
+    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100, 'message': 'v5.7: Sync.'}
 def download_results(args):
-    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True, 'message': 'v5.6: In response.'}
+    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True, 'message': 'v5.7: In response.'}
 def start_tasks(args):
-    return {'job_id': args.job_id, 'started': 0, 'message': 'v5.6: No tasks.'}
+    return {'job_id': args.job_id, 'started': 0, 'message': 'v5.7: No tasks.'}
 
 def main():
     args = parse_args()
