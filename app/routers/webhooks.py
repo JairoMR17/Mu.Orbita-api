@@ -453,8 +453,8 @@ async def webhook_kpis(
     _: bool = Depends(verify_webhook)
 ):
     """
-    n8n envía batch de KPIs (serie temporal completa).
-    job_id viene como string MUORBITA_... → se resuelve al UUID interno.
+    n8n envía batch de KPIs calculados (serie temporal completa).
+    Maneja duplicados intra-batch con flush() progresivo.
     """
     parcel = db.query(Parcel).filter(Parcel.id == payload.parcel_id).first()
     if not parcel:
@@ -463,7 +463,7 @@ async def webhook_kpis(
             detail=f"Parcela {payload.parcel_id} no encontrada"
         )
     
-    # Resolver job_id string → UUID de la BD
+    # Resolver job_id string → UUID del job en BD
     job_uuid = None
     if payload.job_id:
         job = db.query(Job).filter(Job.job_id == payload.job_id).first()
@@ -494,12 +494,16 @@ async def webhook_kpis(
             )
             db.add(kpi)
             inserted += 1
+        
+        # Flush después de cada operación para que el siguiente
+        # item duplicado lo detecte como "existing"
+        db.flush()
     
     db.commit()
+    
     return MessageResponse(
         message=f"KPIs procesados: {inserted} insertados, {updated} actualizados"
     )
-
 # ============================================================
 # REPORT-SENT
 # ============================================================
