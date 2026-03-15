@@ -925,7 +925,7 @@ def execute_biweekly_analysis(args):
     stored = persist_images_to_db(job_id, all_images, bounds)
 
     return {
-        'success': True, 'job_id': job_id, 'analysis_type': 'baseline',
+        'success': True, 'job_id': job_id, 'analysis_type': 'biweekly',
         'kpis': kpis, 'vra_stats': vra_stats, 'bounds': bounds,
         'weather': weather_kpis, 'weather_daily': weather_daily,  # ← NUEVO
         'time_series': time_series,
@@ -1054,7 +1054,7 @@ def execute_analysis(args):
         'bounds_east': bounds['east'] if bounds else None,
         'valid_pixels': stats.get('NDVI_count', 0)
     }
-   kpis.update(weather_kpis)
+    kpis.update(weather_kpis)
 
     print("\nGenerating all images...")
     all_images = generate_all_images(
