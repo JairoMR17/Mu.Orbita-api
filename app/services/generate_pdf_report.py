@@ -1,14 +1,18 @@
 """
-Mu.Orbita PDF Report Generator v5.0
+Mu.Orbita PDF Report Generator v6.0
 ====================================
-v5.0: Reordenamiento de secciones, fix tabla portada, fix gauge NDVI,
-      mapas EVI + NDCI añadidos.
+v6.0: Narrativas estructuradas de Claude (JSON), sin duplicación,
+      mapas con interpretación inline, ERA5 weather, VRA analysis.
 
 Changelog:
 - v3.2: Key aliases para mapeo GEE → PDF
 - v4.0: Carga imágenes desde BD por job_id
-- v5.0: Nuevo orden de secciones, 4 mapas (NDVI, NDWI, EVI, NDCI),
-        fix tabla portada cortada, fix gauge NDVI texto superpuesto
+- v5.0: Nuevo orden de secciones, 4 mapas, fix gauge
+- v6.0: ELIMINADA sección "Análisis Agronómico" duplicada.
+        Narrativas Claude distribuidas en cada sección visual.
+        Nueva tabla clima ERA5. Riesgos con texto interpretativo.
+        Recomendaciones estructuradas desde JSON. VRA analysis.
+        PDF de 10 → 7 páginas.
 
 Autor: Mu.Orbita
 Fecha: 2026-03
@@ -111,6 +115,8 @@ def get_styles():
          textColor=hex_color('text'), leading=15, alignment=TA_JUSTIFY, spaceAfter=3*mm)
     _add('BodySmall',     fontName='Helvetica', fontSize=9,
          textColor=hex_color('text'), leading=13, spaceAfter=2*mm)
+    _add('BodySmallItalic', fontName='Helvetica-Oblique', fontSize=8.5,
+         textColor=hex_color('text_light'), leading=12, spaceAfter=2*mm)
     _add('Callout',       fontName='Helvetica', fontSize=10,
          textColor=hex_color('text'), leading=15, alignment=TA_JUSTIFY,
          spaceBefore=2*mm, spaceAfter=2*mm,
@@ -130,6 +136,11 @@ def get_styles():
          textColor=hex_color('text'), alignment=TA_CENTER)
     _add('TableCellLeft', fontName='Helvetica', fontSize=9,
          textColor=hex_color('text'), alignment=TA_LEFT)
+    _add('TableCellWrap', fontName='Helvetica', fontSize=8.5,
+         textColor=hex_color('text'), alignment=TA_LEFT, leading=12)
+    _add('MapCaption',    fontName='Helvetica-Oblique', fontSize=8.5,
+         textColor=hex_color('brown'), leading=12, alignment=TA_JUSTIFY,
+         spaceBefore=1*mm, spaceAfter=1*mm)
 
     return base
 
@@ -165,7 +176,7 @@ def hetero_label(p10, p90):
 
 def crop_label(ct):
     m = {'olive':'Olivar','olivar':'Olivar','olivo':'Olivar',
-         'vineyard':'Viñedo','viña':'Viñedo','vid':'Viñedo',
+         'vineyard':'Viñedo','viña':'Viñedo','vid':'Viñedo','viñedo':'Viñedo',
          'almond':'Almendro','almendro':'Almendro'}
     return m.get(str(ct).lower(), str(ct).capitalize() if ct else 'Cultivo')
 
@@ -182,6 +193,15 @@ def crop_ndvi_range(ct):
     if 'viñ' in cl or 'vid' in cl or 'vine' in cl: return '0.40–0.60'
     if 'almend' in cl or 'almond' in cl: return '0.50–0.70'
     return '0.45–0.65'
+
+def _safe_fmt(val, decimals=1, suffix='', fallback='N/A'):
+    """Format numérico seguro — devuelve fallback si es None/NaN/0."""
+    if val is None or val == 0:
+        return fallback
+    try:
+        return f"{float(val):.{decimals}f}{suffix}"
+    except:
+        return fallback
 
 
 # ============================================================
@@ -225,124 +245,59 @@ class SectionDivider(Flowable):
         self.canv.line(0, 0, self._width, 0)
 
 
-# ============================================================
-# 5. MARKDOWN → REPORTLAB PARSER
-# ============================================================
+class RecommendationCard(Flowable):
+    """Card visual para una recomendación con borde lateral coloreado."""
+    def __init__(self, number, title, priority, deadline, trigger, zone,
+                 justification, styles, width=170*mm):
+        Flowable.__init__(self)
+        self.number = number
+        self.title = title
+        self.priority = priority
+        self.deadline = deadline
+        self.trigger = trigger
+        self.zone = zone
+        self.justification = justification
+        self.styles = styles
+        self._width = width
 
-def md_to_flowables(md_text: str, styles) -> List:
-    if not md_text:
-        return [Paragraph("<i>Análisis no disponible.</i>", styles['Body'])]
+        pc = {'Alta': C['red'], 'Media': C['gold'], 'Baja': C['green']}.get(priority, C['gold'])
+        self.border_color = colors.HexColor(pc)
 
-    elements = []
-    lines = md_text.split('\n')
-    i = 0
+        text = (
+            f'<b>{number}. {title}</b>  '
+            f'<font color="{pc}">● Prioridad: {priority}</font> | '
+            f'Plazo: {deadline}<br/>'
+            f'<font size="9">'
+            f'<b>Trigger:</b> {trigger}<br/>'
+            f'<b>Zona:</b> {zone}<br/>'
+            f'<b>Justificación:</b> {justification}'
+            f'</font>'
+        )
+        self._para = Paragraph(text, styles['Body'])
+        w, h = self._para.wrap(width - 10*mm, 500*mm)
+        self._height = h + 8*mm
 
-    while i < len(lines):
-        line = lines[i].strip()
+    def wrap(self, availWidth, availHeight):
+        return self._width, self._height
 
-        if not line:
-            elements.append(Spacer(1, 2*mm))
-            i += 1
-            continue
-
-        if line.startswith('---'):
-            elements.append(Spacer(1, 3*mm))
-            i += 1
-            continue
-
-        if line.startswith('## '):
-            title = _clean_md(line[3:])
-            elements.append(Spacer(1, 4*mm))
-            elements.append(Paragraph(title, styles['SectionTitle']))
-            elements.append(SectionDivider())
-            elements.append(Spacer(1, 2*mm))
-            i += 1
-            continue
-
-        if line.startswith('### '):
-            title = _clean_md(line[4:])
-            elements.append(Paragraph(title, styles['SubsectionTitle']))
-            i += 1
-            continue
-
-        if line.startswith('- ') or line.startswith('• '):
-            text = _clean_md(line[2:])
-            elements.append(Paragraph(f'▸ {text}', styles['BodySmall']))
-            i += 1
-            continue
-
-        if line.startswith('|'):
-            table_lines = []
-            while i < len(lines) and lines[i].strip().startswith('|'):
-                table_lines.append(lines[i].strip())
-                i += 1
-            elements.append(_build_md_table(table_lines, styles))
-            elements.append(Spacer(1, 2*mm))
-            continue
-
-        text = _clean_md(line)
-        elements.append(Paragraph(text, styles['Body']))
-        i += 1
-
-    return elements
-
-
-def _clean_md(text: str) -> str:
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
-    text = text.replace('**', '').replace('*', '')
-    text = text.replace('&', '&amp;')
-    text = re.sub(r'<(/?)b>', lambda m: f'<{m.group(1)}b>', text)
-    text = re.sub(r'<(/?)i>', lambda m: f'<{m.group(1)}i>', text)
-    return text
-
-
-def _build_md_table(lines, styles) -> Table:
-    rows = []
-    for line in lines:
-        cells = [c.strip() for c in line.split('|')[1:-1]]
-        if cells and all(c.replace('-','').replace(':','').strip() == '' for c in cells):
-            continue
-        rows.append(cells)
-
-    if not rows:
-        return Spacer(1, 1*mm)
-
-    table_data = []
-    for r_idx, row in enumerate(rows):
-        tr = []
-        for cell in row:
-            clean = _clean_md(cell)
-            if r_idx == 0:
-                tr.append(Paragraph(clean, styles['TableHeader']))
-            else:
-                tr.append(Paragraph(clean, styles['TableCell']))
-        table_data.append(tr)
-
-    n_cols = max(len(r) for r in table_data) if table_data else 1
-    col_w = 170*mm / n_cols
-
-    tbl = Table(table_data, colWidths=[col_w]*n_cols)
-    style_cmds = [
-        ('BACKGROUND', (0,0), (-1,0), hex_color('table_header')),
-        ('TEXTCOLOR', (0,0), (-1,0), hex_color('white')),
-        ('BACKGROUND', (0,1), (-1,-1), hex_color('white')),
-        ('GRID', (0,0), (-1,-1), 0.5, hex_color('cream_dark')),
-        ('BOX', (0,0), (-1,-1), 1, hex_color('table_header')),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('TOPPADDING', (0,0), (-1,-1), 5),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
-    ]
-    for r in range(1, len(table_data)):
-        if r % 2 == 0:
-            style_cmds.append(('BACKGROUND', (0,r), (-1,r), hex_color('cream')))
-    tbl.setStyle(TableStyle(style_cmds))
-    return tbl
+    def draw(self):
+        c = self.canv
+        w, h = self._width, self._height
+        # Background
+        c.setFillColor(hex_color('white'))
+        c.setStrokeColor(hex_color('cream_dark'))
+        c.setLineWidth(0.5)
+        c.roundRect(0, 0, w, h, 3, fill=True, stroke=True)
+        # Left accent bar
+        c.setFillColor(self.border_color)
+        c.rect(0, 0, 3*mm, h, fill=True, stroke=False)
+        # Text
+        self._para.wrap(w - 10*mm, h)
+        self._para.drawOn(c, 5*mm, 3*mm)
 
 
 # ============================================================
-# 6. CHART GENERATION (matplotlib, corporate palette)
+# 5. CHART GENERATION (matplotlib, corporate palette)
 # ============================================================
 
 def _chart_style():
@@ -431,12 +386,7 @@ def generate_ts_chart(time_series: List[Dict], crop_type: str = 'olivar',
     return buf.getvalue()
 
 
-# ── v5.0: GAUGE NDVI CORREGIDO ──────────────────────────────
 def generate_ndvi_gauge(ndvi_mean, ndvi_p10, ndvi_p90, width_px=520, height_px=140) -> bytes:
-    """
-    v5.0: Fixed overlapping labels. Zone labels moved above Media annotation.
-    height_px increased from 120→140, ylim expanded to (-1.3, 3.2).
-    """
     _chart_style()
     fig, ax = plt.subplots(figsize=(width_px/100, height_px/100), dpi=180)
 
@@ -446,7 +396,6 @@ def generate_ndvi_gauge(ndvi_mean, ndvi_p10, ndvi_p90, width_px=520, height_px=1
                  (0.7, C['green']), (1.0, '#2D5016')])
     ax.imshow(gradient, aspect='auto', cmap=cmap, extent=[0, 1, 0, 1])
 
-    # P10 / P90 dashed lines
     ax.plot([ndvi_p10, ndvi_p10], [-0.3, 1.3], color=C['brown_dark'],
             linewidth=1.5, linestyle='--', alpha=0.7)
     ax.plot([ndvi_p90, ndvi_p90], [-0.3, 1.3], color=C['brown_dark'],
@@ -456,18 +405,13 @@ def generate_ndvi_gauge(ndvi_mean, ndvi_p10, ndvi_p90, width_px=520, height_px=1
     ax.annotate(f'P90: {ndvi_p90:.2f}', xy=(ndvi_p90, -0.5),
                 ha='center', fontsize=8, color=C['text_light'])
 
-    # Mean marker (triangle pointing down)
     ax.plot(ndvi_mean, 0.5, marker='v', markersize=14, color=C['brown_dark'], zorder=5)
-
-    # v5.0: Media label at y=1.6
     ax.annotate(f'Media: {ndvi_mean:.2f}', xy=(ndvi_mean, 1.6), ha='center',
                 fontsize=10, fontweight='bold', color=C['brown_dark'])
 
-    # Tick values at bottom
     for v in [0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]:
         ax.text(v, -1.0, f'{v:.1f}', ha='center', fontsize=7, color=C['text_muted'])
 
-    # v5.0: Zone labels ABOVE Media (y=2.5) to prevent overlap
     ax.text(0.10, 2.5, 'Estrés', ha='center', fontsize=7.5, color=C['red'], alpha=0.8)
     ax.text(0.375, 2.5, 'Bajo', ha='center', fontsize=7.5, color='#E8A838', alpha=0.8)
     ax.text(0.525, 2.5, 'Moderado', ha='center', fontsize=7.5, color=C['yellow'], alpha=0.8)
@@ -521,12 +465,11 @@ def generate_heatmap(title, mean_val, cmap_name='RdYlGn',
 
 
 # ============================================================
-# 7. MAIN PDF GENERATOR CLASS
+# 6. MAIN PDF GENERATOR CLASS
 # ============================================================
 
 class MuOrbitaPDFGenerator:
 
-    # ── v3.2: MAPEO DE CLAVES GEE → PDF ──────────────────────────
     KEY_ALIASES = {
         'NDVI_MAP':          ['NDVI_MAP', 'NDVI', 'ndvi', 'ndvi_map'],
         'NDWI_MAP':          ['NDWI_MAP', 'NDWI', 'ndwi', 'ndwi_map'],
@@ -542,10 +485,6 @@ class MuOrbitaPDFGenerator:
     }
 
     def __init__(self, data: Dict[str, Any]):
-        """
-        v4.0: Carga imágenes desde BD por job_id (prioridad 1),
-        con fallback a datos inline del payload (prioridad 2).
-        """
         self.d = data
         self.styles = get_styles()
         self.buffer = io.BytesIO()
@@ -553,65 +492,67 @@ class MuOrbitaPDFGenerator:
         self.M = 15*mm
         self.content_w = self.W - 2*self.M
 
-        # ── v4.0: Build png_map con PRIORIDAD BD ──────────────
+        # v6.0: Extraer narrativas de Claude (JSON estructurado)
+        self.narratives = data.get('narratives', {})
+        if not self.narratives:
+            # Fallback: campos sueltos en data
+            for key in ['executive_summary', 'integrated_interpretation',
+                        'map_ndvi', 'map_ndwi', 'map_evi', 'map_ndci',
+                        'temporal_analysis', 'climate_assessment',
+                        'risk_hydric_level', 'risk_hydric_text',
+                        'risk_thermal_level', 'risk_thermal_text',
+                        'risk_heterogeneity_level', 'risk_heterogeneity_text',
+                        'vra_analysis', 'recommendations', 'conclusion']:
+                if key in data and data[key]:
+                    self.narratives[key] = data[key]
+
+        if self.narratives:
+            print(f"✅ PDF v6.0: {len(self.narratives)} narrative fields from Claude")
+        else:
+            print("⚠️ PDF v6.0: No narratives — using auto-generated text")
+
+        # ── Build png_map con PRIORIDAD BD ──
         self.png_map = {}
         job_id = data.get('job_id', '')
 
-        # PRIORIDAD 1: Cargar desde PostgreSQL (más fiable)
         if job_id:
             self._load_images_from_db(job_id)
 
-        # PRIORIDAD 2: Fallback a datos inline (compatibilidad con legacy)
         if not self.png_map:
-            # Source A: png_images array (from n8n pipeline)
             for img in data.get('png_images', []) or []:
                 name = img.get('name', '')
                 b64 = img.get('base64', '')
                 if name and b64 and not b64.startswith('['):
                     self.png_map[name] = b64
 
-            # Source B: images_base64 dict (directly from GEE)
             for name, b64 in (data.get('images_base64', {}) or {}).items():
                 if name and b64 and isinstance(b64, str) and not b64.startswith('['):
                     if name not in self.png_map:
                         self.png_map[name] = b64
 
-        # Log resultado
         if self.png_map:
-            sources = list(self.png_map.keys())
-            print(f"✅ PDF v5.0: png_map con {len(self.png_map)} imágenes: {sources}")
+            print(f"✅ PDF v6.0: png_map con {len(self.png_map)} imágenes: {list(self.png_map.keys())}")
         else:
-            print("⚠️ PDF v5.0: png_map VACÍO — se usarán gráficos matplotlib")
+            print("⚠️ PDF v6.0: png_map VACÍO — se usarán gráficos matplotlib")
 
     def _load_images_from_db(self, job_id: str):
-        """
-        Carga todas las imágenes satelitales desde PostgreSQL en una sola query.
-        """
         try:
             from app.services.image_provider import get_image_provider
-
             provider = get_image_provider()
             self.png_map = provider.load_all_as_map(job_id)
-
             if self.png_map:
                 print(f"✅ Loaded {len(self.png_map)} images from DB for {job_id}")
             else:
-                print(f"⚠️ No images found in DB for {job_id} — trying inline fallback")
-
+                print(f"⚠️ No images found in DB for {job_id}")
         except ImportError:
-            print("⚠️ image_provider not available, trying direct DB access...")
             self._load_images_from_db_direct(job_id)
         except Exception as e:
             print(f"⚠️ Could not load images from DB: {e}")
 
     def _load_images_from_db_direct(self, job_id: str):
-        """
-        Fallback: acceso directo a BD sin image_provider.
-        """
         try:
             from app.database import SessionLocal
             from app.models.gee_image import GEEImage
-
             db = SessionLocal()
             try:
                 images = db.query(
@@ -620,52 +561,38 @@ class MuOrbitaPDFGenerator:
                     GEEImage.job_id == job_id,
                     GEEImage.png_base64.isnot(None)
                 ).all()
-
                 for index_type, b64 in images:
                     if b64 and isinstance(b64, str) and not b64.startswith('['):
                         self.png_map[index_type] = b64
-                        size_kb = len(b64) * 3 // 4 // 1024
-                        print(f"  📷 Loaded {index_type} from DB (~{size_kb} KB)")
-
-                if self.png_map:
-                    print(f"✅ Direct DB load: {len(self.png_map)} images for {job_id}")
             finally:
                 db.close()
-
         except Exception as e:
             print(f"⚠️ Direct DB load failed: {e}")
 
     def _real_or_generated(self, name: str, fallback_bytes: bytes,
                            width_mm: float, height_mm: float) -> Image:
-        """
-        Devuelve Image con PNG real si existe en png_map,
-        o con gráfico matplotlib como fallback.
-        v3.2: Busca nombre Y todos sus aliases.
-        """
-        # Buscar por nombre directo primero
         if name in self.png_map:
-            print(f"   🛰️  Usando composite GEE: {name}")
             img_bytes = base64.b64decode(self.png_map[name])
             return Image(io.BytesIO(img_bytes), width=width_mm*mm, height=height_mm*mm)
 
-        # Buscar por aliases
         aliases = self.KEY_ALIASES.get(name, [])
         for alias in aliases:
             if alias in self.png_map:
-                print(f"   🛰️  Usando composite GEE: {alias} (alias de {name})")
                 img_bytes = base64.b64decode(self.png_map[alias])
                 return Image(io.BytesIO(img_bytes), width=width_mm*mm, height=height_mm*mm)
 
-        print(f"   📊  Fallback matplotlib: {name} (no encontrado en png_map: {list(self.png_map.keys())})")
         return Image(io.BytesIO(fallback_bytes), width=width_mm*mm, height=height_mm*mm)
 
-    # --- Header / Footer ---
+    def _get_narrative(self, key: str, fallback: str = '') -> str:
+        """Obtiene narrativa de Claude con fallback."""
+        return self.narratives.get(key, fallback) or fallback
+
+    # ── Header / Footer ──
     def _header_footer(self, cvs, doc):
         cvs.saveState()
 
         cvs.setFillColor(hex_color('cream'))
         cvs.rect(0, self.H - 20*mm, self.W, 20*mm, fill=True, stroke=False)
-
         cvs.setStrokeColor(hex_color('cream_dark'))
         cvs.setLineWidth(0.8)
         cvs.line(0, self.H - 20*mm, self.W, self.H - 20*mm)
@@ -693,8 +620,7 @@ class MuOrbitaPDFGenerator:
 
         cvs.restoreState()
 
-    # --- Cover Page ---
-    # v5.0: card_h increased from 72→80mm, row spacing 8→9mm
+    # ── Cover Page ──
     def _draw_cover(self, cvs, doc):
         cvs.saveState()
 
@@ -738,7 +664,6 @@ class MuOrbitaPDFGenerator:
 
         card_x = self.M + 8*mm
         card_w = self.W - 2*self.M - 16*mm
-        # v5.0: card_h 72→80mm to fix last row being cut off
         card_h = 80*mm
         card_y = band_y - 15*mm - card_h
 
@@ -775,7 +700,6 @@ class MuOrbitaPDFGenerator:
             val_display = value if len(str(value)) < 42 else str(value)[:39] + '...'
             cvs.drawRightString(card_x + card_w - 14*mm, row_y, val_display)
 
-            # v5.0: row spacing 8→9mm for breathing room
             row_y -= 3*mm
             cvs.setStrokeColor(hex_color('cream_dark'))
             cvs.setLineWidth(0.3)
@@ -794,7 +718,7 @@ class MuOrbitaPDFGenerator:
 
         cvs.restoreState()
 
-    # --- KPI Cards ---
+    # ── KPI Cards ──
     def _kpi_cards(self) -> Table:
         d = self.d
         s = self.styles
@@ -836,7 +760,7 @@ class MuOrbitaPDFGenerator:
         ]))
         return tbl
 
-    # --- Detail Table ---
+    # ── Detail Table ──
     def _detail_table(self) -> Table:
         d = self.d
         s = self.styles
@@ -882,7 +806,79 @@ class MuOrbitaPDFGenerator:
         tbl.setStyle(TableStyle(style_cmds))
         return tbl
 
-    # --- Risk Table ---
+    # ── v6.0: Weather ERA5 Table ──
+    def _weather_table(self) -> Optional[Table]:
+        """Tabla de condiciones climáticas ERA5. Retorna None si no hay datos."""
+        d = self.d
+        s = self.styles
+
+        # Buscar datos en múltiples ubicaciones posibles
+        tmax = d.get('weather_tmax_mean') or self.narratives.get('weather_tmax_mean')
+        precip = d.get('weather_precip_total') or self.narratives.get('weather_precip_total')
+        balance = d.get('weather_water_balance') or self.narratives.get('weather_water_balance')
+        gdd = d.get('weather_gdd') or d.get('weather_gdd_base10')
+        heat = d.get('weather_heat_days', 0)
+        frost = d.get('weather_frost_days', 0)
+        et = d.get('weather_et_total')
+        rain_days = d.get('weather_rain_days', 0)
+        lst = d.get('lst_mean_c', 0)
+
+        # Si no hay ningún dato ERA5, solo mostrar LST
+        has_era5 = any(v is not None and v != 0 for v in [tmax, precip, balance, gdd])
+
+        rows_data = [
+            ['Parámetro', 'Valor', 'Interpretación'],
+        ]
+
+        if lst:
+            rows_data.append(['LST media (MODIS)', f'{lst:.1f} ºC', 'Temperatura superficial del cultivo'])
+
+        if has_era5:
+            if tmax:
+                rows_data.append(['Tmax media (ERA5)', f'{float(tmax):.1f} ºC', 'Temperatura máxima promedio aire'])
+            if precip:
+                rows_data.append(['Precipitación total', f'{float(precip):.1f} mm ({rain_days} días)', 'Aporte hídrico del período'])
+            if et:
+                rows_data.append(['Evapotranspiración', f'{float(et):.1f} mm', 'Demanda hídrica del cultivo'])
+            if balance is not None:
+                bal_val = float(balance)
+                bal_interp = 'Superávit hídrico' if bal_val > 0 else 'Déficit hídrico'
+                rows_data.append(['Balance hídrico (P-ET)', f'{bal_val:+.1f} mm', bal_interp])
+            if heat > 0:
+                rows_data.append(['Días Tmax ≥ 35 ºC', str(heat), 'Estrés térmico acumulado'])
+            if frost > 0:
+                rows_data.append(['Días helada (Tmin ≤ 0 ºC)', str(frost), 'Riesgo de daño por frío'])
+            if gdd:
+                rows_data.append(['GDD acumulados (base 10 ºC)', f'{float(gdd):.0f}', 'Desarrollo fenológico acumulado'])
+
+        if len(rows_data) < 2:
+            return None
+
+        data = []
+        for r_idx, row in enumerate(rows_data):
+            tr = []
+            for c_idx, cell in enumerate(row):
+                st = s['TableHeader'] if r_idx == 0 else (s['TableCellLeft'] if c_idx in [0, 2] else s['TableCell'])
+                tr.append(Paragraph(str(cell), st))
+            data.append(tr)
+
+        cw = [45*mm, 40*mm, 85*mm]
+        tbl = Table(data, colWidths=cw)
+        style_cmds = [
+            ('BACKGROUND',(0,0),(-1,0), hex_color('table_header')),
+            ('TEXTCOLOR',(0,0),(-1,0), hex_color('white')),
+            ('GRID',(0,0),(-1,-1), 0.5, hex_color('cream_dark')),
+            ('BOX',(0,0),(-1,-1), 1, hex_color('table_header')),
+            ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+            ('TOPPADDING',(0,0),(-1,-1), 5),
+            ('BOTTOMPADDING',(0,0),(-1,-1), 5),
+        ]
+        for r in range(2, len(data), 2):
+            style_cmds.append(('BACKGROUND',(0,r),(-1,r), hex_color('cream')))
+        tbl.setStyle(TableStyle(style_cmds))
+        return tbl
+
+    # ── v6.0: Risk Table with narrative texts ──
     def _risk_table(self) -> Table:
         d = self.d
         s = self.styles
@@ -891,36 +887,57 @@ class MuOrbitaPDFGenerator:
         ndvi_m = d.get('ndvi_mean', 0)
         hetero = d.get('ndvi_p90', 0) - d.get('ndvi_p10', 0)
 
-        def risk_row(name, level, indicator, action, color_key):
-            dot = f'<font color="{C[color_key]}">●</font>'
+        # Get levels from Claude narratives or auto-calculate
+        h_lvl = self._get_narrative('risk_hydric_level', '')
+        t_lvl = self._get_narrative('risk_thermal_level', '')
+        hh_lvl = self._get_narrative('risk_heterogeneity_level', '')
+
+        # Auto-calculate if no narratives
+        if not h_lvl:
+            if ndwi_m < 0:    h_lvl = 'Alto'
+            elif ndwi_m<0.10: h_lvl = 'Moderado'
+            else:             h_lvl = 'Bajo'
+
+        if not t_lvl:
+            heat = d.get('weather_heat_days', 0)
+            if heat > 5:      t_lvl = 'Alto'
+            elif heat > 0:    t_lvl = 'Moderado'
+            else:             t_lvl = 'Bajo'
+
+        if not hh_lvl:
+            if hetero > 0.25: hh_lvl = 'Alta'
+            elif hetero>0.15: hh_lvl = 'Media'
+            else:             hh_lvl = 'Baja'
+
+        def color_for_level(lvl):
+            ll = str(lvl).lower()
+            if ll in ['alto', 'alta']: return 'red'
+            if ll in ['moderado', 'media', 'medio']: return 'yellow'
+            return 'green'
+
+        def risk_row(name, level, indicator, detail_text):
+            c_key = color_for_level(level)
+            dot = f'<font color="{C[c_key]}">●</font>'
             return [
                 Paragraph(name, s['TableCellLeft']),
                 Paragraph(f'{dot} {level}', s['TableCell']),
                 Paragraph(indicator, s['TableCell']),
-                Paragraph(action, s['TableCellLeft']),
+                Paragraph(detail_text if detail_text else '—', s['TableCellWrap']),
             ]
 
-        if ndwi_m < 0:    h_lvl, h_act, h_c = 'Alto', 'Verificar riego urgente', 'red'
-        elif ndwi_m<0.10: h_lvl, h_act, h_c = 'Moderado', 'Ajustar programación de riego', 'yellow'
-        else:             h_lvl, h_act, h_c = 'Bajo', 'Mantener régimen actual', 'green'
+        h_text = self._get_narrative('risk_hydric_text', f'NDWI: {ndwi_m:.2f}')
+        t_text = self._get_narrative('risk_thermal_text', f'LST: {d.get("lst_mean_c",0):.1f} ºC')
+        hh_text = self._get_narrative('risk_heterogeneity_text', f'ΔP90-P10: {hetero:.2f}')
 
-        if ndvi_m < 0.35: v_lvl, v_act, v_c = 'Alto', 'Inspección de campo urgente', 'red'
-        elif ndvi_m<0.45: v_lvl, v_act, v_c = 'Moderado', 'Planificar inspección', 'yellow'
-        else:             v_lvl, v_act, v_c = 'Bajo', 'Sin acción requerida', 'green'
-
-        if hetero > 0.25: hh_lvl, hh_act, hh_c = 'Alto', 'Implementar VRA', 'red'
-        elif hetero>0.15: hh_lvl, hh_act, hh_c = 'Moderado', 'Evaluar zonificación', 'yellow'
-        else:             hh_lvl, hh_act, hh_c = 'Bajo', 'Parcela homogénea', 'green'
-
-        header = [Paragraph(h, s['TableHeader']) for h in ['Riesgo','Nivel','Indicador','Acción sugerida']]
+        header = [Paragraph(h, s['TableHeader']) for h in ['Riesgo', 'Nivel', 'Indicador', 'Evaluación']]
         data = [
             header,
-            risk_row('Estrés hídrico', h_lvl, f'NDWI: {ndwi_m:.2f}', h_act, h_c),
-            risk_row('Déficit de vigor', v_lvl, f'NDVI: {ndvi_m:.2f}', v_act, v_c),
-            risk_row('Heterogeneidad', hh_lvl, f'ΔP90-P10: {hetero:.2f}', hh_act, hh_c),
+            risk_row('Estrés hídrico', h_lvl, f'NDWI: {ndwi_m:.2f}', h_text),
+            risk_row('Estrés térmico', t_lvl, f'LST: {d.get("lst_mean_c",0):.1f} ºC', t_text),
+            risk_row('Heterogeneidad', hh_lvl, f'Δ: {hetero:.2f}', hh_text),
         ]
 
-        cw = [38*mm, 30*mm, 38*mm, 64*mm]
+        cw = [30*mm, 24*mm, 28*mm, 88*mm]
         tbl = Table(data, colWidths=cw)
         tbl.setStyle(TableStyle([
             ('BACKGROUND',(0,0),(-1,0), hex_color('table_header')),
@@ -933,8 +950,37 @@ class MuOrbitaPDFGenerator:
         ]))
         return tbl
 
-    # --- Recommendations ---
+    # ── v6.0: Structured Recommendations from Claude JSON ──
     def _recommendations(self) -> List:
+        d = self.d
+        s = self.styles
+        elements = []
+
+        recs_from_claude = self.narratives.get('recommendations', [])
+
+        if recs_from_claude and isinstance(recs_from_claude, list) and len(recs_from_claude) > 0:
+            for i, rec in enumerate(recs_from_claude[:3], 1):
+                if isinstance(rec, dict):
+                    elements.append(RecommendationCard(
+                        number=i,
+                        title=rec.get('title', 'Acción pendiente'),
+                        priority=rec.get('priority', 'Media'),
+                        deadline=f"{rec.get('deadline_days', 14)} días",
+                        trigger=rec.get('trigger', '—'),
+                        zone=rec.get('zone', 'Toda la parcela'),
+                        justification=rec.get('justification', '—'),
+                        styles=s,
+                        width=self.content_w,
+                    ))
+                    elements.append(Spacer(1, 3*mm))
+        else:
+            # Fallback: generar recomendaciones automáticas
+            elements.extend(self._auto_recommendations())
+
+        return elements
+
+    def _auto_recommendations(self) -> List:
+        """Recomendaciones automáticas cuando Claude no devuelve JSON."""
         d = self.d
         s = self.styles
         elements = []
@@ -944,7 +990,6 @@ class MuOrbitaPDFGenerator:
         stress_pct = d.get('stress_area_pct', 0)
 
         recs = []
-
         if ndvi_m < 0.35:
             recs.append(('Inspección de campo de zonas críticas', 'Alta', '3–5 días',
                 f'NDVI = {ndvi_m:.2f} indica estrés severo',
@@ -952,57 +997,93 @@ class MuOrbitaPDFGenerator:
                 'Descartar plagas, enfermedades o fallo de riego'))
         elif ndvi_m < 0.45:
             recs.append(('Inspección visual de zonas de bajo vigor', 'Media', '7 días',
-                f'NDVI = {ndvi_m:.2f} indica vigor bajo',
-                'Zonas con menor vigor detectado',
+                f'NDVI = {ndvi_m:.2f} indica vigor bajo', 'Zonas con menor vigor',
                 'Identificar causas de bajo rendimiento vegetativo'))
         else:
             recs.append(('Monitorización de mantenimiento', 'Baja', '14 días',
-                f'NDVI = {ndvi_m:.2f} dentro de rango normal',
-                'Toda la parcela', 'Mantener detección temprana de cambios'))
+                f'NDVI = {ndvi_m:.2f} dentro de rango normal', 'Toda la parcela',
+                'Mantener detección temprana de cambios'))
 
         if ndwi_m < 0:
             recs.append(('Revisión urgente del sistema de riego', 'Alta', '3 días',
-                f'NDWI = {ndwi_m:.2f} indica déficit hídrico severo',
-                'Toda la parcela, priorizando sectores con NDWI < 0',
+                f'NDWI = {ndwi_m:.2f} indica déficit severo', 'Toda la parcela',
                 'Estrés hídrico severo puede reducir producción hasta 30%'))
         elif ndwi_m < 0.10:
             recs.append(('Ajustar programación de riego', 'Media', '7 días',
-                f'NDWI = {ndwi_m:.2f} indica déficit moderado',
-                'Sectores con menor NDWI',
-                'Prevenir escalada del estrés hídrico antes de período crítico'))
+                f'NDWI = {ndwi_m:.2f} indica déficit moderado', 'Sectores con menor NDWI',
+                'Prevenir escalada del estrés hídrico'))
         else:
             recs.append(('Mantener régimen de riego actual', 'Baja', '14 días',
-                'Estado hídrico aceptable', 'Toda la parcela',
-                'Monitorizar evolución del balance hídrico'))
+                'Estado hídrico aceptable', 'Toda la parcela', 'Monitorizar evolución'))
 
-        if stress_pct > 40:
-            recs.append(('Zonificación para aplicación variable (VRA)', 'Media', '10 días',
-                f'{stress_pct:.1f}% del área presenta estrés',
-                'Parcela completa', 'VRA optimiza uso de insumos en zonas heterogéneas'))
-        else:
-            recs.append(('Planificar fertilización según zonificación', 'Media', '14 días',
-                'Optimizar inputs según vigor diferencial',
-                'Diferenciar zonas NDVI alto vs bajo',
-                'Maximizar eficiencia del fertilizante'))
+        recs.append(('Planificar fertilización según zonificación', 'Media', '14 días',
+            'Optimizar inputs según vigor diferencial', 'Zonas NDVI alto vs bajo',
+            'Maximizar eficiencia del fertilizante'))
 
         for i, (title, priority, deadline, trigger, zone, justification) in enumerate(recs[:3], 1):
-            pc = {'Alta': C['red'], 'Media': C['yellow'], 'Baja': C['green']}[priority]
-            text = (
-                f'<b>{i}. {title}</b>  '
-                f'<font color="{pc}">● Prioridad: {priority}</font> | '
-                f'Plazo: {deadline}<br/>'
-                f'<font size="9">'
-                f'<b>Trigger:</b> {trigger}<br/>'
-                f'<b>Zona:</b> {zone}<br/>'
-                f'<b>Justificación:</b> {justification}'
-                f'</font>'
-            )
-            elements.append(Paragraph(text, s['Body']))
+            elements.append(RecommendationCard(
+                number=i, title=title, priority=priority, deadline=deadline,
+                trigger=trigger, zone=zone, justification=justification,
+                styles=s, width=self.content_w,
+            ))
             elements.append(Spacer(1, 3*mm))
 
         return elements
 
-    # --- Technical Annex ---
+    # ── VRA Analysis ──
+    def _vra_section(self) -> List:
+        """Sección VRA con tabla + narrativa."""
+        d = self.d
+        s = self.styles
+        elements = []
+
+        vra_stats = d.get('vra_stats', [])
+        vra_text = self._get_narrative('vra_analysis', '')
+
+        if not vra_stats and not vra_text:
+            return elements
+
+        elements.append(Paragraph('Zonificación VRA (Aplicación Variable)', s['SubsectionTitle']))
+
+        if vra_stats and isinstance(vra_stats, list) and len(vra_stats) > 0:
+            header = [Paragraph(h, s['TableHeader']) for h in ['Zona', 'Superficie', 'NDVI medio', 'NDWI medio', 'Recomendación']]
+            data = [header]
+            zone_colors = {'Bajo vigor': 'red', 'Vigor medio': 'yellow', 'Alto vigor': 'green'}
+            for z in vra_stats:
+                label = z.get('label', '')
+                c_key = zone_colors.get(label, 'yellow')
+                dot = f'<font color="{C[c_key]}">●</font>'
+                data.append([
+                    Paragraph(f'{dot} {label}', s['TableCellLeft']),
+                    Paragraph(f'{z.get("area_ha", 0):.1f} ha', s['TableCell']),
+                    Paragraph(f'{z.get("ndvi_mean", 0):.3f}', s['TableCell']),
+                    Paragraph(f'{z.get("ndwi_mean", 0):.3f}', s['TableCell']),
+                    Paragraph(z.get('recommendation', '—'), s['TableCellLeft']),
+                ])
+
+            cw = [32*mm, 28*mm, 28*mm, 28*mm, 54*mm]
+            tbl = Table(data, colWidths=cw)
+            tbl.setStyle(TableStyle([
+                ('BACKGROUND',(0,0),(-1,0), hex_color('table_header')),
+                ('TEXTCOLOR',(0,0),(-1,0), hex_color('white')),
+                ('GRID',(0,0),(-1,-1), 0.5, hex_color('cream_dark')),
+                ('BOX',(0,0),(-1,-1), 1, hex_color('table_header')),
+                ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+                ('TOPPADDING',(0,0),(-1,-1), 5),
+                ('BOTTOMPADDING',(0,0),(-1,-1), 5),
+            ]))
+            elements.append(tbl)
+            elements.append(Spacer(1, 3*mm))
+
+        if vra_text:
+            elements.append(CalloutBox(
+                f'<b>Análisis de zonificación:</b> {vra_text}',
+                s, accent='gold', width=self.content_w
+            ))
+
+        return elements
+
+    # ── Technical Annex ──
     def _annex(self) -> List:
         d = self.d
         s = self.styles
@@ -1014,6 +1095,7 @@ class MuOrbitaPDFGenerator:
             f'• Sentinel-2 SR Harmonized: {d.get("images_processed",0)} escenas procesadas<br/>'
             f'• Última imagen válida: {fmt_date(d.get("latest_image_date"))}<br/>'
             f'• MODIS LST: Temperatura superficial media {d.get("lst_mean_c",0):.1f} ºC<br/>'
+            f'• ERA5-Land: Datos meteorológicos del período analizado<br/>'
             f'• Resolución: 10 m (S2), 30 m (Landsat), 1 km (MODIS)<br/><br/>'
             f'<b>Umbrales de referencia ({ct})</b><br/>'
             f'• NDVI > 0.60: Vigor alto | 0.45–0.60: Moderado | &lt; 0.35: Estrés severo<br/>'
@@ -1023,7 +1105,7 @@ class MuOrbitaPDFGenerator:
             f'• Motor: Google Earth Engine<br/>'
             f'• Máscaras: QA60 + SCL (S2), QA_PIXEL (Landsat)<br/>'
             f'• Estadísticas: Media, P10, P50, P90, desviación estándar<br/>'
-            f'• Zonificación VRA: K-means (k=3) sobre [NDVI, EVI, NDWI]<br/><br/>'
+            f'• Zonificación VRA: Score compuesto (NDVI 60% + NDWI 25% + EVI 15%)<br/><br/>'
             f'<b>Índices calculados</b><br/>'
             f'• NDVI = (NIR − Red) / (NIR + Red) → Vigor vegetativo<br/>'
             f'• NDWI = (NIR − SWIR) / (NIR + SWIR) → Estado hídrico<br/>'
@@ -1033,19 +1115,21 @@ class MuOrbitaPDFGenerator:
         elements.append(Paragraph(annex, s['BodySmall']))
         return elements
 
+
     # =====================================================
-    # MAIN BUILD METHOD — v5.0 NEW ORDER
+    # MAIN BUILD METHOD — v6.0 STRUCTURED NARRATIVES
     # =====================================================
     def generate(self) -> bytes:
         """
-        v5.0: New section order:
+        v6.0: New structure — narrativas de Claude inline entre secciones visuales.
+        ELIMINADA la sección 'Análisis Agronómico' duplicada.
+
         1. Cover (Page 1)
-        2. Resumen Ejecutivo: KPIs + Interpretación + Detalle + Gauge (Page 2)
-        3. Mapas: NDVI, NDWI, EVI, NDCI en grid 2×2 (Page 3)
-        4. Evolución Temporal de Índices (Page 4)
-        5. Análisis Agronómico — Claude AI markdown (Page 5+)
-        6. Evaluación de Riesgos + Recomendaciones Prioritarias (Page N)
-        7. Anexo Técnico (Last page)
+        2. Resumen Ejecutivo: KPIs + Narrativa ejecutiva + Detalle + Gauge (Page 2)
+        3. Mapas: NDVI, NDWI, EVI, NDCI con interpretación debajo de cada par (Page 3)
+        4. Evolución Temporal + Clima ERA5 (Page 4)
+        5. Evaluación de Riesgos + VRA + Recomendaciones (Page 5-6)
+        6. Anexo Técnico (Last page)
         """
         d = self.d
         s = self.styles
@@ -1063,7 +1147,7 @@ class MuOrbitaPDFGenerator:
         ct = crop_label(d.get('crop_type', ''))
 
         # ════════════════════════════════════════════════════
-        # PAGE 2: RESUMEN EJECUTIVO (KPIs + Detalle + Gauge)
+        # PAGE 2: RESUMEN EJECUTIVO
         # ════════════════════════════════════════════════════
         elements.append(Spacer(1, 3*mm))
         elements.append(Paragraph('Indicadores Clave de Rendimiento', s['SectionTitle']))
@@ -1072,39 +1156,52 @@ class MuOrbitaPDFGenerator:
         elements.append(self._kpi_cards())
         elements.append(Spacer(1, 4*mm))
 
-        # Interpretación integrada
-        ndvi_m = d.get('ndvi_mean', 0)
-        stress_pct = d.get('stress_area_pct', 0)
-        hetero = d.get('ndvi_p90', 0) - d.get('ndvi_p10', 0)
+        # v6.0: Narrativa ejecutiva de Claude (o auto-generada)
+        exec_summary = self._get_narrative('executive_summary', '')
+        integrated = self._get_narrative('integrated_interpretation', '')
 
-        if stress_pct > 40:
-            interp_text = (
-                f'<b>Interpretación integrada:</b> El cultivo presenta estrés significativo. '
-                f'El NDVI medio de {ndvi_m:.2f} está por debajo del rango típico para '
-                f'{ct.lower()} ({crop_ndvi_range(d.get("crop_type",""))}). '
-                f'El {stress_pct:.1f}% de la superficie ({d.get("stress_area_ha",0):.1f} ha) '
-                f'muestra valores de estrés (NDVI &lt;0.35). Se requiere inspección de campo prioritaria.'
-            )
-            accent = 'red'
-        elif stress_pct > 15:
-            interp_text = (
-                f'<b>Interpretación integrada:</b> El cultivo presenta señales de estrés moderado. '
-                f'El NDVI medio de {ndvi_m:.2f} indica vigor por debajo del óptimo para {ct.lower()}. '
-                f'El {stress_pct:.1f}% del área ({d.get("stress_area_ha",0):.1f} ha) presenta estrés. '
-                f'Se recomienda verificar estado hídrico y condiciones de suelo.'
-            )
-            accent = 'yellow'
+        if exec_summary:
+            elements.append(CalloutBox(
+                f'<b>Resumen ejecutivo:</b> {exec_summary}',
+                s, accent='gold', width=self.content_w
+            ))
+            elements.append(Spacer(1, 3*mm))
+
+        if integrated:
+            elements.append(CalloutBox(
+                f'<b>Interpretación integrada:</b> {integrated}',
+                s, accent='green', width=self.content_w
+            ))
         else:
-            interp_text = (
-                f'<b>Interpretación integrada:</b> El cultivo muestra vigor vegetativo '
-                f'dentro del rango esperado. El NDVI medio de {ndvi_m:.2f} es consistente con '
-                f'{ct.lower()} en actividad normal. Heterogeneidad intra-parcela: '
-                f'{hetero_label(d.get("ndvi_p10",0), d.get("ndvi_p90",0)).lower()} '
-                f'(rango P10-P90: {d.get("ndvi_p10",0):.2f} – {d.get("ndvi_p90",0):.2f}).'
-            )
-            accent = 'green'
+            # Fallback: interpretación auto-generada
+            ndvi_m = d.get('ndvi_mean', 0)
+            stress_pct = d.get('stress_area_pct', 0)
+            hetero = d.get('ndvi_p90', 0) - d.get('ndvi_p10', 0)
 
-        elements.append(CalloutBox(interp_text, s, accent=accent, width=self.content_w))
+            if stress_pct > 40:
+                interp_text = (
+                    f'<b>Interpretación integrada:</b> El cultivo presenta estrés significativo. '
+                    f'El NDVI medio de {ndvi_m:.2f} está por debajo del rango típico para '
+                    f'{ct.lower()} ({crop_ndvi_range(d.get("crop_type",""))}). '
+                    f'El {stress_pct:.1f}% de la superficie muestra estrés. Se requiere inspección.'
+                )
+                accent = 'red'
+            elif stress_pct > 15:
+                interp_text = (
+                    f'<b>Interpretación integrada:</b> El cultivo presenta señales de estrés moderado. '
+                    f'NDVI medio de {ndvi_m:.2f}, con {stress_pct:.1f}% del área en estrés.'
+                )
+                accent = 'yellow'
+            else:
+                interp_text = (
+                    f'<b>Interpretación integrada:</b> Vigor vegetativo dentro del rango esperado. '
+                    f'NDVI medio de {ndvi_m:.2f}, consistente con {ct.lower()} en actividad normal. '
+                    f'Heterogeneidad: {hetero_label(d.get("ndvi_p10",0), d.get("ndvi_p90",0)).lower()} '
+                    f'(P10-P90: {d.get("ndvi_p10",0):.2f}–{d.get("ndvi_p90",0):.2f}).'
+                )
+                accent = 'green'
+            elements.append(CalloutBox(interp_text, s, accent=accent, width=self.content_w))
+
         elements.append(Spacer(1, 4*mm))
 
         # Detalle de Índices
@@ -1112,17 +1209,16 @@ class MuOrbitaPDFGenerator:
         elements.append(self._detail_table())
         elements.append(Spacer(1, 4*mm))
 
-        # Gauge NDVI — v5.0: height 36→42mm
+        # Gauge NDVI
         gauge_bytes = generate_ndvi_gauge(
             d.get('ndvi_mean', 0.3), d.get('ndvi_p10', 0.2), d.get('ndvi_p90', 0.4))
         elements.append(self._real_or_generated('NDVI_DISTRIBUTION', gauge_bytes, 155, 42))
 
         # ════════════════════════════════════════════════════
-        # PAGE 3: MAPAS — NDVI, NDWI, EVI, NDCI (2×2)
+        # PAGE 3: MAPAS CON INTERPRETACIÓN
         # ════════════════════════════════════════════════════
         elements.append(PageBreak())
         elements.append(Spacer(1, 3*mm))
-
         elements.append(Paragraph('Mapas de Vigor y Estado Hídrico', s['SectionTitle']))
         elements.append(SectionDivider(self.content_w))
         elements.append(Spacer(1, 2*mm))
@@ -1140,9 +1236,30 @@ class MuOrbitaPDFGenerator:
             ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
         ]))
         elements.append(maps_row1)
-        elements.append(Spacer(1, 4*mm))
 
-        # v5.0: Row 2: EVI + NDCI (NEW MAPS)
+        # v6.0: Interpretación inline NDVI + NDWI
+        map_ndvi_text = self._get_narrative('map_ndvi', '')
+        map_ndwi_text = self._get_narrative('map_ndwi', '')
+        if map_ndvi_text or map_ndwi_text:
+            captions_row1 = []
+            captions_row1.append(
+                Paragraph(f'<b>NDVI:</b> {map_ndvi_text}' if map_ndvi_text else '',
+                          s['MapCaption'])
+            )
+            captions_row1.append(
+                Paragraph(f'<b>NDWI:</b> {map_ndwi_text}' if map_ndwi_text else '',
+                          s['MapCaption'])
+            )
+            cap_tbl1 = Table([captions_row1], colWidths=[83*mm, 83*mm])
+            cap_tbl1.setStyle(TableStyle([
+                ('VALIGN',(0,0),(-1,-1),'TOP'),
+                ('TOPPADDING',(0,0),(-1,-1), 1),
+            ]))
+            elements.append(cap_tbl1)
+
+        elements.append(Spacer(1, 3*mm))
+
+        # Row 2: EVI + NDCI
         evi_map_bytes = generate_heatmap('EVI (Productividad)', d.get('evi_mean', 0.25), 'YlOrRd')
         ndci_map_bytes = generate_heatmap('NDCI (Clorofila)', d.get('ndci_mean', 0.2), 'YlGn')
 
@@ -1155,9 +1272,30 @@ class MuOrbitaPDFGenerator:
             ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
         ]))
         elements.append(maps_row2)
+
+        # v6.0: Interpretación inline EVI + NDCI
+        map_evi_text = self._get_narrative('map_evi', '')
+        map_ndci_text = self._get_narrative('map_ndci', '')
+        if map_evi_text or map_ndci_text:
+            captions_row2 = []
+            captions_row2.append(
+                Paragraph(f'<b>EVI:</b> {map_evi_text}' if map_evi_text else '',
+                          s['MapCaption'])
+            )
+            captions_row2.append(
+                Paragraph(f'<b>NDCI:</b> {map_ndci_text}' if map_ndci_text else '',
+                          s['MapCaption'])
+            )
+            cap_tbl2 = Table([captions_row2], colWidths=[83*mm, 83*mm])
+            cap_tbl2.setStyle(TableStyle([
+                ('VALIGN',(0,0),(-1,-1),'TOP'),
+                ('TOPPADDING',(0,0),(-1,-1), 1),
+            ]))
+            elements.append(cap_tbl2)
+
         elements.append(Spacer(1, 2*mm))
 
-        # Dynamic note based on image source
+        # Map source note
         has_real_maps = any(
             alias in self.png_map
             for aliases in [self.KEY_ALIASES.get('NDVI_MAP', []), self.KEY_ALIASES.get('NDWI_MAP', [])]
@@ -1174,11 +1312,10 @@ class MuOrbitaPDFGenerator:
                                   s['Footnote']))
 
         # ════════════════════════════════════════════════════
-        # PAGE 4: EVOLUCIÓN TEMPORAL
+        # PAGE 4: EVOLUCIÓN TEMPORAL + CLIMA
         # ════════════════════════════════════════════════════
         elements.append(PageBreak())
         elements.append(Spacer(1, 3*mm))
-
         elements.append(Paragraph('Evolución Temporal de Índices', s['SectionTitle']))
         elements.append(SectionDivider(self.content_w))
         elements.append(Spacer(1, 2*mm))
@@ -1188,55 +1325,80 @@ class MuOrbitaPDFGenerator:
         elements.append(self._real_or_generated('TIME_SERIES', chart_bytes, 165, 60))
         elements.append(Spacer(1, 2*mm))
 
-        chart_note = (
-            f'<b>Lectura del gráfico:</b> Verde = NDVI (vigor); Azul = NDWI (agua); '
-            f'Dorado = EVI (productividad). La franja roja inferior marca estrés severo '
-            f'(NDVI &lt;0.35). La franja verde marca el rango óptimo para {ct.lower()}.'
-        )
-        if len(ts or []) < 5:
-            chart_note += ' Nota: los datos acumulados son aún insuficientes para tendencias robustas.'
-        elements.append(CalloutBox(chart_note, s, accent='gold', width=self.content_w))
-
-        # ════════════════════════════════════════════════════
-        # PAGE 5+: ANÁLISIS AGRONÓMICO (Claude AI)
-        # ════════════════════════════════════════════════════
-        elements.append(PageBreak())
-        elements.append(Spacer(1, 3*mm))
-
-        elements.append(Paragraph('Análisis Agronómico', s['SectionTitle']))
-        elements.append(SectionDivider(self.content_w))
-        elements.append(Spacer(1, 2*mm))
-
-        md = d.get('markdown_analysis', '') or d.get('analysis', '') or d.get('html_report', '')
-        if md:
-            elements.extend(md_to_flowables(md, s))
+        # v6.0: Análisis temporal de Claude
+        temporal_text = self._get_narrative('temporal_analysis', '')
+        if temporal_text:
+            elements.append(CalloutBox(
+                f'<b>Análisis de tendencia:</b> {temporal_text}',
+                s, accent='green', width=self.content_w
+            ))
         else:
-            elements.extend(self._auto_analysis())
+            chart_note = (
+                f'<b>Lectura del gráfico:</b> Verde = NDVI (vigor); Azul = NDWI (agua); '
+                f'Dorado = EVI (productividad). La franja roja marca estrés severo '
+                f'(NDVI &lt;0.35). La franja verde marca el rango óptimo para {ct.lower()}.'
+            )
+            if len(ts or []) < 5:
+                chart_note += ' Los datos acumulados son aún insuficientes para tendencias robustas.'
+            elements.append(CalloutBox(chart_note, s, accent='gold', width=self.content_w))
+
+        elements.append(Spacer(1, 5*mm))
+
+        # v6.0: Condiciones Climáticas ERA5
+        elements.append(Paragraph('Condiciones Climáticas', s['SubsectionTitle']))
+
+        weather_tbl = self._weather_table()
+        if weather_tbl:
+            elements.append(weather_tbl)
+            elements.append(Spacer(1, 3*mm))
+
+        climate_text = self._get_narrative('climate_assessment', '')
+        if climate_text:
+            elements.append(CalloutBox(
+                f'<b>Evaluación climática:</b> {climate_text}',
+                s, accent='gold', width=self.content_w
+            ))
 
         # ════════════════════════════════════════════════════
-        # PAGE N: RIESGOS + RECOMENDACIONES
+        # PAGE 5: RIESGOS + VRA
         # ════════════════════════════════════════════════════
         elements.append(PageBreak())
         elements.append(Spacer(1, 3*mm))
-
         elements.append(Paragraph('Evaluación de Riesgos', s['SectionTitle']))
         elements.append(SectionDivider(self.content_w))
         elements.append(Spacer(1, 2*mm))
         elements.append(self._risk_table())
-        elements.append(Spacer(1, 6*mm))
+        elements.append(Spacer(1, 5*mm))
 
+        # VRA Section
+        vra_elements = self._vra_section()
+        if vra_elements:
+            elements.extend(vra_elements)
+            elements.append(Spacer(1, 5*mm))
+
+        # ════════════════════════════════════════════════════
+        # PAGE 6: RECOMENDACIONES
+        # ════════════════════════════════════════════════════
         elements.append(Paragraph('Recomendaciones Prioritarias', s['SectionTitle']))
         elements.append(SectionDivider(self.content_w))
         elements.append(Spacer(1, 2*mm))
         elements.extend(self._recommendations())
-        elements.append(Spacer(1, 6*mm))
+        elements.append(Spacer(1, 5*mm))
+
+        # Conclusión
+        conclusion = self._get_narrative('conclusion', '')
+        if conclusion:
+            elements.append(CalloutBox(
+                f'<b>Conclusión:</b> {conclusion}',
+                s, accent='green', width=self.content_w
+            ))
+            elements.append(Spacer(1, 3*mm))
 
         # ════════════════════════════════════════════════════
         # LAST PAGE: ANEXO TÉCNICO
         # ════════════════════════════════════════════════════
         elements.append(PageBreak())
         elements.append(Spacer(1, 3*mm))
-
         elements.append(Paragraph('Anexo Técnico', s['SectionTitle']))
         elements.append(SectionDivider(self.content_w))
         elements.append(Spacer(1, 2*mm))
@@ -1263,39 +1425,9 @@ class MuOrbitaPDFGenerator:
         self.buffer.seek(0)
         return self.buffer.getvalue()
 
-    def _auto_analysis(self) -> List:
-        d = self.d
-        s = self.styles
-        elements = []
-
-        ndvi_m = d.get('ndvi_mean', 0)
-        ndwi_m = d.get('ndwi_mean', 0)
-        stress_pct = d.get('stress_area_pct', 0)
-        hetero = d.get('ndvi_p90', 0) - d.get('ndvi_p10', 0)
-        ct = crop_label(d.get('crop_type', ''))
-
-        ndvi_i, _ = ndvi_status(ndvi_m)
-        ndwi_i, _ = ndwi_status(ndwi_m)
-
-        text = (
-            f'<b>Evaluación de vigor vegetativo</b><br/><br/>'
-            f'El cultivo de {ct.lower()} analizado ({d.get("area_hectares",0):.1f} ha) presenta '
-            f'un vigor vegetativo clasificado como <b>{ndvi_i.lower()}</b> '
-            f'(NDVI medio: {ndvi_m:.2f}). El rango típico para {ct.lower()} en producción '
-            f'es {crop_ndvi_range(d.get("crop_type",""))}.<br/><br/>'
-            f'El estado hídrico indica <b>{ndwi_i.lower()}</b> (NDWI: {ndwi_m:.2f}). '
-            f'El {stress_pct:.1f}% del área ({d.get("stress_area_ha",0):.1f} ha) muestra '
-            f'signos de estrés significativo (NDVI &lt;0.35).<br/><br/>'
-            f'La heterogeneidad intra-parcela es <b>{hetero_label(d.get("ndvi_p10",0), d.get("ndvi_p90",0)).lower()}</b> '
-            f'(dispersión P10-P90: {hetero:.2f})'
-            f'{", lo que sugiere considerar aplicación variable de insumos" if hetero > 0.15 else ""}.'
-        )
-        elements.append(Paragraph(text, s['Body']))
-        return elements
-
 
 # ============================================================
-# 8. PUBLIC API FUNCTION
+# 7. PUBLIC API FUNCTION
 # ============================================================
 
 def generate_muorbita_report(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1314,13 +1446,10 @@ def generate_muorbita_report(data: Dict[str, Any]) -> Dict[str, Any]:
             'pdf_size': len(pdf_bytes),
             'job_id': job_id,
             'generated_at': datetime.now().isoformat(),
+            'version': '6.0',
             'images_used': list(generator.png_map.keys()) if generator.png_map else ['matplotlib_fallback'],
-            'ndvi_mean': data.get('ndvi_mean', 0),
-            'ndvi_p10': data.get('ndvi_p10', 0),
-            'ndvi_p90': data.get('ndvi_p90', 0),
-            'ndwi_mean': data.get('ndwi_mean', 0),
-            'stress_area_ha': data.get('stress_area_ha', 0),
-            'stress_area_pct': data.get('stress_area_pct', 0),
+            'has_narratives': bool(generator.narratives),
+            'narrative_fields': list(generator.narratives.keys()) if generator.narratives else [],
         }
 
     except Exception as e:
@@ -1334,44 +1463,111 @@ def generate_muorbita_report(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================
-# 9. CLI TEST
+# 8. CLI TEST
 # ============================================================
 
 if __name__ == '__main__':
     import sys
 
     test_data = {
-        "job_id": "MUORBITA_TEST_V5",
-        "client_name": "Cliente Test",
-        "crop_type": "olive",
+        "job_id": "MUORBITA_TEST_V6",
+        "client_name": "Jairo Mejías Reyes",
+        "crop_type": "viñedo",
         "analysis_type": "baseline",
-        "area_hectares": 19.9,
-        "start_date": "2025-09-13",
-        "end_date": "2026-03-13",
+        "area_hectares": 16.5,
+        "start_date": "2025-09-14",
+        "end_date": "2026-03-14",
         "images_processed": 43,
         "latest_image_date": "2026-03-11",
-        "ndvi_mean": 0.49, "ndvi_p10": 0.39, "ndvi_p50": 0.49,
-        "ndvi_p90": 0.61, "ndvi_stddev": 0.092, "ndvi_zscore": 0.20,
-        "ndwi_mean": 0.01, "ndwi_p10": -0.069, "ndwi_p90": 0.122,
-        "evi_mean": 0.26, "evi_p10": 0.208, "evi_p90": 0.335,
-        "ndci_mean": 0.20, "savi_mean": 0.28,
-        "stress_area_ha": 1.1, "stress_area_pct": 5.8,
-        "lst_mean_c": 13.7,
-        "png_images": [],
-        "time_series": [
-            {"date": "2025-09-20", "ndvi": 0.45, "ndwi": 0.02, "evi": 0.24},
-            {"date": "2025-10-05", "ndvi": 0.44, "ndwi": 0.01, "evi": 0.23},
-            {"date": "2025-10-20", "ndvi": 0.43, "ndwi": 0.00, "evi": 0.23},
-            {"date": "2025-11-04", "ndvi": 0.44, "ndwi": 0.01, "evi": 0.24},
-            {"date": "2025-11-19", "ndvi": 0.45, "ndwi": 0.01, "evi": 0.24},
-            {"date": "2025-12-04", "ndvi": 0.46, "ndwi": 0.01, "evi": 0.25},
-            {"date": "2025-12-19", "ndvi": 0.47, "ndwi": 0.01, "evi": 0.25},
-            {"date": "2026-01-03", "ndvi": 0.47, "ndwi": 0.01, "evi": 0.25},
-            {"date": "2026-01-18", "ndvi": 0.48, "ndwi": 0.01, "evi": 0.26},
-            {"date": "2026-02-02", "ndvi": 0.48, "ndwi": 0.01, "evi": 0.26},
-            {"date": "2026-02-17", "ndvi": 0.49, "ndwi": 0.01, "evi": 0.26},
-            {"date": "2026-03-11", "ndvi": 0.49, "ndwi": 0.01, "evi": 0.26},
+        "ndvi_mean": 0.60, "ndvi_p10": 0.50, "ndvi_p50": 0.60,
+        "ndvi_p90": 0.68, "ndvi_stddev": 0.076, "ndvi_zscore": 2.27,
+        "ndwi_mean": 0.08, "ndwi_p10": 0.024, "ndwi_p90": 0.138,
+        "evi_mean": 0.31, "evi_p10": 0.259, "evi_p90": 0.363,
+        "ndci_mean": 0.28, "savi_mean": 0.32,
+        "stress_area_ha": 0.1, "stress_area_pct": 0.4,
+        "lst_mean_c": 13.8, "lst_min_c": 13.7, "lst_max_c": 13.8,
+        "heterogeneity": 0.18,
+
+        # Weather ERA5
+        "weather_tmax_mean": 18.5,
+        "weather_tmin_mean": 6.2,
+        "weather_heat_days": 0,
+        "weather_frost_days": 3,
+        "weather_gdd": 842.5,
+        "weather_precip_total": 285.0,
+        "weather_et_total": 195.0,
+        "weather_water_balance": 90.0,
+        "weather_rain_days": 28,
+
+        # VRA stats
+        "vra_stats": [
+            {"zone": 0, "label": "Bajo vigor", "recommendation": "Dosis alta", "area_ha": 3.2, "ndvi_mean": 0.52, "ndwi_mean": 0.04, "evi_mean": 0.26},
+            {"zone": 1, "label": "Vigor medio", "recommendation": "Dosis media", "area_ha": 7.8, "ndvi_mean": 0.60, "ndwi_mean": 0.08, "evi_mean": 0.31},
+            {"zone": 2, "label": "Alto vigor", "recommendation": "Dosis baja", "area_ha": 5.5, "ndvi_mean": 0.68, "ndwi_mean": 0.12, "evi_mean": 0.36},
         ],
+
+        # Claude narratives (simulated)
+        "narratives": {
+            "executive_summary": "El viñedo de 16.5 ha presenta un estado vegetativo excelente con NDVI de 0.60, en el límite superior del rango típico para viñedo (0.40–0.60). Solo 0.1 ha (0.4%) muestra estrés. El NDWI de 0.08 indica déficit hídrico moderado que requiere ajuste de riego antes de primavera. Acción prioritaria: revisión del sistema de riego en los sectores con NDWI más bajo.",
+            "integrated_interpretation": "Todos los índices son coherentes: el NDVI alto (0.60) se confirma con EVI robusto (0.31) y buen contenido de clorofila (NDCI 0.28). La única discrepancia es el NDWI moderado (0.08), que sugiere que pese al buen vigor actual, el contenido hídrico foliar empieza a descender. Con un balance hídrico positivo de +90 mm en el período, la reserva del suelo ha sido suficiente, pero la evapotranspiración creciente de primavera podría invertir esta situación.",
+            "map_ndvi": "El vigor se distribuye de forma relativamente homogénea, con las zonas de mayor NDVI (0.68) concentradas en el sector central-norte de la parcela. El sector sur muestra valores más bajos (P10: 0.50), posiblemente asociados a diferencias de suelo o exposición.",
+            "map_ndwi": "El estado hídrico muestra un patrón espacial similar al NDVI pero más marcado: las zonas con menor contenido de agua (NDWI 0.024) coinciden con las de menor vigor en el sector sur. No se detectan zonas con déficit severo (NDWI < 0).",
+            "map_evi": "La productividad fotosintética (EVI 0.31) confirma el patrón de vigor del NDVI. Las zonas con EVI más alto (0.36) coinciden con las de mayor NDVI, confirmando un viñedo con buena capacidad productiva.",
+            "map_ndci": "El contenido de clorofila (NDCI 0.28) es adecuado para la fase actual. No se detectan patrones de deficiencia nutricional significativa. Los valores son consistentes con un viñedo bien fertilizado.",
+            "temporal_analysis": "La serie temporal de 43 observaciones muestra una tendencia estable-ascendente desde septiembre 2025. El NDVI pasó de 0.55 en otoño a 0.60 actual, un incremento gradual coherente con la activación vegetativa post-parada invernal. No se detectan caídas abruptas ni anomalías. El NDWI se ha mantenido estable en torno a 0.08, sin deterioro significativo.",
+            "climate_assessment": "El período analizado acumuló 285 mm de precipitación frente a 195 mm de evapotranspiración, dejando un balance hídrico positivo de +90 mm. Se registraron 3 días de helada, sin impacto visible en el vigor. Con 842 GDD acumulados (base 10 ºC), el desarrollo fenológico es coherente con viñedo en fase de reposo invernal tardío a inicio de brotación. No hubo días de calor extremo (≥35 ºC).",
+            "risk_hydric_level": "Moderado",
+            "risk_hydric_text": "NDWI de 0.08 se sitúa por debajo del umbral óptimo (0.20). Aunque el balance hídrico del período es positivo (+90 mm), el contenido hídrico foliar ya muestra señales de déficit moderado. Con el aumento de temperaturas en primavera, el riesgo de estrés hídrico aumentará si no se ajusta el riego.",
+            "risk_thermal_level": "Bajo",
+            "risk_thermal_text": "Sin días de calor extremo y solo 3 heladas leves en el período. La LST media de 13.8 ºC es normal para la época. Sin impacto térmico significativo en el cultivo.",
+            "risk_heterogeneity_level": "Media",
+            "risk_heterogeneity_text": "El rango P10-P90 de 0.18 indica heterogeneidad moderada. La zonificación VRA identifica 3.2 ha de bajo vigor (19% de la parcela) en el sector sur. Se recomienda evaluar manejo diferenciado de riego y fertilización.",
+            "vra_analysis": "La zonificación identifica tres zonas claras: 5.5 ha de alto vigor (33%, sector norte) con NDVI 0.68, 7.8 ha de vigor medio (47%, sector central) con NDVI 0.60, y 3.2 ha de bajo vigor (19%, sector sur) con NDVI 0.52. La zona de bajo vigor coincide con menor NDWI (0.04), sugiriendo que el riego o la capacidad de retención del suelo son inferiores en esa área.",
+            "recommendations": [
+                {
+                    "title": "Revisión y ajuste del riego en sector sur",
+                    "priority": "Media",
+                    "deadline_days": 7,
+                    "trigger": "NDWI = 0.04 en zona de bajo vigor (3.2 ha, sector sur)",
+                    "zone": "Sector sur — zona VRA 'Bajo vigor'",
+                    "justification": "El déficit hídrico moderado en esta zona puede agravarse con el aumento de temperaturas primaverales"
+                },
+                {
+                    "title": "Fertilización diferenciada según zonificación VRA",
+                    "priority": "Media",
+                    "deadline_days": 14,
+                    "trigger": "Heterogeneidad P90-P10 = 0.18 con 3 zonas diferenciadas",
+                    "zone": "Toda la parcela — dosis según mapa VRA",
+                    "justification": "Maximizar eficiencia del fertilizante aplicando dosis alta en zona de bajo vigor y dosis reducida en zona de alto vigor"
+                },
+                {
+                    "title": "Monitorización de brotación y estado hídrico",
+                    "priority": "Baja",
+                    "deadline_days": 14,
+                    "trigger": "Inicio de fase vegetativa activa (842 GDD acumulados)",
+                    "zone": "Toda la parcela",
+                    "justification": "La transición a brotación es período crítico donde el vigor actual debe mantenerse"
+                }
+            ],
+            "conclusion": "El viñedo está en excelente estado para afrontar la campaña 2026. El principal punto de atención es el déficit hídrico moderado en el sector sur, que debe corregirse antes de que las temperaturas primaverales aumenten la demanda evapotranspirativa. Próxima revisión recomendada en 14 días para verificar evolución post-brotación."
+        },
+
+        "time_series": [
+            {"date": "2025-04-01", "ndvi": 0.35, "ndwi": 0.05, "evi": 0.20},
+            {"date": "2025-05-01", "ndvi": 0.50, "ndwi": 0.10, "evi": 0.28},
+            {"date": "2025-06-01", "ndvi": 0.62, "ndwi": 0.15, "evi": 0.33},
+            {"date": "2025-07-01", "ndvi": 0.70, "ndwi": 0.18, "evi": 0.36},
+            {"date": "2025-08-01", "ndvi": 0.65, "ndwi": 0.12, "evi": 0.34},
+            {"date": "2025-09-01", "ndvi": 0.55, "ndwi": 0.08, "evi": 0.29},
+            {"date": "2025-10-01", "ndvi": 0.48, "ndwi": 0.06, "evi": 0.25},
+            {"date": "2025-11-01", "ndvi": 0.42, "ndwi": 0.05, "evi": 0.22},
+            {"date": "2025-12-01", "ndvi": 0.40, "ndwi": 0.04, "evi": 0.21},
+            {"date": "2026-01-01", "ndvi": 0.45, "ndwi": 0.06, "evi": 0.24},
+            {"date": "2026-02-01", "ndvi": 0.55, "ndwi": 0.07, "evi": 0.28},
+            {"date": "2026-03-11", "ndvi": 0.60, "ndwi": 0.08, "evi": 0.31},
+        ],
+
+        "png_images": [],
         "markdown_analysis": ""
     }
 
@@ -1385,8 +1581,9 @@ if __name__ == '__main__':
         out_path = f"/tmp/{result['filename']}"
         with open(out_path, 'wb') as f:
             f.write(base64.b64decode(result['pdf_base64']))
-        print(f"✅ PDF v5.0 generado: {out_path} ({result['pdf_size']:,} bytes)")
-        print(f"   Imágenes usadas: {result['images_used']}")
+        print(f"✅ PDF v6.0 generado: {out_path} ({result['pdf_size']:,} bytes)")
+        print(f"   Imágenes: {result['images_used']}")
+        print(f"   Narrativas: {result['has_narratives']} ({len(result['narrative_fields'])} campos)")
     else:
         print(f"❌ Error: {result['error']}")
         print(result.get('traceback', ''))
