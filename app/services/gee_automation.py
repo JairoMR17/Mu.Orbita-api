@@ -925,13 +925,14 @@ def execute_biweekly_analysis(args):
     stored = persist_images_to_db(job_id, all_images, bounds)
 
     return {
-        'success': True, 'job_id': job_id, 'analysis_type': 'biweekly',
-        'kpis': kpis, 'weather': weather_kpis, 'weather_daily': weather_daily,
-        'bounds': bounds, 'time_series': time_series,
+        'success': True, 'job_id': job_id, 'analysis_type': 'baseline',
+        'kpis': kpis, 'vra_stats': vra_stats, 'bounds': bounds,
+        'weather': weather_kpis, 'weather_daily': weather_daily,  # ← NUEVO
+        'time_series': time_series,
         'images_stored': stored, 'images_available': list(all_images.keys()),
         'images_base64': {} if stored else all_images,
         'tasks': [], 'task_count': 0,
-        'message': f'Biweekly v5.7 complete. {len(stored)} images in DB.'
+        'message': f'Baseline v5.8 complete. {len(stored)} images in DB.'
     }
 
 
@@ -1008,6 +1009,16 @@ def execute_analysis(args):
         lst_unclipped = None
         lst_mean = lst_min = lst_max = None
 
+
+# ── ERA5 Weather (nuevo en baseline v5.8) ──
+    print("Computing ERA5 weather...")
+    try:
+        weather_kpis, weather_daily = get_era5_weather(roi, args.start_date, args.end_date)
+    except Exception as e:
+        print(f"Warning: ERA5 weather failed: {e}")
+        weather_kpis, weather_daily = {}, []
+
+   
     # VRA: sobre composite de 6 meses (coherente con mapas)
     print("Computing VRA (deterministic score)...")
     vra_image, vra_stats = calculate_vra_zones(composite_clipped, roi)
@@ -1043,6 +1054,7 @@ def execute_analysis(args):
         'bounds_east': bounds['east'] if bounds else None,
         'valid_pixels': stats.get('NDVI_count', 0)
     }
+   kpis.update(weather_kpis)
 
     print("\nGenerating all images...")
     all_images = generate_all_images(
@@ -1077,11 +1089,12 @@ def execute_analysis(args):
     return {
         'success': True, 'job_id': job_id, 'analysis_type': 'baseline',
         'kpis': kpis, 'vra_stats': vra_stats, 'bounds': bounds,
+        'weather': weather_kpis, 'weather_daily': weather_daily,  # ← NUEVO
         'time_series': time_series,
         'images_stored': stored, 'images_available': list(all_images.keys()),
         'images_base64': {} if stored else all_images,
         'tasks': [], 'task_count': 0,
-        'message': f'Baseline v5.7 complete. {len(stored)} images in DB.'
+        'message': f'Baseline v5.8 complete. {len(stored)} images in DB.'
     }
 
 
