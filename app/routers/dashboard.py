@@ -830,3 +830,251 @@ async def get_client_map_data(
         current_client=current_client,
         db=db
     )
+
+
+# =============================================================================
+#  AÑADIR AL FINAL DE app/routers/dashboard.py
+#  Justo antes del último comentario o final de archivo.
+#  Versión: PAC v1.0
+# =============================================================================
+#
+#  INSTRUCCIÓN: Pega este bloque completo al final de dashboard.py,
+#  después del último @router endpoint existente.
+#
+#  TAMBIÉN: Añadir el import al bloque de imports del archivo:
+#  import base64
+#  (solo si no existe ya)
+# =============================================================================
+
+
+# ============================================================================
+# PAC REPORTS — Generación bajo demanda e informe anual
+# ============================================================================
+
+class PacReportRequest(BaseModel):
+    parcel_id: str
+    report_type: str = "pac_inspeccion"   # "pac_inspeccion" | "pac_anual"
+    request_signature: bool = False        # True → solicita firma de agrónomo
+    year: Optional[int] = None             # Año del informe (default: año actual)
+
+
+class PacSignatureRequest(BaseModel):
+    report_id: str
+
+
+@router.post("/reports/generate-pac")
+async def generate_pac_report_endpoint(
+    req: PacReportRequest,
+    current_client = Depends(get_current_active_client),
+    db: Session = Depends(get_db)
+):
+    """
+    Genera un informe PAC on-demand para la parcela indicada.
+
+    - Lee los KPIs del último año (o del año indicado) de la BD.
+    - Evalúa las 3 condiciones PAC.
+    - Genera el PDF.
+    - Registra el report en la tabla reports con report_type = "pac_inspeccion" o "pac_anual".
+    - Si request_signature = True, marca como pendiente de firma de agrónomo.
+    - Devuelve el PDF en base64 + report_id para el dashboard.
+    """
+    import base64 as _b64
+    from app.services.generate_pac_report import generate_pac_report
+
+    # ── Verificar que la parcela pertenece al cliente ──
+    parcel = db.query(Parcel).filter(
+        Parcel.id == req.parcel_id,
+        Parcel.client_id == current_client.id,
+        Parcel.is_active == True
+    ).first()
+
+    if not parcel:
+        raise HTTPException(status_code=404, detail="Parcela no encontrada")
+
+    # ── Calcular período de análisis ──
+    year = req.year or datetime.now().year
+    period_start = date(year - 1, 3, 1)   # 1 marzo año anterior (campaña PAC)
+    period_end   = date(year, 2, 28)        # 28 febrero año actual
+
+    # Si es una inspección en año en curso, usar últimos 365 días
+    if req.report_type == 'pac_inspeccion':
+        period_end   = datetime.now().date()
+        period_start = date(period_end.year - 1, period_end.month, period_end.day)
+
+    # ── Leer KPIs del período ──
+    kpi_records_raw = (
+        db.query(Kpi)
+        .filter(
+            Kpi.parcel_id == req.parcel_id,
+            Kpi.observation_date >= period_start,
+            Kpi.observation_date <= period_end,
+            Kpi.ndvi_mean.isnot(None)
+        )
+        .order_by(Kpi.observation_date)
+        .all()
+    )
+
+    kpi_records = [
+        {
+            'observation_date': str(k.observation_date),
+            'ndvi_mean':        float(k.ndvi_mean)        if k.ndvi_mean        else None,
+            'ndwi_mean':        float(k.ndwi_mean)        if k.ndwi_mean        else None,
+            'stress_area_pct':  float(k.stress_area_pct)  if k.stress_area_pct  else None,
+            'satellite_source': k.satellite_source or 'Sentinel-2',
+        }
+        for k in kpi_records_raw
+    ]
+
+    # ── Referencia única del informe ──
+    ts  = datetime.now().strftime('%Y%m%d%H%M')
+    ref = f"PAC-{str(current_client.id)[:8].upper()}-{ts}"
+
+    sig_status = 'pending' if req.request_signature else 'not_requested'
+
+    # ── Construir payload para el generador ──
+    pdf_data = {
+        'client_name':      current_client.name,
+        'parcel_name':      parcel.parcel_name,
+        'crop_type':        parcel.crop_type,
+        'area_hectares':    float(parcel.hectares) if parcel.hectares else 0,
+        'municipality':     parcel.municipality or parcel.province or 'Andalucía, España',
+        'province':         parcel.province or 'Andalucía',
+        'period_start':     period_start,
+        'period_end':       period_end,
+        'year':             year,
+        'report_type':      req.report_type,
+        'report_ref':       ref,
+        'signature_status': sig_status,
+        'kpi_records':      kpi_records,
+    }
+
+    result = generate_pac_report(pdf_data)
+
+    if not result['success']:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generando informe PAC: {result.get('error', 'Unknown')}"
+        )
+
+    # ── Registrar en la tabla reports ──
+    # Crear un Job fantasma (PAC no tiene job GEE real — usa el último job de la parcela)
+    last_job = (
+        db.query(Job)
+        .filter(Job.parcel_id == req.parcel_id)
+        .order_by(desc(Job.created_at))
+        .first()
+    )
+
+    new_report = Report(
+        job_id=last_job.id if last_job else None,  # nullable
+        client_id=current_client.id,
+        report_type=req.report_type,
+        period_start=period_start,
+        period_end=period_end,
+        report_metadata={
+            'pac_ref':          ref,
+            'pac_status':       result['pac_status'],
+            'signature_status': sig_status,
+            'agronomist_name':  None,
+            'conditions_count': result['conditions_count'],
+            'no_conforme_count':result['no_conforme_count'],
+            'year':             year,
+            'kpi_count':        len(kpi_records),
+        }
+    )
+
+    db.add(new_report)
+    db.commit()
+    db.refresh(new_report)
+
+    # ── Si solicitó firma, notificar internamente (log por ahora) ──
+    if req.request_signature:
+        print(f"📝 PAC firma solicitada: report_id={new_report.id} | cliente={current_client.email} | ref={ref}")
+        # TODO: Enviar email a equipo Mu.Orbita con solicitud de firma
+        # Future: trigger n8n webhook for agronomist assignment
+
+    return {
+        'success':      True,
+        'report_id':    str(new_report.id),
+        'report_ref':   ref,
+        'pac_status':   result['pac_status'],
+        'pdf_base64':   result['pdf_base64'],
+        'filename':     result['filename'],
+        'pdf_size':     result['pdf_size'],
+        'signature_status': sig_status,
+        'kpi_count':    len(kpi_records),
+        'conditions':   result['conditions_count'],
+        'generated_at': result['generated_at'],
+    }
+
+
+@router.get("/reports/pac-status/{report_id}")
+async def get_pac_report_status(
+    report_id: str,
+    current_client = Depends(get_current_active_client),
+    db: Session = Depends(get_db)
+):
+    """Devuelve el estado de un informe PAC (incluyendo si tiene firma)."""
+    try:
+        rid = uuid.UUID(report_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID inválido")
+
+    report = db.query(Report).filter(
+        Report.id == rid,
+        Report.client_id == current_client.id
+    ).first()
+
+    if not report:
+        raise HTTPException(status_code=404, detail="Informe no encontrado")
+
+    meta = report.report_metadata or {}
+    return {
+        'report_id':        str(report.id),
+        'report_type':      report.report_type,
+        'pac_ref':          meta.get('pac_ref', ''),
+        'pac_status':       meta.get('pac_status', 'unknown'),
+        'signature_status': meta.get('signature_status', 'not_requested'),
+        'agronomist_name':  meta.get('agronomist_name'),
+        'generated_at':     report.generated_at.isoformat() if report.generated_at else None,
+        'pdf_url':          report.pdf_url,
+    }
+
+
+# ── Internal endpoint (Mu.Orbita team only) — update signature status ──
+# Called when the agronomist signs the report
+@router.post("/reports/pac-sign")
+async def update_pac_signature(
+    report_id: str,
+    agronomist_name: str,
+    agronomist_college: str = '',
+    x_internal_key: str = '',
+    db: Session = Depends(get_db)
+):
+    """
+    Marca un informe PAC como firmado por agrónomo.
+    Solo para uso interno de Mu.Orbita (protegido por API key interna).
+    """
+    import os
+    internal_key = os.getenv('INTERNAL_API_KEY', 'muorbita-internal-2026')
+    if x_internal_key != internal_key:
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    try:
+        rid = uuid.UUID(report_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID inválido")
+
+    report = db.query(Report).filter(Report.id == rid).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Informe no encontrado")
+
+    meta = dict(report.report_metadata or {})
+    meta['signature_status']  = 'signed'
+    meta['agronomist_name']   = agronomist_name
+    meta['agronomist_college']= agronomist_college
+    meta['signature_date']    = datetime.now().isoformat()
+    report.report_metadata    = meta
+
+    db.commit()
+    return {'success': True, 'report_id': str(report.id), 'agronomist_name': agronomist_name}
