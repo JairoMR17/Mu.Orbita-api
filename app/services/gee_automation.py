@@ -675,7 +675,20 @@ def calculate_vra_zones(composite_clipped, roi):
 
 
 # ############################################################################
-#  ERA5 WEATHER — v2.0 (optimized: fewer getInfo calls, better error logging)
+#  ERA5 WEATHER — v2.1 (FIX: buffered ROI for reduceRegion at 11km scale)
+# ############################################################################
+#
+#  ROOT CAUSE:  reduceRegion(scale=11132) on a 14 ha parcel → 0 pixel centers
+#               inside ROI → all values returned as None.
+#  FIX:         Buffer the parcel centroid by 15 km for ERA5 queries.
+#               ERA5-Land is ~11 km resolution, so buffering doesn't change
+#               the actual data — it just ensures GEE finds pixel centers.
+#
+#  OTHER FIXES:
+#  - toList(200) instead of toList(50) to cover 6-month baselines
+#  - era5.size().getInfo() upfront check
+#  - Full traceback on exception
+#  - Diagnostic print counts
 # ############################################################################
 
 def _safe_round(v, decimals=1):
@@ -684,20 +697,9 @@ def _safe_round(v, decimals=1):
 
 
 def get_era5_weather(roi, start_date, end_date):
-    """
-    Fetch ERA5-Land daily weather KPIs for a given ROI and date range.
-    
-    v2.0 changes vs v1:
-    - Added era5.size().getInfo() check upfront (detects empty collection early)
-    - Added full traceback logging on failure
-    - toList cap raised to 200 (covers 6-month baseline)
-    - Defensive None checks on all getInfo() results
-    - Prints diagnostic counts for debugging
-    """
     weather_kpis = {}
     daily_series = []
 
-    # ── Keys we must always return (even if all None) ──
     ALL_KEYS = [
         'weather_tmax_mean', 'weather_tmax_max',
         'weather_tmin_mean', 'weather_tmin_min',
@@ -708,31 +710,40 @@ def get_era5_weather(roi, start_date, end_date):
     ]
 
     try:
-        era5 = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
-                .filterDate(start_date, end_date).filterBounds(roi))
+        # ══════════════════════════════════════════════════════════════
+        #  FIX PRINCIPAL: Buffer the ROI for ERA5 queries
+        #  ERA5-Land pixel = ~11 km. Parcels are typically <1 km wide.
+        #  reduceRegion at scale=11132 needs pixel CENTERS inside the
+        #  geometry. A 15 km buffer around the centroid guarantees this.
+        # ══════════════════════════════════════════════════════════════
+        era5_roi = roi.centroid().buffer(15000)   # 15 km buffer
+        print(f"  ERA5 ROI: parcel centroid buffered to 15 km radius")
 
-        # ── CHECK 1: Does the collection have any images? ──
+        era5 = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+                .filterDate(start_date, end_date).filterBounds(era5_roi))
+
+        # ── Check: any images? ──
         n_images = era5.size().getInfo()
         print(f"  ERA5 images in range [{start_date} → {end_date}]: {n_images}")
         if n_images == 0:
-            print("  WARNING: ERA5 collection is EMPTY — possibly date range too recent (ERA5 has ~5-day latency)")
+            print("  WARNING: ERA5 collection EMPTY (ERA5 has ~5-day latency)")
             for k in ALL_KEYS:
                 weather_kpis[k] = None
             return weather_kpis, daily_series
 
-        # ── TEMP: Convert Kelvin → Celsius, build FeatureCollection ──
+        # ── TEMP: Kelvin → Celsius ──
         temp = era5.select(['temperature_2m_max', 'temperature_2m_min']).map(
             lambda img: img.subtract(273.15).copyProperties(img, ['system:time_start']))
 
         temp_feat = temp.map(lambda img: ee.Feature(None, {
             'date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
             'tmax': img.select('temperature_2m_max').reduceRegion(
-                ee.Reducer.mean(), roi, 11132, maxPixels=1e9).get('temperature_2m_max'),
+                ee.Reducer.mean(), era5_roi, 11132, maxPixels=1e9).get('temperature_2m_max'),
             'tmin': img.select('temperature_2m_min').reduceRegion(
-                ee.Reducer.mean(), roi, 11132, maxPixels=1e9).get('temperature_2m_min'),
+                ee.Reducer.mean(), era5_roi, 11132, maxPixels=1e9).get('temperature_2m_min'),
         }))
 
-        # ── WATER: Precip (m→mm) + ET (sign flip + m→mm) ──
+        # ── WATER: precip (m→mm) + ET (sign flip, m→mm) ──
         water = era5.select(['total_precipitation_sum', 'total_evaporation_sum']).map(
             lambda img: ee.Image([
                 img.select('total_precipitation_sum').multiply(1000).rename('precip_mm'),
@@ -742,13 +753,12 @@ def get_era5_weather(roi, start_date, end_date):
         water_feat = water.map(lambda img: ee.Feature(None, {
             'date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
             'precip': img.select('precip_mm').reduceRegion(
-                ee.Reducer.mean(), roi, 11132, maxPixels=1e9).get('precip_mm'),
+                ee.Reducer.mean(), era5_roi, 11132, maxPixels=1e9).get('precip_mm'),
             'et': img.select('et_mm').reduceRegion(
-                ee.Reducer.mean(), roi, 11132, maxPixels=1e9).get('et_mm'),
+                ee.Reducer.mean(), era5_roi, 11132, maxPixels=1e9).get('et_mm'),
         }))
 
-        # ── FETCH daily lists ──
-        # Cap = 200 (covers ~6.5 months for baseline)
+        # ── Fetch daily lists (cap=200 for 6-month baseline) ──
         print("  Fetching ERA5 temp + water...")
         temp_list = temp_feat.toList(200).getInfo()
         water_list = water_feat.toList(200).getInfo()
@@ -817,7 +827,7 @@ def get_era5_weather(roi, start_date, end_date):
         weather_kpis['weather_et_total_mm'] = _safe_round(ett) if et_vals else None
         weather_kpis['weather_water_balance_mm'] = round(pt - ett, 1)
 
-        # ── WIND + SOIL MOISTURE (single getInfo call) ──
+        # ── WIND + SOIL MOISTURE ──
         print("  Fetching ERA5 wind + soil...")
         try:
             wu = era5.select('u_component_of_wind_10m').mean()
@@ -826,7 +836,7 @@ def get_era5_weather(roi, start_date, end_date):
             sm = era5.select('volumetric_soil_water_layer_1').reduce(
                 ee.Reducer.mean().combine(ee.Reducer.min(), sharedInputs=True))
             combined = wind.addBands(sm).reduceRegion(
-                ee.Reducer.mean(), roi, 11132, maxPixels=1e9).getInfo()
+                ee.Reducer.mean(), era5_roi, 11132, maxPixels=1e9).getInfo()
 
             wv_val = combined.get('wind')
             sm_m = combined.get('volumetric_soil_water_layer_1_mean')
@@ -852,7 +862,10 @@ def get_era5_weather(roi, start_date, end_date):
                 'et_mm': round(et_by_date.get(d, 0), 1),
             })
 
-        print(f"  ERA5 OK: {len(tmax_vals)} temp days, {len(precip_vals)} precip days, {len(daily_series)} daily records")
+        # ── Diagnostic summary ──
+        sample_tmax = _safe_round(tmax_vals[0]) if tmax_vals else 'N/A'
+        print(f"  ERA5 OK: {len(tmax_vals)} temp days, {len(precip_vals)} precip days, "
+              f"{len(daily_series)} daily records. Sample tmax={sample_tmax}")
 
     except Exception as e:
         import traceback
