@@ -931,6 +931,50 @@ async def generate_pac_internal(
         'generated_at': result['generated_at'],
     }
 
+
+@router.get("/clients-active")
+async def get_active_clients_for_pac(
+    x_internal_key: str = Query(""),
+    db: Session = Depends(get_db)
+):
+    """
+    Devuelve todos los clientes activos con su primera parcela activa.
+    Usado por el workflow n8n de informe PAC anual.
+    Protegido por X-Internal-Key via query param.
+    """
+    import os
+    from app.models.parcel import Parcel
+    from app.models.client import Client
+ 
+    internal_key = os.getenv('INTERNAL_API_KEY', 'muorbita-internal-2026')
+    if x_internal_key != internal_key:
+        raise HTTPException(status_code=403, detail="No autorizado")
+ 
+    clients = db.query(Client).filter(Client.is_active == True).all()
+ 
+    result = []
+    for client in clients:
+        parcel = db.query(Parcel).filter(
+            Parcel.client_id == client.id,
+            Parcel.is_active == True
+        ).first()
+ 
+        if not parcel:
+            continue
+ 
+        result.append({
+            "client_id":    str(client.id),
+            "client_name":  client.name,
+            "email":        client.email,
+            "parcel_id":    str(parcel.id),
+            "parcel_name":  parcel.parcel_name,
+            "crop_type":    parcel.crop_type,
+            "hectares":     float(parcel.hectares) if parcel.hectares else 0,
+            "province":     parcel.province or "",
+            "municipality": parcel.municipality or "",
+        })
+ 
+    return result
 # ============================================================
 # HEALTH CHECK
 # ============================================================
