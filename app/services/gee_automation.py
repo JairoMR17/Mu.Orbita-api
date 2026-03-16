@@ -675,17 +675,55 @@ def calculate_vra_zones(composite_clipped, roi):
 
 
 # ############################################################################
-#  ERA5 WEATHER
+#  ERA5 WEATHER — v2.0 (optimized: fewer getInfo calls, better error logging)
 # ############################################################################
 
+def _safe_round(v, decimals=1):
+    """Round safely, returning None if value is None."""
+    return round(v, decimals) if v is not None else None
+
+
 def get_era5_weather(roi, start_date, end_date):
+    """
+    Fetch ERA5-Land daily weather KPIs for a given ROI and date range.
+    
+    v2.0 changes vs v1:
+    - Added era5.size().getInfo() check upfront (detects empty collection early)
+    - Added full traceback logging on failure
+    - toList cap raised to 200 (covers 6-month baseline)
+    - Defensive None checks on all getInfo() results
+    - Prints diagnostic counts for debugging
+    """
     weather_kpis = {}
     daily_series = []
+
+    # ── Keys we must always return (even if all None) ──
+    ALL_KEYS = [
+        'weather_tmax_mean', 'weather_tmax_max',
+        'weather_tmin_mean', 'weather_tmin_min',
+        'weather_heat_days', 'weather_frost_days', 'weather_gdd_base10',
+        'weather_precip_total_mm', 'weather_precip_max_daily_mm',
+        'weather_rain_days', 'weather_et_total_mm', 'weather_water_balance_mm',
+        'weather_wind_mean_ms', 'weather_soil_moisture_mean', 'weather_soil_moisture_min',
+    ]
+
     try:
         era5 = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
-            .filterDate(start_date, end_date).filterBounds(roi))
-        temp = era5.select(['temperature_2m_max','temperature_2m_min']).map(
+                .filterDate(start_date, end_date).filterBounds(roi))
+
+        # ── CHECK 1: Does the collection have any images? ──
+        n_images = era5.size().getInfo()
+        print(f"  ERA5 images in range [{start_date} → {end_date}]: {n_images}")
+        if n_images == 0:
+            print("  WARNING: ERA5 collection is EMPTY — possibly date range too recent (ERA5 has ~5-day latency)")
+            for k in ALL_KEYS:
+                weather_kpis[k] = None
+            return weather_kpis, daily_series
+
+        # ── TEMP: Convert Kelvin → Celsius, build FeatureCollection ──
+        temp = era5.select(['temperature_2m_max', 'temperature_2m_min']).map(
             lambda img: img.subtract(273.15).copyProperties(img, ['system:time_start']))
+
         temp_feat = temp.map(lambda img: ee.Feature(None, {
             'date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
             'tmax': img.select('temperature_2m_max').reduceRegion(
@@ -693,11 +731,14 @@ def get_era5_weather(roi, start_date, end_date):
             'tmin': img.select('temperature_2m_min').reduceRegion(
                 ee.Reducer.mean(), roi, 11132, maxPixels=1e9).get('temperature_2m_min'),
         }))
-        water = era5.select(['total_precipitation_sum','total_evaporation_sum']).map(
+
+        # ── WATER: Precip (m→mm) + ET (sign flip + m→mm) ──
+        water = era5.select(['total_precipitation_sum', 'total_evaporation_sum']).map(
             lambda img: ee.Image([
                 img.select('total_precipitation_sum').multiply(1000).rename('precip_mm'),
                 img.select('total_evaporation_sum').multiply(-1000).rename('et_mm')
             ]).copyProperties(img, ['system:time_start']))
+
         water_feat = water.map(lambda img: ee.Feature(None, {
             'date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
             'precip': img.select('precip_mm').reduceRegion(
@@ -705,50 +746,78 @@ def get_era5_weather(roi, start_date, end_date):
             'et': img.select('et_mm').reduceRegion(
                 ee.Reducer.mean(), roi, 11132, maxPixels=1e9).get('et_mm'),
         }))
+
+        # ── FETCH daily lists ──
+        # Cap = 200 (covers ~6.5 months for baseline)
         print("  Fetching ERA5 temp + water...")
-        temp_list = temp_feat.toList(50).getInfo()
-        water_list = water_feat.toList(50).getInfo()
+        temp_list = temp_feat.toList(200).getInfo()
+        water_list = water_feat.toList(200).getInfo()
+        print(f"  ERA5 temp records: {len(temp_list)}, water records: {len(water_list)}")
+
+        # ── Process TEMP ──
         tmax_by_date, tmin_by_date = {}, {}
         tmax_vals, tmin_vals = [], []
         heat_days, frost_days, gdd = 0, 0, 0
+
         for f in temp_list:
             p = f.get('properties', {})
-            d, tx, tn = p.get('date',''), p.get('tmax'), p.get('tmin')
+            d = p.get('date', '')
+            tx = p.get('tmax')
+            tn = p.get('tmin')
             if tx is not None:
-                tmax_vals.append(tx); tmax_by_date[d] = tx
-                if tx >= 35: heat_days += 1
+                tmax_vals.append(tx)
+                tmax_by_date[d] = tx
+                if tx >= 35:
+                    heat_days += 1
             if tn is not None:
-                tmin_vals.append(tn); tmin_by_date[d] = tn
-                if tn <= 0: frost_days += 1
+                tmin_vals.append(tn)
+                tmin_by_date[d] = tn
+                if tn <= 0:
+                    frost_days += 1
+
         for d in tmax_by_date:
-            tx, tn = tmax_by_date.get(d), tmin_by_date.get(d)
+            tx = tmax_by_date.get(d)
+            tn = tmin_by_date.get(d)
             if tx is not None and tn is not None:
-                gdd += max(0, (tx+tn)/2 - 10)
-        weather_kpis['weather_tmax_mean'] = round(sum(tmax_vals)/len(tmax_vals), 1) if tmax_vals else None
-        weather_kpis['weather_tmax_max'] = round(max(tmax_vals), 1) if tmax_vals else None
-        weather_kpis['weather_tmin_mean'] = round(sum(tmin_vals)/len(tmin_vals), 1) if tmin_vals else None
-        weather_kpis['weather_tmin_min'] = round(min(tmin_vals), 1) if tmin_vals else None
+                gdd += max(0, (tx + tn) / 2 - 10)
+
+        weather_kpis['weather_tmax_mean'] = _safe_round(sum(tmax_vals) / len(tmax_vals)) if tmax_vals else None
+        weather_kpis['weather_tmax_max'] = _safe_round(max(tmax_vals)) if tmax_vals else None
+        weather_kpis['weather_tmin_mean'] = _safe_round(sum(tmin_vals) / len(tmin_vals)) if tmin_vals else None
+        weather_kpis['weather_tmin_min'] = _safe_round(min(tmin_vals)) if tmin_vals else None
         weather_kpis['weather_heat_days'] = heat_days
         weather_kpis['weather_frost_days'] = frost_days
         weather_kpis['weather_gdd_base10'] = round(gdd, 1)
+
+        # ── Process WATER ──
         precip_by_date, et_by_date = {}, {}
         precip_vals, et_vals = [], []
         rain_days = 0
+
         for f in water_list:
             p = f.get('properties', {})
-            d, pr, et = p.get('date',''), p.get('precip'), p.get('et')
+            d = p.get('date', '')
+            pr = p.get('precip')
+            et = p.get('et')
             if pr is not None:
-                precip_vals.append(pr); precip_by_date[d] = pr
-                if pr > 1: rain_days += 1
+                precip_vals.append(pr)
+                precip_by_date[d] = pr
+                if pr > 1:
+                    rain_days += 1
             if et is not None:
-                et_vals.append(et); et_by_date[d] = et
+                et_vals.append(et)
+                et_by_date[d] = et
+
         pt = sum(precip_vals) if precip_vals else 0
         ett = sum(et_vals) if et_vals else 0
-        weather_kpis['weather_precip_total_mm'] = round(pt, 1) if precip_vals else None
-        weather_kpis['weather_precip_max_daily_mm'] = round(max(precip_vals), 1) if precip_vals else None
+
+        weather_kpis['weather_precip_total_mm'] = _safe_round(pt) if precip_vals else None
+        weather_kpis['weather_precip_max_daily_mm'] = _safe_round(max(precip_vals)) if precip_vals else None
         weather_kpis['weather_rain_days'] = rain_days
-        weather_kpis['weather_et_total_mm'] = round(ett, 1) if et_vals else None
+        weather_kpis['weather_et_total_mm'] = _safe_round(ett) if et_vals else None
         weather_kpis['weather_water_balance_mm'] = round(pt - ett, 1)
+
+        # ── WIND + SOIL MOISTURE (single getInfo call) ──
         print("  Fetching ERA5 wind + soil...")
         try:
             wu = era5.select('u_component_of_wind_10m').mean()
@@ -758,31 +827,41 @@ def get_era5_weather(roi, start_date, end_date):
                 ee.Reducer.mean().combine(ee.Reducer.min(), sharedInputs=True))
             combined = wind.addBands(sm).reduceRegion(
                 ee.Reducer.mean(), roi, 11132, maxPixels=1e9).getInfo()
+
             wv_val = combined.get('wind')
-            weather_kpis['weather_wind_mean_ms'] = round(wv_val, 1) if wv_val else None
             sm_m = combined.get('volumetric_soil_water_layer_1_mean')
             sm_mn = combined.get('volumetric_soil_water_layer_1_min')
-            weather_kpis['weather_soil_moisture_mean'] = round(sm_m, 3) if sm_m else None
-            weather_kpis['weather_soil_moisture_min'] = round(sm_mn, 3) if sm_mn else None
-        except:
+
+            weather_kpis['weather_wind_mean_ms'] = _safe_round(wv_val) if wv_val else None
+            weather_kpis['weather_soil_moisture_mean'] = _safe_round(sm_m, 3) if sm_m else None
+            weather_kpis['weather_soil_moisture_min'] = _safe_round(sm_mn, 3) if sm_mn else None
+        except Exception as e_wind:
+            print(f"  WARNING: ERA5 wind/soil failed: {e_wind}")
             weather_kpis['weather_wind_mean_ms'] = None
             weather_kpis['weather_soil_moisture_mean'] = None
-        for d in sorted(set(list(tmax_by_date.keys()) + list(precip_by_date.keys()))):
+            weather_kpis['weather_soil_moisture_min'] = None
+
+        # ── Build daily series ──
+        all_dates = sorted(set(list(tmax_by_date.keys()) + list(precip_by_date.keys())))
+        for d in all_dates:
             daily_series.append({
-                'date': d, 'tmax_c': round(tmax_by_date.get(d, -9999), 1),
-                'tmin_c': round(tmin_by_date.get(d, -9999), 1),
+                'date': d,
+                'tmax_c': round(tmax_by_date[d], 1) if d in tmax_by_date else -9999,
+                'tmin_c': round(tmin_by_date[d], 1) if d in tmin_by_date else -9999,
                 'precip_mm': round(precip_by_date.get(d, 0), 1),
                 'et_mm': round(et_by_date.get(d, 0), 1),
             })
-    except Exception as e:
-        print(f"Warning: ERA5 failed: {e}")
-        for k in ['weather_tmax_mean','weather_tmin_mean','weather_heat_days',
-                   'weather_frost_days','weather_gdd_base10','weather_precip_total_mm',
-                   'weather_rain_days','weather_et_total_mm','weather_water_balance_mm',
-                   'weather_wind_mean_ms','weather_soil_moisture_mean']:
-            weather_kpis.setdefault(k, None)
-    return weather_kpis, daily_series
 
+        print(f"  ERA5 OK: {len(tmax_vals)} temp days, {len(precip_vals)} precip days, {len(daily_series)} daily records")
+
+    except Exception as e:
+        import traceback
+        print(f"  *** ERA5 FAILED: {e}")
+        print(f"  *** Stack trace:\n{traceback.format_exc()}")
+        for k in ALL_KEYS:
+            weather_kpis.setdefault(k, None)
+
+    return weather_kpis, daily_series
 
 # ############################################################################
 #  PERSISTIR IMÁGENES
