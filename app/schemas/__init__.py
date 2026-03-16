@@ -310,7 +310,7 @@ class JobResponse(JobBase):
 
 class ReportResponse(BaseModel):
     id: UUID
-    job_id: UUID
+    job_id: Optional[UUID] = None
     report_type: str
     pdf_url: Optional[str] = None
     period_start: Optional[date] = None
