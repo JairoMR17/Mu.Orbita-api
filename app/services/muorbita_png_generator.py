@@ -369,8 +369,10 @@ def png_time_series(data: Dict) -> bytes:
                 marker='^', markersize=4, markerfacecolor=P['bg'], markeredgewidth=1.2, zorder=2)
 
     # Zone labels
-    ax.text(dates[-1], 0.17, '  Estrés', fontsize=8, color=P['red'], alpha=0.6, va='center')
-    ax.text(dates[-1], 0.55, '  Óptimo', fontsize=8, color=P['green'], alpha=0.6, va='center')
+    ax.text(1.01, 0.17, 'Estrés', fontsize=8, color=P['red'], alpha=0.6,
+        va='center', transform=ax.get_yaxis_transform())
+    ax.text(1.01, 0.55, 'Óptimo', fontsize=8, color=P['green'], alpha=0.6,
+        va='center', transform=ax.get_yaxis_transform())
 
     ax.set_ylabel('Valor del índice', fontsize=10)
     ax.set_title(f'Evolución Temporal de Índices — {crop}', pad=12, fontsize=13)
@@ -378,7 +380,9 @@ def png_time_series(data: Dict) -> bytes:
     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=10))
     plt.xticks(rotation=30, ha='right')
     ax.set_ylim(-0.15, 1.0)
-    ax.legend(loc='upper right', fontsize=9, framealpha=0.9, edgecolor=P['border'])
+    ax.legend(loc='lower center', bbox_to_anchor=(0.5, 1.02), ncol=3,
+          fontsize=9, framealpha=0.9, edgecolor=P['border'],
+          borderpad=0.4, columnspacing=1.5)
     ax.grid(True, alpha=0.3)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
@@ -386,7 +390,7 @@ def png_time_series(data: Dict) -> bytes:
     fig.text(0.5, -0.02, f'© {datetime.now().year} Mu.Orbita — Período: {_fmt_date(data.get("start_date"))} → {_fmt_date(data.get("end_date"))}',
              ha='center', fontsize=7, color=P['text_muted'])
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     return _save_png(fig)
 
 
