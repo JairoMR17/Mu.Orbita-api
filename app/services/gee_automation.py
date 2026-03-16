@@ -115,7 +115,7 @@ VIZ_PALETTES = {
 def parse_args():
     parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.7')
     parser.add_argument('--mode', required=True,
-                        choices=['execute','check-status','download-results','start-tasks'])
+                        choices=['','check-status','download-results','start-tasks'])
     parser.add_argument('--job-id', required=True)
     parser.add_argument('--roi', help='GeoJSON string of ROI')
     parser.add_argument('--start-date', help='Start date YYYY-MM-DD')
@@ -976,10 +976,21 @@ def execute_biweekly_analysis(args):
         for f in ts.toList(100).getInfo():
             p = f.get('properties', {})
             if p.get('date'):
-                time_series.append({'date': p['date'],
-                    'ndvi': round(p.get('NDVI_mean',0) or 0, 3),
-                    'ndwi': round(p.get('NDWI_mean',0) or 0, 3),
-                    'evi': round(p.get('EVI_mean',0) or 0, 3)})
+                ndvi_val = round(p.get('NDVI_mean', 0) or 0, 3)
+                ndwi_val = round(p.get('NDWI_mean', 0) or 0, 3)
+                evi_val = round(p.get('EVI_mean', 0) or 0, 3)
+                # ── Outlier filter: skip cloud artifacts ──
+                # NDVI < 0.05 on vegetated crops is physically impossible
+                # (bare soil still gives ~0.10). Skip these points.
+                if ndvi_val < 0.05:
+                    print(f"  ⚠️ TS outlier skipped: {p['date']} NDVI={ndvi_val}")
+                    continue
+                time_series.append({
+                    'date': p['date'],
+                    'ndvi': ndvi_val,
+                    'ndwi': ndwi_val,
+                    'evi': evi_val
+                })
         time_series.sort(key=lambda x: x['date'])
         print(f"  ✓ Time series: {len(time_series)} points over 1 year")
     except Exception as e:
@@ -998,8 +1009,12 @@ def execute_biweekly_analysis(args):
         'ndvi_zscore': round(z_score, 2),
         'ndwi_mean': round(stats.get('NDWI_mean',0) or 0, 3),
         'ndwi_p10': round(stats.get('NDWI_p10',0) or 0, 3),
+        'ndwi_p50': round(stats.get('NDWI_p50',0) or 0, 3),
         'ndwi_p90': round(stats.get('NDWI_p90',0) or 0, 3),
         'evi_mean': round(stats.get('EVI_mean',0) or 0, 3),
+        'evi_p10': round(stats.get('EVI_p10',0) or 0, 3),      
+        'evi_p50': round(stats.get('EVI_p50',0) or 0, 3),       
+        'evi_p90': round(stats.get('EVI_p90',0) or 0, 3),    
         'ndci_mean': round(stats.get('NDCI_mean',0) or 0, 3),
         'stress_area_ha': round(stress_ha, 2),
         'stress_area_pct': round(stress_pct, 1),
@@ -1128,9 +1143,11 @@ def execute_analysis(args):
         'ndvi_zscore': round(z_score, 2),
         'ndwi_mean': round(stats.get('NDWI_mean',0) or 0, 3),
         'ndwi_p10': round(stats.get('NDWI_p10',0) or 0, 3),
+        'ndwi_p50': round(stats.get('NDWI_p50',0) or 0, 3),
         'ndwi_p90': round(stats.get('NDWI_p90',0) or 0, 3),
         'evi_mean': round(stats.get('EVI_mean',0) or 0, 3),
         'evi_p10': round(stats.get('EVI_p10',0) or 0, 3),
+        'evi_p50': round(stats.get('EVI_p50',0) or 0, 3),
         'evi_p90': round(stats.get('EVI_p90',0) or 0, 3),
         'ndci_mean': round(stats.get('NDCI_mean',0) or 0, 3),
         'savi_mean': round(stats.get('SAVI_mean',0) or 0, 3),
@@ -1167,10 +1184,21 @@ def execute_analysis(args):
         for f in ts.toList(100).getInfo():
             p = f.get('properties', {})
             if p.get('date'):
-                time_series.append({'date': p['date'],
-                    'ndvi': round(p.get('NDVI_mean',0) or 0, 3),
-                    'ndwi': round(p.get('NDWI_mean',0) or 0, 3),
-                    'evi': round(p.get('EVI_mean',0) or 0, 3)})
+                ndvi_val = round(p.get('NDVI_mean', 0) or 0, 3)
+                ndwi_val = round(p.get('NDWI_mean', 0) or 0, 3)
+                evi_val = round(p.get('EVI_mean', 0) or 0, 3)
+                # ── Outlier filter: skip cloud artifacts ──
+                # NDVI < 0.05 on vegetated crops is physically impossible
+                # (bare soil still gives ~0.10). Skip these points.
+                if ndvi_val < 0.05:
+                    print(f"  ⚠️ TS outlier skipped: {p['date']} NDVI={ndvi_val}")
+                    continue
+                time_series.append({
+                    'date': p['date'],
+                    'ndvi': ndvi_val,
+                    'ndwi': ndwi_val,
+                    'evi': evi_val
+                })
         time_series.sort(key=lambda x: x['date'])
         print(f"  ✓ Time series: {len(time_series)} points over 1 year")
     except Exception as e:
