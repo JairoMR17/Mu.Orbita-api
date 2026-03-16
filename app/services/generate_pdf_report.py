@@ -764,45 +764,83 @@ class MuOrbitaPDFGenerator:
     def _detail_table(self) -> Table:
         d = self.d
         s = self.styles
-
-        ndvi_i, _ = ndvi_status(d.get('ndvi_mean',0))
-        ndwi_i, _ = ndwi_status(d.get('ndwi_mean',0))
-
+ 
+        ndvi_i, _ = ndvi_status(d.get('ndvi_mean', 0))
+        ndwi_i, _ = ndwi_status(d.get('ndwi_mean', 0))
+ 
+        # ── Helper: format value or show '—' if missing/zero ──
+        def fv(val, decimals=2):
+            """Format value: show number or '—' if None/0/missing."""
+            if val is None or val == 0 or val == '—':
+                return '—'
+            try:
+                return f"{float(val):.{decimals}f}"
+            except (ValueError, TypeError):
+                return '—'
+ 
+        # ── EVI interpretation ──
+        evi_m = d.get('evi_mean', 0) or 0
+        if evi_m >= 0.35:
+            evi_interp = 'Productividad alta'
+        elif evi_m >= 0.25:
+            evi_interp = 'Productividad moderada'
+        elif evi_m > 0:
+            evi_interp = 'Productividad baja'
+        else:
+            evi_interp = '—'
+ 
+        # ── NDCI interpretation ──
+        ndci_m = d.get('ndci_mean', 0) or 0
+        if ndci_m >= 0.3:
+            ndci_interp = 'Clorofila adecuada'
+        elif ndci_m >= 0.2:
+            ndci_interp = 'Clorofila moderada'
+        elif ndci_m > 0:
+            ndci_interp = 'Clorofila baja'
+        else:
+            ndci_interp = '—'
+ 
         rows = [
-            ['Métrica','Media','P10','P50','P90','Interpretación'],
-            ['NDVI (Vigor)', f"{d.get('ndvi_mean',0):.2f}", f"{d.get('ndvi_p10',0):.2f}",
-             f"{d.get('ndvi_p50',0):.2f}", f"{d.get('ndvi_p90',0):.2f}", ndvi_i],
-            ['NDWI (Agua)', f"{d.get('ndwi_mean',0):.2f}", f"{d.get('ndwi_p10','—')}",
-             '—', f"{d.get('ndwi_p90','—')}", ndwi_i],
-            ['EVI (Productiv.)', f"{d.get('evi_mean',0):.2f}", f"{d.get('evi_p10','—')}",
-             '—', f"{d.get('evi_p90','—')}", '—'],
-            ['NDCI (Clorofila)', f"{d.get('ndci_mean',0):.2f}", '—','—','—','—'],
-            ['SAVI (Aj. suelo)', f"{d.get('savi_mean',0):.2f}", '—','—','—','—'],
+            ['Métrica', 'Media', 'P10', 'P50', 'P90', 'Interpretación'],
+            ['NDVI (Vigor)',
+                fv(d.get('ndvi_mean')), fv(d.get('ndvi_p10')),
+                fv(d.get('ndvi_p50')), fv(d.get('ndvi_p90')), ndvi_i],
+            ['NDWI (Agua)',
+                fv(d.get('ndwi_mean'), 3), fv(d.get('ndwi_p10'), 3),
+                fv(d.get('ndwi_p50'), 3), fv(d.get('ndwi_p90'), 3), ndwi_i],
+            ['EVI (Productiv.)',
+                fv(d.get('evi_mean'), 3), fv(d.get('evi_p10'), 3),
+                fv(d.get('evi_p50'), 3), fv(d.get('evi_p90'), 3), evi_interp],
+            ['NDCI (Clorofila)',
+                fv(d.get('ndci_mean'), 3), '—', '—', '—', ndci_interp],
+            ['SAVI (Aj. suelo)',
+                fv(d.get('savi_mean'), 3), '—', '—', '—', '—'],
         ]
-
+ 
         data = []
         for r_idx, row in enumerate(rows):
             tr = []
             for c_idx, cell in enumerate(row):
-                st = s['TableHeader'] if r_idx == 0 else (s['TableCellLeft'] if c_idx == 0 else s['TableCell'])
+                st = s['TableHeader'] if r_idx == 0 else (
+                    s['TableCellLeft'] if c_idx == 0 else s['TableCell'])
                 tr.append(Paragraph(str(cell), st))
             data.append(tr)
-
+ 
         cw = [32*mm, 22*mm, 18*mm, 18*mm, 18*mm, 62*mm]
         tbl = Table(data, colWidths=cw)
-
+ 
         style_cmds = [
-            ('BACKGROUND',(0,0),(-1,0), hex_color('table_header')),
-            ('TEXTCOLOR',(0,0),(-1,0), hex_color('white')),
-            ('GRID',(0,0),(-1,-1), 0.5, hex_color('cream_dark')),
-            ('BOX',(0,0),(-1,-1), 1, hex_color('table_header')),
-            ('ALIGN',(1,1),(-1,-1),'CENTER'),
-            ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
-            ('TOPPADDING',(0,0),(-1,-1), 5),
-            ('BOTTOMPADDING',(0,0),(-1,-1), 5),
+            ('BACKGROUND', (0, 0), (-1, 0), hex_color('table_header')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), hex_color('white')),
+            ('GRID', (0, 0), (-1, -1), 0.5, hex_color('cream_dark')),
+            ('BOX', (0, 0), (-1, -1), 1, hex_color('table_header')),
+            ('ALIGN', (1, 1), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
         ]
         for r in range(2, len(data), 2):
-            style_cmds.append(('BACKGROUND',(0,r),(-1,r), hex_color('cream')))
+            style_cmds.append(('BACKGROUND', (0, r), (-1, r), hex_color('cream')))
         tbl.setStyle(TableStyle(style_cmds))
         return tbl
 
