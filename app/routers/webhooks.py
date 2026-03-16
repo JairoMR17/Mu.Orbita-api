@@ -614,6 +614,323 @@ async def webhook_client_created(
     )
 
 
+# ── Pydantic models for PAC ──
+ 
+class PacAlert(BaseModel):
+    condition_id: str          # "abandono" | "eco_cubierta" | "hidrico"
+    condition_name: str
+    level: str                 # "low" | "high"
+    ndvi_value: Optional[float] = None
+    ndwi_value: Optional[float] = None
+    observation_date: Optional[str] = None
+    detail: str
+    suggested_action: str
+ 
+ 
+class PacCheckResponse(BaseModel):
+    parcel_id: str
+    parcel_name: str
+    crop_type: str
+    client_email: str
+    risk_level: str            # "none" | "low" | "high"
+    alerts: List[PacAlert]
+    kpis_evaluated: int
+    checked_at: str
+ 
+ 
+@router.get("/pac-check", response_model=PacCheckResponse)
+async def pac_check(
+    parcel_id: str = Query(..., description="UUID de la parcela a evaluar"),
+    db: Session = Depends(get_db)
+):
+    """
+    Evalúa 3 condiciones PAC para una parcela usando los últimos 2 KPIs almacenados.
+ 
+    Condición 1 — Riesgo abandono de cultivo:
+      NDVI < 0.25. Si los 2 últimos registros están por debajo → nivel HIGH.
+ 
+    Condición 2 — Eco-esquema cubierta vegetal (solo olivar):
+      NDVI < 0.30 en parcela de olivar → ausencia de cubierta entre filas.
+ 
+    Condición 3 — Anomalía hídrica en período de riego:
+      NDWI < 0.10 → estrés hídrico severo.
+ 
+    Requiere parcel_id con KPIs almacenados (observation_date + ndvi_mean + ndwi_mean).
+    """
+    from app.models.kpi import Kpi
+    from app.models.parcel import Parcel
+    from app.models.client import Client
+    from sqlalchemy import desc
+ 
+    # ── Fetch parcel + client ──
+    parcel = db.query(Parcel).filter(
+        Parcel.id == parcel_id,
+        Parcel.is_active == True
+    ).first()
+ 
+    if not parcel:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Parcela no encontrada o inactiva: {parcel_id}"
+        )
+ 
+    client = db.query(Client).filter(Client.id == parcel.client_id).first()
+    client_email = client.email if client else "desconocido@muorbita.com"
+ 
+    # ── Fetch last 2 KPIs ordered by observation_date desc ──
+    recent_kpis = (
+        db.query(Kpi)
+        .filter(
+            Kpi.parcel_id == parcel_id,
+            Kpi.ndvi_mean.isnot(None)
+        )
+        .order_by(desc(Kpi.observation_date))
+        .limit(2)
+        .all()
+    )
+ 
+    if not recent_kpis:
+        # No hay KPIs — no se puede evaluar, devolver sin alertas
+        return PacCheckResponse(
+            parcel_id=str(parcel_id),
+            parcel_name=parcel.parcel_name,
+            crop_type=parcel.crop_type,
+            client_email=client_email,
+            risk_level="none",
+            alerts=[],
+            kpis_evaluated=0,
+            checked_at=datetime.utcnow().isoformat()
+        )
+ 
+    latest_kpi  = recent_kpis[0]
+    previous_kpi = recent_kpis[1] if len(recent_kpis) > 1 else None
+ 
+    ndvi_latest  = float(latest_kpi.ndvi_mean) if latest_kpi.ndvi_mean else None
+    ndwi_latest  = float(latest_kpi.ndwi_mean) if latest_kpi.ndwi_mean else None
+    ndvi_prev    = float(previous_kpi.ndvi_mean) if previous_kpi and previous_kpi.ndvi_mean else None
+    obs_date_str = str(latest_kpi.observation_date) if latest_kpi.observation_date else "—"
+ 
+    crop = parcel.crop_type.lower() if parcel.crop_type else ""
+    is_olivar = any(x in crop for x in ["oliv", "olive"])
+ 
+    alerts: List[PacAlert] = []
+ 
+    # ── Condición 1: Riesgo abandono (NDVI < 0.25) ──
+    if ndvi_latest is not None and ndvi_latest < 0.25:
+        # HIGH si los 2 últimos registros están por debajo del umbral
+        two_consecutive = (ndvi_prev is not None and ndvi_prev < 0.25)
+        level = "high" if two_consecutive else "low"
+        detail = (
+            f"NDVI actual {ndvi_latest:.3f} por debajo del umbral de abandono (0.25). "
+            + (f"Registro anterior también bajo ({ndvi_prev:.3f}) — patrón persistente." if two_consecutive
+               else f"Primera detección — vigilar evolución.")
+        )
+        alerts.append(PacAlert(
+            condition_id="abandono",
+            condition_name="Riesgo abandono de cultivo",
+            level=level,
+            ndvi_value=ndvi_latest,
+            observation_date=obs_date_str,
+            detail=detail,
+            suggested_action=(
+                "Verificar en campo que el cultivo sigue activo. "
+                "Documentar con fotografías georreferenciadas antes de la próxima revisión PAC."
+            )
+        ))
+ 
+    # ── Condición 2: Eco-esquema cubierta vegetal (solo olivar, NDVI < 0.30) ──
+    if is_olivar and ndvi_latest is not None and ndvi_latest < 0.30:
+        alerts.append(PacAlert(
+            condition_id="eco_cubierta",
+            condition_name="Eco-esquema cubierta vegetal (olivar)",
+            level="low",
+            ndvi_value=ndvi_latest,
+            observation_date=obs_date_str,
+            detail=(
+                f"NDVI {ndvi_latest:.3f} indica ausencia o insuficiencia de cubierta vegetal "
+                f"entre filas. Umbral mínimo eco-esquema: 0.30."
+            ),
+            suggested_action=(
+                "Revisar estado de la cubierta vegetal entre filas. "
+                "Si no se ha sembrado, valorar establecimiento antes del próximo control PAC."
+            )
+        ))
+ 
+    # ── Condición 3: Anomalía hídrica (NDWI < 0.10) ──
+    if ndwi_latest is not None and ndwi_latest < 0.10:
+        level = "high" if ndwi_latest < 0.00 else "low"
+        alerts.append(PacAlert(
+            condition_id="hidrico",
+            condition_name="Anomalía hídrica en período de riego",
+            level=level,
+            ndwi_value=ndwi_latest,
+            observation_date=obs_date_str,
+            detail=(
+                f"NDWI {ndwi_latest:.3f} indica estrés hídrico "
+                + ("severo (< 0.00)." if ndwi_latest < 0.00 else "significativo (< 0.10).")
+                + " Puede comprometer justificación de riego en declaración PAC."
+            ),
+            suggested_action=(
+                "Revisar sistema de riego y registros de consumo de agua. "
+                "Conservar albaranes de suministro como documentación de respaldo PAC."
+            )
+        ))
+ 
+    # ── Risk level summary ──
+    if any(a.level == "high" for a in alerts):
+        risk_level = "high"
+    elif alerts:
+        risk_level = "low"
+    else:
+        risk_level = "none"
+ 
+    return PacCheckResponse(
+        parcel_id=str(parcel_id),
+        parcel_name=parcel.parcel_name,
+        crop_type=parcel.crop_type,
+        client_email=client_email,
+        risk_level=risk_level,
+        alerts=alerts,
+        kpis_evaluated=len(recent_kpis),
+        checked_at=datetime.utcnow().isoformat()
+    )
+
+
+class PacInternalRequest(BaseModel):
+    parcel_id: str
+    client_email: str
+    report_type: str = "pac_anual"
+    request_signature: bool = False
+    year: Optional[int] = None
+ 
+ 
+@router.post("/generate-pac-internal")
+async def generate_pac_internal(
+    req: PacInternalRequest,
+    x_internal_key: str = "",
+    db: Session = Depends(get_db)
+):
+    """
+    Genera un informe PAC para ser usado por el workflow n8n annual.
+    Protegido por X-Internal-Key (no requiere JWT de cliente).
+    """
+    import os, base64 as _b64
+    from datetime import date
+    from app.models.kpi import Kpi
+    from app.models.parcel import Parcel
+    from app.models.client import Client
+    from app.models.job import Job
+    from app.models.report import Report
+    from app.services.generate_pac_report import generate_pac_report
+    from sqlalchemy import desc
+ 
+    internal_key = os.getenv('INTERNAL_API_KEY', 'muorbita-internal-2026')
+    if x_internal_key != internal_key:
+        raise HTTPException(status_code=403, detail="No autorizado")
+ 
+    # Fetch parcel and client
+    parcel = db.query(Parcel).filter(
+        Parcel.id == req.parcel_id,
+        Parcel.is_active == True
+    ).first()
+    if not parcel:
+        raise HTTPException(status_code=404, detail=f"Parcela no encontrada: {req.parcel_id}")
+ 
+    client = db.query(Client).filter(Client.email == req.client_email).first()
+    if not client:
+        raise HTTPException(status_code=404, detail=f"Cliente no encontrado: {req.client_email}")
+ 
+    year = req.year or datetime.utcnow().year
+    period_start = date(year - 1, 3, 1)
+    period_end   = date(year, 2, 28)
+ 
+    kpi_records_raw = (
+        db.query(Kpi)
+        .filter(
+            Kpi.parcel_id == req.parcel_id,
+            Kpi.observation_date >= period_start,
+            Kpi.observation_date <= period_end,
+            Kpi.ndvi_mean.isnot(None)
+        )
+        .order_by(Kpi.observation_date)
+        .all()
+    )
+ 
+    kpi_records = [
+        {
+            'observation_date': str(k.observation_date),
+            'ndvi_mean':        float(k.ndvi_mean)       if k.ndvi_mean       else None,
+            'ndwi_mean':        float(k.ndwi_mean)       if k.ndwi_mean       else None,
+            'stress_area_pct':  float(k.stress_area_pct) if k.stress_area_pct else None,
+            'satellite_source': k.satellite_source or 'Sentinel-2',
+        }
+        for k in kpi_records_raw
+    ]
+ 
+    ts  = datetime.utcnow().strftime('%Y%m%d%H%M')
+    ref = f"PAC-{str(client.id)[:8].upper()}-{ts}"
+ 
+    pdf_data = {
+        'client_name':      client.name,
+        'parcel_name':      parcel.parcel_name,
+        'crop_type':        parcel.crop_type,
+        'area_hectares':    float(parcel.hectares) if parcel.hectares else 0,
+        'municipality':     parcel.municipality or parcel.province or 'Andalucía, España',
+        'province':         parcel.province or 'Andalucía',
+        'period_start':     period_start,
+        'period_end':       period_end,
+        'year':             year,
+        'report_type':      req.report_type,
+        'report_ref':       ref,
+        'signature_status': 'not_requested',
+        'kpi_records':      kpi_records,
+    }
+ 
+    result = generate_pac_report(pdf_data)
+    if not result['success']:
+        raise HTTPException(status_code=500, detail=f"PDF error: {result.get('error')}")
+ 
+    # Register in DB
+    last_job = (
+        db.query(Job)
+        .filter(Job.parcel_id == req.parcel_id)
+        .order_by(desc(Job.created_at))
+        .first()
+    )
+ 
+    new_report = Report(
+        job_id=last_job.id if last_job else None,
+        client_id=client.id,
+        report_type=req.report_type,
+        period_start=period_start,
+        period_end=period_end,
+        report_metadata={
+            'pac_ref':           ref,
+            'pac_status':        result['pac_status'],
+            'signature_status':  'not_requested',
+            'agronomist_name':   None,
+            'conditions_count':  result['conditions_count'],
+            'no_conforme_count': result['no_conforme_count'],
+            'year':              year,
+            'kpi_count':         len(kpi_records),
+        }
+    )
+    db.add(new_report)
+    db.commit()
+    db.refresh(new_report)
+ 
+    return {
+        'success':      True,
+        'report_id':    str(new_report.id),
+        'report_ref':   ref,
+        'pac_status':   result['pac_status'],
+        'pdf_base64':   result['pdf_base64'],
+        'filename':     result['filename'],
+        'pdf_size':     result['pdf_size'],
+        'kpi_count':    len(kpi_records),
+        'generated_at': result['generated_at'],
+    }
+
 # ============================================================
 # HEALTH CHECK
 # ============================================================
