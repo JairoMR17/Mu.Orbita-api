@@ -863,7 +863,7 @@ class MuOrbitaPDFGenerator:
         frost = d.get('weather_frost_days', 0)
         et = d.get('weather_et_total')
         rain_days = d.get('weather_rain_days', 0)
-        lst = d.get('lst_mean_c', 0)
+        lst = d.get('lst_mean_c')
 
         # Si no hay ningún dato ERA5, solo mostrar LST
         has_era5 = any(v is not None and v != 0 for v in [tmax, precip, balance, gdd])
@@ -872,8 +872,8 @@ class MuOrbitaPDFGenerator:
             ['Parámetro', 'Valor', 'Interpretación'],
         ]
 
-        if lst:
-            rows_data.append(['LST media (MODIS)', f'{lst:.1f} ºC', 'Temperatura superficial del cultivo'])
+        if lst is not None and lst != 0:
+          rows_data.append(['LST media (MODIS)', f'{lst:.1f} ºC', 'Temperatura superficial del cultivo'])
 
         if has_era5:
             if tmax:
@@ -968,14 +968,16 @@ class MuOrbitaPDFGenerator:
             ]
 
         h_text = self._get_narrative('risk_hydric_text', f'NDWI: {ndwi_m:.2f}')
-        t_text = self._get_narrative('risk_thermal_text', f'LST: {d.get("lst_mean_c",0):.1f} ºC')
+        lst_val = d.get('lst_mean_c')
+        lst_str = f'{lst_val:.1f} ºC' if lst_val and lst_val != 0 else 'N/D'
+        t_text = self._get_narrative('risk_thermal_text', f'LST: {lst_str}')
         hh_text = self._get_narrative('risk_heterogeneity_text', f'ΔP90-P10: {hetero:.2f}')
 
         header = [Paragraph(h, s['TableHeader']) for h in ['Riesgo', 'Nivel', 'Indicador', 'Evaluación']]
         data = [
             header,
             risk_row('Estrés hídrico', h_lvl, f'NDWI: {ndwi_m:.2f}', h_text),
-            risk_row('Estrés térmico', t_lvl, f'LST: {d.get("lst_mean_c",0):.1f} ºC', t_text),
+            risk_row('Estrés térmico', t_lvl, f'LST: {lst_str}', t_text),
             risk_row('Heterogeneidad', hh_lvl, f'Δ: {hetero:.2f}', hh_text),
         ]
 
