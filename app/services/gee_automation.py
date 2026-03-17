@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Mu.Orbita GEE Automation Script v5.7
+Mu.Orbita GEE Automation Script v5.8
 =============================================================
+
+CAMBIOS V5.8 (FIXES BIWEEKLY):
+🐛 FIX: vra_stats NameError — variable nunca definida en biweekly,
+   causaba 500 al llegar al return (el persist timeout era red herring)
+🐛 FIX: Serie temporal 0 puntos — ee.Reducer.mean() devuelve claves
+   'NDVI'/'NDWI'/'EVI', pero el código buscaba 'NDVI_mean' → siempre 0
+   → todos filtrados como outlier. Ahora usa combined reducer (=baseline)
+🐛 FIX: persist_images_to_db usa localhost:8000 en vez de URL pública
+   para evitar timeout por Varnish proxy (self-referencing loop)
+✅ OPT: Biweekly ahora genera EVI+NDCI además de NDVI+NDWI (2x2 grid PDF)
+✅ OPT: Biweekly stats incluyen SAVI para consistencia con baseline
 
 CAMBIOS V5.7:
 ✅ VRA: Score compuesto determinista (NDVI 60% + NDWI 25% + EVI 15%)
@@ -113,9 +124,9 @@ VIZ_PALETTES = {
 # ============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.7')
+    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.8')
     parser.add_argument('--mode', required=True,
-                        choices=['','check-status','download-results','start-tasks'])
+                        choices=['execute','check-status','download-results','start-tasks'])
     parser.add_argument('--job-id', required=True)
     parser.add_argument('--roi', help='GeoJSON string of ROI')
     parser.add_argument('--start-date', help='Start date YYYY-MM-DD')
@@ -175,7 +186,7 @@ def get_leaflet_overlay_png(index_image_unclipped, roi, viz_params, dimensions=5
             'region': region_coords, 'dimensions': dimensions, 'format': 'png'
         })
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.7')
+        req.add_header('User-Agent', 'MuOrbita/5.8')
         png_bytes = urllib.request.urlopen(req, timeout=60).read()
         if len(png_bytes) < 100:
             return None
@@ -217,7 +228,7 @@ def _fetch_tile(x, y, z):
     url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
     try:
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.7')
+        req.add_header('User-Agent', 'MuOrbita/5.8')
         req.add_header('Referer', 'https://muorbita.com')
         return urllib.request.urlopen(req, timeout=15).read()
     except Exception as e:
@@ -677,19 +688,6 @@ def calculate_vra_zones(composite_clipped, roi):
 # ############################################################################
 #  ERA5 WEATHER — v2.1 (FIX: buffered ROI for reduceRegion at 11km scale)
 # ############################################################################
-#
-#  ROOT CAUSE:  reduceRegion(scale=11132) on a 14 ha parcel → 0 pixel centers
-#               inside ROI → all values returned as None.
-#  FIX:         Buffer the parcel centroid by 15 km for ERA5 queries.
-#               ERA5-Land is ~11 km resolution, so buffering doesn't change
-#               the actual data — it just ensures GEE finds pixel centers.
-#
-#  OTHER FIXES:
-#  - toList(200) instead of toList(50) to cover 6-month baselines
-#  - era5.size().getInfo() upfront check
-#  - Full traceback on exception
-#  - Diagnostic print counts
-# ############################################################################
 
 def _safe_round(v, decimals=1):
     """Round safely, returning None if value is None."""
@@ -710,19 +708,12 @@ def get_era5_weather(roi, start_date, end_date):
     ]
 
     try:
-        # ══════════════════════════════════════════════════════════════
-        #  FIX PRINCIPAL: Buffer the ROI for ERA5 queries
-        #  ERA5-Land pixel = ~11 km. Parcels are typically <1 km wide.
-        #  reduceRegion at scale=11132 needs pixel CENTERS inside the
-        #  geometry. A 15 km buffer around the centroid guarantees this.
-        # ══════════════════════════════════════════════════════════════
         era5_roi = roi.centroid().buffer(15000)   # 15 km buffer
         print(f"  ERA5 ROI: parcel centroid buffered to 15 km radius")
 
         era5 = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
                 .filterDate(start_date, end_date).filterBounds(era5_roi))
 
-        # ── Check: any images? ──
         n_images = era5.size().getInfo()
         print(f"  ERA5 images in range [{start_date} → {end_date}]: {n_images}")
         if n_images == 0:
@@ -876,14 +867,25 @@ def get_era5_weather(roi, start_date, end_date):
 
     return weather_kpis, daily_series
 
+
 # ############################################################################
-#  PERSISTIR IMÁGENES
+#  PERSISTIR IMÁGENES — v5.8: usa localhost para evitar Varnish proxy timeout
 # ############################################################################
 
 def persist_images_to_db(job_id, images_base64, bounds=None):
+    """
+    Guarda imágenes en PostgreSQL vía la API /api/images/store.
+    v5.8 FIX: Usa localhost:8000 en vez del URL público.
+    Razón: GEE corre DENTRO del mismo container FastAPI en Railway.
+    Llamar al URL público (muorbita-api-production.up.railway.app) crea
+    un loop HTTP que pasa por el proxy Varnish externo, con timeout
+    de ~2 min que falla con imágenes grandes (5 PNGs = ~4 MB payload).
+    localhost evita el proxy y es instantáneo.
+    """
     if not images_base64:
         return []
-    api_base = os.environ.get('API_BASE_URL', 'https://muorbita-api-production.up.railway.app')
+    # v5.8: localhost primero (mismo container), fallback a URL público
+    api_base = os.environ.get('API_BASE_URL_INTERNAL', 'http://localhost:8000')
     try:
         payload = json.dumps({'job_id': job_id, 'images': images_base64, 'bounds': bounds}).encode()
         req = urllib.request.Request(f'{api_base}/api/images/store', data=payload,
@@ -894,22 +896,42 @@ def persist_images_to_db(job_id, images_base64, bounds=None):
             print(f"✅ Persisted {len(stored)} images: {stored}")
             return stored
     except Exception as e:
-        print(f"⚠️ Persist failed: {e}")
+        print(f"⚠️ Persist failed (localhost): {e}")
+        # v5.8: Fallback al URL público por si localhost falla
+        api_public = os.environ.get('API_BASE_URL', 'https://muorbita-api-production.up.railway.app')
+        if api_public != api_base:
+            try:
+                req2 = urllib.request.Request(f'{api_public}/api/images/store', data=payload,
+                    headers={'Content-Type': 'application/json'}, method='POST')
+                result2 = json.loads(urllib.request.urlopen(req2, timeout=180).read().decode())
+                if result2.get('success'):
+                    stored2 = [d['index_type'] for d in result2.get('details', [])]
+                    print(f"✅ Persisted {len(stored2)} images (public fallback): {stored2}")
+                    return stored2
+            except Exception as e2:
+                print(f"⚠️ Persist failed (public fallback): {e2}")
     return []
 
 
 # ############################################################################
-#  ANÁLISIS BIWEEKLY
+#  ANÁLISIS BIWEEKLY — v5.8 FIXES
 # ############################################################################
 
 def execute_biweekly_analysis(args):
     print("=" * 60)
-    print("  Mu.Orbita GEE v5.7 — BIWEEKLY ANALYSIS")
+    print("  Mu.Orbita GEE v5.8 — BIWEEKLY ANALYSIS")
     print("  VRA determinista + serie temporal 1 año")
     print("=" * 60)
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
     bounds = get_bounds(roi)
+
+    # ══════════════════════════════════════════════════════════════
+    #  FIX v5.8: Inicializar vra_stats (biweekly no computa VRA)
+    #  En v5.7 la variable no existía → NameError en el return →
+    #  HTTP 500 que parecía ser del persist timeout (red herring)
+    # ══════════════════════════════════════════════════════════════
+    vra_stats = []
 
     # ── Colección principal: período del job (30 días) ──
     collection = get_sentinel2_collection(roi, args.start_date, args.end_date)
@@ -935,8 +957,11 @@ def execute_biweekly_analysis(args):
     except:
         latest_date = args.end_date
 
+    # ══════════════════════════════════════════════════════════════
+    #  v5.8: Añadir SAVI a stats para consistencia con baseline
+    # ══════════════════════════════════════════════════════════════
     print("Computing statistics...")
-    stats = composite_clipped.select(['NDVI','NDWI','EVI','NDCI']).reduceRegion(
+    stats = composite_clipped.select(['NDVI','NDWI','EVI','NDCI','SAVI']).reduceRegion(
         reducer=ee.Reducer.mean()
             .combine(ee.Reducer.percentile([10,50,90]), sharedInputs=True)
             .combine(ee.Reducer.stdDev(), sharedInputs=True),
@@ -965,13 +990,22 @@ def execute_biweekly_analysis(args):
     except:
         lst_unclipped, lst_mean = None, None
 
-    # ── Serie temporal: usa colección de 1 año ──
+    # ══════════════════════════════════════════════════════════════
+    #  FIX v5.8: Serie temporal — usar combined reducer para que
+    #  las claves sean 'NDVI_mean', 'NDWI_mean', 'EVI_mean'
+    #  (igual que baseline).
+    #
+    #  BUG v5.7: ee.Reducer.mean() solo → claves 'NDVI','NDWI','EVI'
+    #  Pero el código buscaba p.get('NDVI_mean', 0) → siempre 0
+    #  → filtrado como outlier → 0 puntos en 1 año
+    # ══════════════════════════════════════════════════════════════
     print("Computing time series (1 year)...")
     time_series = []
     try:
         ts = indexed_ts.select(['NDVI','NDWI','EVI']).map(lambda img:
             ee.Feature(None, img.reduceRegion(
-                ee.Reducer.mean(), roi, 20, maxPixels=1e9
+                reducer=ee.Reducer.mean().combine(ee.Reducer.percentile([10,90]), sharedInputs=True),
+                geometry=roi, scale=20, maxPixels=1e9
             )).set('date', ee.Date(img.get('system:time_start')).format('YYYY-MM-dd')))
         for f in ts.toList(100).getInfo():
             p = f.get('properties', {})
@@ -980,8 +1014,6 @@ def execute_biweekly_analysis(args):
                 ndwi_val = round(p.get('NDWI_mean', 0) or 0, 3)
                 evi_val = round(p.get('EVI_mean', 0) or 0, 3)
                 # ── Outlier filter: skip cloud artifacts ──
-                # NDVI < 0.05 on vegetated crops is physically impossible
-                # (bare soil still gives ~0.10). Skip these points.
                 if ndvi_val < 0.05:
                     print(f"  ⚠️ TS outlier skipped: {p['date']} NDVI={ndvi_val}")
                     continue
@@ -1012,10 +1044,11 @@ def execute_biweekly_analysis(args):
         'ndwi_p50': round(stats.get('NDWI_p50',0) or 0, 3),
         'ndwi_p90': round(stats.get('NDWI_p90',0) or 0, 3),
         'evi_mean': round(stats.get('EVI_mean',0) or 0, 3),
-        'evi_p10': round(stats.get('EVI_p10',0) or 0, 3),      
-        'evi_p50': round(stats.get('EVI_p50',0) or 0, 3),       
-        'evi_p90': round(stats.get('EVI_p90',0) or 0, 3),    
+        'evi_p10': round(stats.get('EVI_p10',0) or 0, 3),
+        'evi_p50': round(stats.get('EVI_p50',0) or 0, 3),
+        'evi_p90': round(stats.get('EVI_p90',0) or 0, 3),
         'ndci_mean': round(stats.get('NDCI_mean',0) or 0, 3),
+        'savi_mean': round(stats.get('SAVI_mean',0) or 0, 3),
         'stress_area_ha': round(stress_ha, 2),
         'stress_area_pct': round(stress_pct, 1),
         'lst_mean_c': round(lst_mean, 1) if lst_mean else None,
@@ -1026,25 +1059,29 @@ def execute_biweekly_analysis(args):
     }
     kpis.update(weather_kpis)
 
+    # ══════════════════════════════════════════════════════════════
+    #  v5.8: Generar EVI + NDCI además de NDVI + NDWI
+    #  El PDF v5.0 tiene grid 2×2 que espera los 4 índices
+    # ══════════════════════════════════════════════════════════════
     print("\nGenerating all images...")
     all_images = generate_all_images(composite_viz, roi, bounds, kpis,
-                                      index_list=['NDVI','NDWI'])
+                                      index_list=['NDVI','NDWI','EVI','NDCI'])
     stored = persist_images_to_db(job_id, all_images, bounds)
 
     return {
         'success': True, 'job_id': job_id, 'analysis_type': 'biweekly',
         'kpis': kpis, 'vra_stats': vra_stats, 'bounds': bounds,
-        'weather': weather_kpis, 'weather_daily': weather_daily,  # ← NUEVO
+        'weather': weather_kpis, 'weather_daily': weather_daily,
         'time_series': time_series,
         'images_stored': stored, 'images_available': list(all_images.keys()),
         'images_base64': {} if stored else all_images,
         'tasks': [], 'task_count': 0,
-        'message': f'Baseline v5.8 complete. {len(stored)} images in DB.'
+        'message': f'Biweekly v5.8 complete. {len(stored)} images in DB.'
     }
 
 
 # ############################################################################
-#  ANÁLISIS BASELINE
+#  ANÁLISIS BASELINE (SIN CAMBIOS — idéntico a v5.7)
 # ############################################################################
 
 def execute_analysis(args):
@@ -1116,8 +1153,7 @@ def execute_analysis(args):
         lst_unclipped = None
         lst_mean = lst_min = lst_max = None
 
-
-# ── ERA5 Weather (nuevo en baseline v5.8) ──
+    # ── ERA5 Weather (nuevo en baseline v5.8) ──
     print("Computing ERA5 weather...")
     try:
         weather_kpis, weather_daily = get_era5_weather(roi, args.start_date, args.end_date)
@@ -1125,7 +1161,6 @@ def execute_analysis(args):
         print(f"Warning: ERA5 weather failed: {e}")
         weather_kpis, weather_daily = {}, []
 
-   
     # VRA: sobre composite de 6 meses (coherente con mapas)
     print("Computing VRA (deterministic score)...")
     vra_image, vra_stats = calculate_vra_zones(composite_clipped, roi)
@@ -1209,7 +1244,7 @@ def execute_analysis(args):
     return {
         'success': True, 'job_id': job_id, 'analysis_type': 'baseline',
         'kpis': kpis, 'vra_stats': vra_stats, 'bounds': bounds,
-        'weather': weather_kpis, 'weather_daily': weather_daily,  # ← NUEVO
+        'weather': weather_kpis, 'weather_daily': weather_daily,
         'time_series': time_series,
         'images_stored': stored, 'images_available': list(all_images.keys()),
         'images_base64': {} if stored else all_images,
@@ -1223,11 +1258,11 @@ def execute_analysis(args):
 # ############################################################################
 
 def check_status(args):
-    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100, 'message': 'v5.7: Sync.'}
+    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100, 'message': 'v5.8: Sync.'}
 def download_results(args):
-    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True, 'message': 'v5.7: In response.'}
+    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True, 'message': 'v5.8: In response.'}
 def start_tasks(args):
-    return {'job_id': args.job_id, 'started': 0, 'message': 'v5.7: No tasks.'}
+    return {'job_id': args.job_id, 'started': 0, 'message': 'v5.8: No tasks.'}
 
 def main():
     args = parse_args()
