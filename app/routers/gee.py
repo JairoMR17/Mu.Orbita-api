@@ -1,7 +1,10 @@
 """
-Mu.Orbita API - GEE Router v5.1 (NO-DRIVE)
+Mu.Orbita API - GEE Router v5.2
 ============================================
 
+V5.2: try/except en save_images_to_db dentro de execute_gee.
+      Si Neon está lento o falla, el resultado GEE se devuelve
+      igualmente con images_base64 para que n8n use el fallback.
 V5.1: Mantiene images_base64 en respuesta para que n8n use en PDF.
       Parámetro strip_images=true para limpiar si no se necesitan.
 """
@@ -31,7 +34,7 @@ class GEERequest(BaseModel):
     analysis_type: str = "baseline"
     output_dir: Optional[str] = ""
     drive_folder: Optional[str] = "MuOrbita_Outputs"
-    strip_images: Optional[bool] = False  # Si true, no devuelve base64 en respuesta
+    strip_images: Optional[bool] = False
 
 
 def normalize_crop_type(crop_type: str) -> str:
@@ -128,19 +131,30 @@ async def execute_gee(request: GEERequest, db: Session = Depends(get_db)):
             else:
                 result = execute_analysis(args)
             
-            # Guardar imágenes en BD
+            # ══════════════════════════════════════════════════════════
+            #  v5.2 FIX: try/except en save_images_to_db
+            #  Si Neon está lento o timeout, el resultado GEE se
+            #  devuelve igualmente con images_base64 intacto para
+            #  que n8n use el fallback (🖼️ Generate PNG node).
+            #  Sin esto, el timeout de Neon causa HTTP 500.
+            # ══════════════════════════════════════════════════════════
             images_base64 = result.get('images_base64', {})
             bounds = result.get('bounds', {})
             
             if images_base64:
-                saved_images = save_images_to_db(db, request.job_id, images_base64, bounds)
-                result['images_saved'] = saved_images
-                result['images_saved_count'] = len(saved_images)
+                try:
+                    saved_images = save_images_to_db(db, request.job_id, images_base64, bounds)
+                    result['images_saved'] = saved_images
+                    result['images_saved_count'] = len(saved_images)
+                except Exception as e:
+                    print(f"⚠️ DB image persist failed in endpoint: {e}")
+                    result['images_saved'] = []
+                    result['images_saved_count'] = 0
+                    # images_base64 se mantiene intacto en result
+                    # para que n8n lo guarde via fallback
             
             result['images_available'] = list(images_base64.keys()) if images_base64 else []
             
-            # Por defecto MANTENER base64 para que n8n use en PDF
-            # Solo limpiar si strip_images=true
             if request.strip_images and images_base64:
                 result['images_base64'] = {
                     k: f"[stripped:{len(v)} chars]"
@@ -167,7 +181,7 @@ async def execute_gee(request: GEERequest, db: Session = Depends(get_db)):
                 "crop_type_normalized": normalized_crop,
                 "phenology_enabled": normalized_crop in ['olivo', 'vina', 'almendro'],
                 "is_biweekly": request.analysis_type == 'biweekly',
-                "version": "5.1",
+                "version": "5.2",
                 "drive_used": False
             }
         }
@@ -216,4 +230,4 @@ async def gee_health():
         modules["ee"] = True
     except ImportError:
         modules["ee"] = False
-    return {"status": "ok" if all(modules.values()) else "degraded", "version": "5.1", "drive": False, "modules": modules}
+    return {"status": "ok" if all(modules.values()) else "degraded", "version": "5.2", "drive": False, "modules": modules}
