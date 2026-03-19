@@ -1,17 +1,18 @@
 """
 Mu.Orbita API - Webhooks Router
 Endpoints para recibir datos de n8n
-VERSIÓN 4.3 - Añade analysis_type a WebhookJobCompletedV2
+VERSIÓN 4.4 - Soporte recommendations_json + endpoint latest-recommendations
 
-CAMBIOS vs v4.2:
-  1. WebhookJobCompletedV2 ahora acepta analysis_type
-  2. Job se crea con analysis_type del payload (no solo 'baseline')
-  3. analysis_type se actualiza si viene en el payload
-  → Dashboard muestra "Biweekly" en vez de "Baseline" para reportes bisemanales
+CAMBIOS vs v4.3:
+  1. WebhookJobCompletedV2 ahora acepta recommendations_json (list de dicts)
+  2. webhook_job_completed guarda recommendations_json en Report (crear y update)
+  3. Nuevo endpoint GET /webhooks/latest-recommendations — devuelve las
+     recomendaciones del último informe de un cliente (para seguimiento biweekly)
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Header
 from sqlalchemy.orm import Session
+from sqlalchemy import desc
 from typing import Optional, Union, List
 from datetime import datetime, date as date_type
 from pydantic import BaseModel
@@ -135,12 +136,12 @@ async def webhook_job_started(
 
 
 # ============================================================
-# JOB-COMPLETED v4.3
+# JOB-COMPLETED v4.4
 # ============================================================
 
 class WebhookJobCompletedV2(BaseModel):
     """
-    Payload para webhook job-completed v4.3.
+    Payload para webhook job-completed v4.4.
     Incluye client_email para resolución automática de client_id/parcel_id,
     campos fenológicos, y datos para auto-crear Report y Kpi.
     """
@@ -177,6 +178,9 @@ class WebhookJobCompletedV2(BaseModel):
     # Campos opcionales para Report
     main_findings: Optional[list] = None
     priority_actions: Optional[list] = None
+
+    # ══ v4.4: recomendaciones estructuradas de Claude (array de dicts) ══
+    recommendations_json: Optional[list] = None
 
 
 @router.post("/job-completed", response_model=MessageResponse)
@@ -294,11 +298,14 @@ async def webhook_job_completed(
                     ndvi_current=round(payload.ndvi_mean, 2) if payload.ndvi_mean is not None else None,
                     main_findings=payload.main_findings,
                     priority_actions=payload.priority_actions,
+                    # ══ v4.4: guardar recomendaciones estructuradas ══
+                    recommendations_json=payload.recommendations_json,
                 )
                 db.add(new_report)
                 db.commit()
                 report_created = True
-                print(f"✅ Report auto-creado para job {payload.job_id} (type={job.analysis_type})")
+                recs_count = len(payload.recommendations_json) if payload.recommendations_json else 0
+                print(f"✅ Report auto-creado para job {payload.job_id} (type={job.analysis_type}, recs={recs_count})")
             else:
                 if payload.pdf_url:
                     existing_report.pdf_url = payload.pdf_url
@@ -307,6 +314,9 @@ async def webhook_job_completed(
                 # ══ v4.3: actualizar report_type si cambió ══
                 if payload.analysis_type:
                     existing_report.report_type = payload.analysis_type
+                # ══ v4.4: actualizar recomendaciones si vienen ══
+                if payload.recommendations_json:
+                    existing_report.recommendations_json = payload.recommendations_json
                 db.commit()
                 print(f"📝 Report existente actualizado para job {payload.job_id}")
 
@@ -385,11 +395,69 @@ async def webhook_job_completed(
         extras.append(f"parcel={str(job.parcel_id)[:8]}")
     if payload.analysis_type:
         extras.append(f"type={payload.analysis_type}")
+    if payload.recommendations_json:
+        extras.append(f"recs={len(payload.recommendations_json)}")
     extras_str = f" | {', '.join(extras)}" if extras else ""
 
     return MessageResponse(
         message=f"Job {payload.job_id} actualizado a {payload.status}{pheno_info}{extras_str}"
     )
+
+
+# ============================================================
+# LATEST-RECOMMENDATIONS (v4.4 NEW)
+# ============================================================
+
+@router.get("/latest-recommendations")
+async def get_latest_recommendations(
+    client_email: str = Query(..., description="Email del cliente"),
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_webhook)
+):
+    """
+    Devuelve las recommendations_json del último Report de un cliente.
+    Usado por n8n antes de generar el informe biweekly para que Claude
+    pueda evaluar el seguimiento de recomendaciones anteriores.
+
+    Retorna:
+      - recommendations: array de dicts (o [] si no hay informe previo)
+      - report_type: tipo del informe de origen (baseline/biweekly)
+      - report_date: fecha de generación del informe
+    """
+    client = db.query(Client).filter(Client.email == client_email).first()
+    if not client:
+        return {
+            "recommendations": [],
+            "report_type": None,
+            "report_date": None,
+            "message": f"Cliente no encontrado: {client_email}"
+        }
+
+    latest_report = (
+        db.query(Report)
+        .filter(
+            Report.client_id == client.id,
+            Report.recommendations_json.isnot(None)
+        )
+        .order_by(desc(Report.generated_at))
+        .first()
+    )
+
+    if not latest_report or not latest_report.recommendations_json:
+        return {
+            "recommendations": [],
+            "report_type": None,
+            "report_date": None,
+            "message": "Sin recomendaciones previas para este cliente"
+        }
+
+    return {
+        "recommendations": latest_report.recommendations_json,
+        "report_type": latest_report.report_type,
+        "report_date": latest_report.generated_at.isoformat() if latest_report.generated_at else None,
+        "report_id": str(latest_report.id),
+        "message": f"{len(latest_report.recommendations_json)} recomendaciones del informe {latest_report.report_type}"
+    }
 
 
 # ============================================================
@@ -590,7 +658,6 @@ async def pac_check(
     from app.models.kpi import Kpi
     from app.models.parcel import Parcel
     from app.models.client import Client
-    from sqlalchemy import desc
 
     parcel = db.query(Parcel).filter(
         Parcel.id == parcel_id,
@@ -706,7 +773,6 @@ async def generate_pac_internal(
     from app.models.job import Job
     from app.models.report import Report
     from app.services.generate_pac_report import generate_pac_report
-    from sqlalchemy import desc
 
     internal_key = os.getenv('INTERNAL_API_KEY', 'muorbita-internal-2026')
     if x_internal_key != internal_key:
@@ -848,4 +914,4 @@ async def get_active_clients_for_pac(
 
 @router.get("/health")
 async def webhooks_health():
-    return {"status": "ok", "service": "webhooks", "version": "4.3"}
+    return {"status": "ok", "service": "webhooks", "version": "4.4"}
