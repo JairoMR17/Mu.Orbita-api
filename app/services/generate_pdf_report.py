@@ -1,7 +1,15 @@
 """
-Mu.Orbita PDF Report Generator v8.0
+Mu.Orbita PDF Report Generator v8.1
 ====================================
-Changelog vs v7.1:
+Changelog vs v8.0:
+───────────────────
+NEW:  _followup_section() — renderiza "Seguimiento de Recomendaciones Anteriores"
+      con cards coloreadas por estado (Completada/En curso/No iniciada/No evaluable).
+      Se inserta en biweekly entre Riesgos y Recomendaciones nuevas.
+NEW:  FollowupCard flowable — card visual para cada recomendación con seguimiento.
+NEW:  'prev_actions_followup' añadido a narratives key list.
+
+Changelog v8.0 vs v7.1:
 ───────────────────
 FIX:  _sanitize_index() captura el bug ×1000 de valores upstream (prev_ndvi=588 → 0.588)
 FIX:  _safe_fmt() ya NO trata 0.0 como missing — solo None es fallback
@@ -15,7 +23,6 @@ NEW:  Semáforo de estado general en portada (🟢🟡🔴 + texto)
 NEW:  Executive summary bisemanal como lista de bullets (no párrafo)
 NEW:  _forecast_table() — tabla estructurada de previsión 7 días
 NEW:  Comparativa vs baseline original en _delta_table (fila extra si hay dato)
-NEW:  Sección placeholder "Seguimiento de Recomendaciones Anteriores" en biweekly
 IMPROVED: Mejor flujo de páginas bisemanal (forecast con clima, no en pág. 2)
 IMPROVED: Nota explícita cuando EVI/NDCI usan mapa sintético vs satélite real
 
@@ -352,6 +359,51 @@ class RecommendationCard(Flowable):
         self._para.drawOn(c, 5*mm, 3*mm)
 
 
+class FollowupCard(Flowable):
+    """v8.1: Card para seguimiento de recomendación anterior."""
+    STATUS_CONFIG = {
+        'Completada':    {'color': '#4B7F3A', 'icon': '✓'},
+        'En curso':      {'color': '#B8860B', 'icon': '⟳'},
+        'No iniciada':   {'color': '#A63D2F', 'icon': '✗'},
+        'No evaluable':  {'color': '#7A7A7A', 'icon': '?'},
+    }
+
+    def __init__(self, number, title, status_label, observed_result,
+                 next_step, styles, width=170*mm):
+        Flowable.__init__(self)
+        self._width = width
+        cfg = self.STATUS_CONFIG.get(status_label, self.STATUS_CONFIG['No evaluable'])
+        sc = cfg['color']
+
+        text = (
+            f'<b>{number}. {title}</b><br/>'
+            f'<font size="9">'
+            f'<b>Estado:</b> <font color="{sc}"><b>{cfg["icon"]} {status_label}</b></font><br/>'
+            f'<b>Resultado observado:</b> {observed_result}<br/>'
+            f'<b>Siguiente paso:</b> {next_step}'
+            f'</font>'
+        )
+        self._para = Paragraph(text, styles['Body'])
+        w, h = self._para.wrap(width - 10*mm, 500*mm)
+        self._height = h + 8*mm
+        self.border_color = colors.HexColor(sc)
+
+    def wrap(self, availWidth, availHeight):
+        return self._width, self._height
+
+    def draw(self):
+        c = self.canv
+        w, h = self._width, self._height
+        c.setFillColor(hex_color('white'))
+        c.setStrokeColor(hex_color('cream_dark'))
+        c.setLineWidth(0.5)
+        c.roundRect(0, 0, w, h, 3, fill=True, stroke=True)
+        c.setFillColor(self.border_color)
+        c.rect(0, 0, 3*mm, h, fill=True, stroke=False)
+        self._para.wrap(w - 10*mm, h)
+        self._para.drawOn(c, 5*mm, 3*mm)
+
+
 # ============================================================
 # 5. CHART GENERATION (matplotlib, corporate palette)
 # ============================================================
@@ -562,14 +614,16 @@ class MuOrbitaPDFGenerator:
                         'vra_analysis', 'recommendations', 'conclusion',
                         # v7.0 biweekly keys
                         'changes_interpretation', 'new_risks',
-                        'forecast_narrative']:
+                        'forecast_narrative',
+                        # v8.1 followup key
+                        'prev_actions_followup']:
                 if key in data and data[key]:
                     self.narratives[key] = data[key]
 
         if self.narratives:
-            print(f"✅ PDF v8.0: {len(self.narratives)} narrative fields from Claude")
+            print(f"✅ PDF v8.1: {len(self.narratives)} narrative fields from Claude")
         else:
-            print("⚠️ PDF v8.0: No narratives — using auto-generated text")
+            print("⚠️ PDF v8.1: No narratives — using auto-generated text")
 
         # ── Build png_map con PRIORIDAD BD ──
         self.png_map = {}
@@ -591,9 +645,9 @@ class MuOrbitaPDFGenerator:
                         self.png_map[name] = b64
 
         if self.png_map:
-            print(f"✅ PDF v8.0: png_map con {len(self.png_map)} imágenes: {list(self.png_map.keys())}")
+            print(f"✅ PDF v8.1: png_map con {len(self.png_map)} imágenes: {list(self.png_map.keys())}")
         else:
-            print("⚠️ PDF v8.0: png_map VACÍO — se usarán gráficos matplotlib")
+            print("⚠️ PDF v8.1: png_map VACÍO — se usarán gráficos matplotlib")
 
     def _load_images_from_db(self, job_id: str):
         try:
@@ -1644,14 +1698,50 @@ class MuOrbitaPDFGenerator:
 
         return elements
 
+    # ── v8.1: Seguimiento de Recomendaciones Anteriores ──
+    def _followup_section(self) -> List:
+        """
+        v8.1 NEW: Renderiza el seguimiento de recomendaciones del informe anterior.
+        Datos vienen de narratives['prev_actions_followup'] (generado por Claude).
+        Solo se renderiza si hay datos — no aparece en el primer biweekly sin baseline.
+        """
+        s = self.styles
+        elements = []
+
+        followup = self._get_narrative('prev_actions_followup', '')
+        if not followup or not isinstance(followup, list) or len(followup) == 0:
+            return elements
+
+        elements.append(Paragraph('Seguimiento de Recomendaciones Anteriores',
+                                  s['SectionTitle']))
+        elements.append(SectionDivider(self.content_w))
+        elements.append(Spacer(1, 2*mm))
+
+        for i, item in enumerate(followup[:3], 1):
+            if not isinstance(item, dict):
+                continue
+            elements.append(FollowupCard(
+                number=i,
+                title=item.get('title', 'Recomendación anterior'),
+                status_label=item.get('status', 'No evaluable'),
+                observed_result=item.get('observed_result',
+                                         'Sin datos observables en este período'),
+                next_step=item.get('next_step', 'Continuar monitorización'),
+                styles=s,
+                width=self.content_w,
+            ))
+            elements.append(Spacer(1, 3*mm))
+
+        return elements
+
     # =====================================================
-    # MAIN BUILD METHOD — v8.0
+    # MAIN BUILD METHOD — v8.1
     # =====================================================
     def generate(self) -> bytes:
         """
-        v8.0: Layout mejorado.
-        BASELINE: estructura idéntica a v6.0/v7.0
-        BIWEEKLY: mejor flujo de páginas, forecast separado, bullets en summary
+        v8.1: Añade sección de seguimiento de recomendaciones anteriores.
+        BASELINE: estructura idéntica a v6.0/v7.0/v8.0
+        BIWEEKLY: followup section entre riesgos y recomendaciones nuevas
         """
         d = self.d
         s = self.styles
@@ -1912,6 +2002,15 @@ class MuOrbitaPDFGenerator:
                 elements.append(Spacer(1, 5*mm))
 
         # ════════════════════════════════════════════════════
+        # v8.1: SEGUIMIENTO DE RECOMENDACIONES ANTERIORES (solo biweekly)
+        # ════════════════════════════════════════════════════
+        if is_biweekly:
+            followup_elements = self._followup_section()
+            if followup_elements:
+                elements.extend(followup_elements)
+                elements.append(Spacer(1, 3*mm))
+
+        # ════════════════════════════════════════════════════
         # RECOMENDACIONES
         # ════════════════════════════════════════════════════
         elements.append(Paragraph('Recomendaciones Prioritarias', s['SectionTitle']))
@@ -1994,7 +2093,7 @@ def generate_muorbita_report(data: Dict[str, Any]) -> Dict[str, Any]:
             'pdf_size': len(pdf_bytes),
             'job_id': job_id,
             'generated_at': datetime.now().isoformat(),
-            'version': '8.0',
+            'version': '8.1',
             'images_used': list(generator.png_map.keys()) if generator.png_map else ['matplotlib_fallback'],
             'has_narratives': bool(generator.narratives),
             'narrative_fields': list(generator.narratives.keys()) if generator.narratives else [],
@@ -2114,7 +2213,12 @@ if __name__ == '__main__':
                     "justification": "Aprovechar condiciones estables para evaluación nutricional de base"
                 }
             ],
-            "conclusion": "El olivar presenta condiciones estables con vigor normal, requiriendo principalmente atención al manejo hídrico preventivo. Recomendamos revisión en 15 días para evaluar respuesta a las medidas de riego implementadas."
+            "conclusion": "El olivar presenta condiciones estables con vigor normal, requiriendo principalmente atención al manejo hídrico preventivo. Recomendamos revisión en 15 días para evaluar respuesta a las medidas de riego implementadas.",
+            "prev_actions_followup": [
+                {"title": "Incrementar frecuencia de riego preventivo", "status": "En curso", "observed_result": "NDWI estable en 0.12, sin deterioro adicional", "next_step": "Mantener riego incrementado 7 días más"},
+                {"title": "Monitoreo semanal de humedad del suelo", "status": "Completada", "observed_result": "Humedad 0.39 m³/m³ confirmada en campo", "next_step": "Ninguna"},
+                {"title": "Planificar análisis foliar nutricional", "status": "No iniciada", "observed_result": "Sin datos — pendiente de programar", "next_step": "Programar muestreo en próximos 14 días"}
+            ]
         },
 
         "time_series": [
@@ -2141,7 +2245,7 @@ if __name__ == '__main__':
         out_path = f"/tmp/{result['filename']}"
         with open(out_path, 'wb') as f:
             f.write(base64.b64decode(result['pdf_base64']))
-        print(f"✅ PDF v8.0 generado: {out_path} ({result['pdf_size']:,} bytes)")
+        print(f"✅ PDF v8.1 generado: {out_path} ({result['pdf_size']:,} bytes)")
         print(f"   Imágenes: {result['images_used']}")
         print(f"   Narrativas: {result['has_narratives']} ({len(result['narrative_fields'])} campos)")
     else:
