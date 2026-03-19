@@ -1,22 +1,23 @@
 """
-Mu.Orbita PDF Report Generator v7.1
+Mu.Orbita PDF Report Generator v8.0
 ====================================
-v7.0: Soporte bisemanal completo. Layout diferenciado por analysis_type.
-      Tabla de cambios vs período anterior, forecast alert, nuevos riesgos.
-      Baseline 100% idéntico a v6.0.
-
-Changelog:
-- v3.2: Key aliases para mapeo GEE → PDF
-- v4.0: Carga imágenes desde BD por job_id
-- v5.0: Nuevo orden de secciones, 4 mapas, fix gauge
-- v6.0: ELIMINADA sección "Análisis Agronómico" duplicada.
-        Narrativas Claude distribuidas en cada sección visual.
-        Nueva tabla clima ERA5. Riesgos con texto interpretativo.
-        Recomendaciones estructuradas desde JSON. VRA analysis.
-        PDF de 10 → 7 páginas.
-- v7.0: Soporte bisemanal. Nuevos métodos: _delta_table, _forecast_alert_box,
-        _biweekly_changes_section. generate() ramifica por analysis_type.
-        Baseline path idéntico a v6.0.
+Changelog vs v7.1:
+───────────────────
+FIX:  _sanitize_index() captura el bug ×1000 de valores upstream (prev_ndvi=588 → 0.588)
+FIX:  _safe_fmt() ya NO trata 0.0 como missing — solo None es fallback
+FIX:  fv() en _detail_table — misma corrección: 0.0 es valor válido
+FIX:  LST 0.0 ºC en _risk_table → fallback a ERA5 Tmax o "N/D"
+FIX:  Página en blanco antes de anexo → CondPageBreak reemplaza PageBreak forzado
+FIX:  _delta_table: delta_fmt ya no divide por 0 cuando prev==0; sanitiza valores >2
+FIX:  Forecast label siempre dice "7 días" (no depende de days_ahead upstream)
+FIX:  _weather_table incluye Tmin media/mínima cuando están disponibles
+NEW:  Semáforo de estado general en portada (🟢🟡🔴 + texto)
+NEW:  Executive summary bisemanal como lista de bullets (no párrafo)
+NEW:  _forecast_table() — tabla estructurada de previsión 7 días
+NEW:  Comparativa vs baseline original en _delta_table (fila extra si hay dato)
+NEW:  Sección placeholder "Seguimiento de Recomendaciones Anteriores" en biweekly
+IMPROVED: Mejor flujo de páginas bisemanal (forecast con clima, no en pág. 2)
+IMPROVED: Nota explícita cuando EVI/NDCI usan mapa sintético vs satélite real
 
 Autor: Mu.Orbita
 Fecha: 2026-03
@@ -38,7 +39,8 @@ from reportlab.lib.units import mm, cm
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    Image, PageBreak, KeepTogether, HRFlowable, Flowable
+    Image, PageBreak, KeepTogether, HRFlowable, Flowable,
+    CondPageBreak
 )
 from reportlab.pdfgen import canvas
 
@@ -121,6 +123,9 @@ def get_styles():
          textColor=hex_color('text'), leading=13, spaceAfter=2*mm)
     _add('BodySmallItalic', fontName='Helvetica-Oblique', fontSize=8.5,
          textColor=hex_color('text_light'), leading=12, spaceAfter=2*mm)
+    _add('BulletBody',    fontName='Helvetica', fontSize=9.5,
+         textColor=hex_color('text'), leading=14, spaceAfter=1.5*mm,
+         leftIndent=6*mm, bulletIndent=2*mm)
     _add('Callout',       fontName='Helvetica', fontSize=10,
          textColor=hex_color('text'), leading=15, alignment=TA_JUSTIFY,
          spaceBefore=2*mm, spaceAfter=2*mm,
@@ -150,8 +155,28 @@ def get_styles():
 
 
 # ============================================================
-# 3. INTERPRETATION FUNCTIONS
+# 3. INTERPRETATION & SANITIZATION FUNCTIONS
 # ============================================================
+
+def _sanitize_index(val, name: str = '') -> Optional[float]:
+    """
+    v8.0: Sanitiza valores de índices vegetativos.
+    Detecta el bug ×1000 de upstream (p.ej. prev_ndvi=588 → 0.588).
+    NDVI, NDWI, EVI, SAVI, NDCI siempre están en rango [-1, 1].
+    """
+    if val is None:
+        return None
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        return None
+    # Detectar valores ×1000 — índices nunca exceden ±2
+    idx_names = ['ndvi', 'ndwi', 'evi', 'savi', 'ndci']
+    if any(n in name.lower() for n in idx_names):
+        if abs(v) > 2.0:
+            v = v / 1000.0
+    return v
+
 
 def ndvi_status(v: float) -> Tuple[str, str]:
     if v >= 0.60: return ("Vigor alto",     'green')
@@ -199,13 +224,43 @@ def crop_ndvi_range(ct):
     return '0.45–0.65'
 
 def _safe_fmt(val, decimals=1, suffix='', fallback='N/A'):
-    """Format numérico seguro — devuelve fallback si es None/NaN/0."""
-    if val is None or val == 0:
+    """
+    v8.0 FIX: Format numérico seguro.
+    Solo None es fallback — 0.0 ES un valor válido.
+    """
+    if val is None:
         return fallback
     try:
         return f"{float(val):.{decimals}f}{suffix}"
-    except:
+    except (ValueError, TypeError):
         return fallback
+
+
+def fv(val, decimals=2, fallback='—'):
+    """
+    v8.0: Format value global — 0.0 ES válido, solo None/missing → fallback.
+    """
+    if val is None or val == '—' or val == '':
+        return fallback
+    try:
+        return f"{float(val):.{decimals}f}"
+    except (ValueError, TypeError):
+        return fallback
+
+
+def _calc_general_status(d: Dict) -> str:
+    """v8.0: Calcula estado general para semáforo de portada."""
+    ndvi_m = d.get('ndvi_mean', 0) or 0
+    stress_pct = d.get('stress_area_pct', 0) or 0
+    balance = d.get('weather_water_balance')
+
+    if ndvi_m < 0.35 or stress_pct > 30:
+        return 'critico'
+    if ndvi_m < 0.45 or stress_pct > 15:
+        return 'atencion'
+    if balance is not None and float(balance) < -50:
+        return 'atencion'
+    return 'normal'
 
 
 # ============================================================
@@ -287,15 +342,12 @@ class RecommendationCard(Flowable):
     def draw(self):
         c = self.canv
         w, h = self._width, self._height
-        # Background
         c.setFillColor(hex_color('white'))
         c.setStrokeColor(hex_color('cream_dark'))
         c.setLineWidth(0.5)
         c.roundRect(0, 0, w, h, 3, fill=True, stroke=True)
-        # Left accent bar
         c.setFillColor(self.border_color)
         c.rect(0, 0, 3*mm, h, fill=True, stroke=False)
-        # Text
         self._para.wrap(w - 10*mm, h)
         self._para.drawOn(c, 5*mm, 3*mm)
 
@@ -501,21 +553,23 @@ class MuOrbitaPDFGenerator:
         # v6.0: Extraer narrativas de Claude (JSON estructurado)
         self.narratives = data.get('narratives', {})
         if not self.narratives:
-            # Fallback: campos sueltos en data
             for key in ['executive_summary', 'integrated_interpretation',
                         'map_ndvi', 'map_ndwi', 'map_evi', 'map_ndci',
                         'temporal_analysis', 'climate_assessment',
                         'risk_hydric_level', 'risk_hydric_text',
                         'risk_thermal_level', 'risk_thermal_text',
                         'risk_heterogeneity_level', 'risk_heterogeneity_text',
-                        'vra_analysis', 'recommendations', 'conclusion']:
+                        'vra_analysis', 'recommendations', 'conclusion',
+                        # v7.0 biweekly keys
+                        'changes_interpretation', 'new_risks',
+                        'forecast_narrative']:
                 if key in data and data[key]:
                     self.narratives[key] = data[key]
 
         if self.narratives:
-            print(f"✅ PDF v7.0: {len(self.narratives)} narrative fields from Claude")
+            print(f"✅ PDF v8.0: {len(self.narratives)} narrative fields from Claude")
         else:
-            print("⚠️ PDF v7.0: No narratives — using auto-generated text")
+            print("⚠️ PDF v8.0: No narratives — using auto-generated text")
 
         # ── Build png_map con PRIORIDAD BD ──
         self.png_map = {}
@@ -537,9 +591,9 @@ class MuOrbitaPDFGenerator:
                         self.png_map[name] = b64
 
         if self.png_map:
-            print(f"✅ PDF v7.0: png_map con {len(self.png_map)} imágenes: {list(self.png_map.keys())}")
+            print(f"✅ PDF v8.0: png_map con {len(self.png_map)} imágenes: {list(self.png_map.keys())}")
         else:
-            print("⚠️ PDF v7.0: png_map VACÍO — se usarán gráficos matplotlib")
+            print("⚠️ PDF v8.0: png_map VACÍO — se usarán gráficos matplotlib")
 
     def _load_images_from_db(self, job_id: str):
         try:
@@ -575,6 +629,13 @@ class MuOrbitaPDFGenerator:
         except Exception as e:
             print(f"⚠️ Direct DB load failed: {e}")
 
+    def _has_real_map(self, name: str) -> bool:
+        """v8.0: Comprueba si existe mapa real de GEE (no fallback matplotlib)."""
+        if name in self.png_map:
+            return True
+        aliases = self.KEY_ALIASES.get(name, [])
+        return any(alias in self.png_map for alias in aliases)
+
     def _real_or_generated(self, name: str, fallback_bytes: bytes,
                            width_mm: float, height_mm: float) -> Image:
         if name in self.png_map:
@@ -590,7 +651,6 @@ class MuOrbitaPDFGenerator:
         return Image(io.BytesIO(fallback_bytes), width=width_mm*mm, height=height_mm*mm)
 
     def _get_narrative(self, key: str, fallback: str = '') -> str:
-        """Obtiene narrativa de Claude con fallback."""
         return self.narratives.get(key, fallback) or fallback
 
     # ── Header / Footer ──
@@ -668,6 +728,7 @@ class MuOrbitaPDFGenerator:
         cvs.line(self.M + 8*mm, band_y + band_h - 40*mm,
                  self.M + 50*mm, band_y + band_h - 40*mm)
 
+        # ── Metadata card ──
         card_x = self.M + 8*mm
         card_w = self.W - 2*self.M - 16*mm
         card_h = 80*mm
@@ -712,9 +773,43 @@ class MuOrbitaPDFGenerator:
             cvs.line(card_x + 14*mm, row_y, card_x + card_w - 14*mm, row_y)
             row_y -= 9*mm
 
+        # ════════════════════════════════════════════
+        # v8.0 NEW: Semáforo de estado general
+        # ════════════════════════════════════════════
+        status = _calc_general_status(self.d)
+        status_cfg = {
+            'normal':    (C['green'],  'BUEN ESTADO'),
+            'atencion':  (C['yellow'], 'REQUIERE ATENCIÓN'),
+            'critico':   (C['red'],    'ESTADO CRÍTICO'),
+        }
+        sem_color_hex, sem_label = status_cfg.get(status, status_cfg['normal'])
+        sem_color = colors.HexColor(sem_color_hex)
+
+        sem_y = card_y - 18*mm
+        sem_x = self.W / 2
+
+        # Fondo pill
+        pill_w = 70*mm
+        pill_h = 10*mm
+        pill_x = sem_x - pill_w / 2
+        cvs.setFillColor(colors.HexColor('#FFFFFF'))
+        cvs.setStrokeColor(sem_color)
+        cvs.setLineWidth(1.5)
+        cvs.roundRect(pill_x, sem_y, pill_w, pill_h, pill_h / 2, fill=True, stroke=True)
+
+        # Círculo de color
+        cvs.setFillColor(sem_color)
+        cvs.circle(pill_x + 8*mm, sem_y + pill_h / 2, 3*mm, fill=True, stroke=False)
+
+        # Texto
+        cvs.setFillColor(colors.HexColor(sem_color_hex))
+        cvs.setFont('Helvetica-Bold', 9)
+        cvs.drawString(pill_x + 14*mm, sem_y + pill_h / 2 - 1.5*mm, sem_label)
+
+        # ── Footer ──
         cvs.setFillColor(hex_color('text_light'))
         cvs.setFont('Helvetica', 9)
-        cvs.drawCentredString(self.W/2, card_y - 10*mm,
+        cvs.drawCentredString(self.W/2, sem_y - 10*mm,
             f'Fecha del informe: {datetime.now().strftime("%d/%m/%Y")}')
 
         cvs.setFillColor(hex_color('text_muted'))
@@ -774,18 +869,8 @@ class MuOrbitaPDFGenerator:
         ndvi_i, _ = ndvi_status(d.get('ndvi_mean', 0))
         ndwi_i, _ = ndwi_status(d.get('ndwi_mean', 0))
 
-        # ── Helper: format value or show '—' if missing/zero ──
-        def fv(val, decimals=2):
-            """Format value: show number or '—' if None/missing (0.0 IS valid)."""
-            if val is None or val == '—':
-                return '—'
-            try:
-                return f"{float(val):.{decimals}f}"
-            except (ValueError, TypeError):
-                return '—'
-
         # ── EVI interpretation ──
-        evi_m = d.get('evi_mean', 0) or 0
+        evi_m = d.get('evi_mean') or 0
         if evi_m >= 0.35:
             evi_interp = 'Productividad alta'
         elif evi_m >= 0.25:
@@ -796,7 +881,7 @@ class MuOrbitaPDFGenerator:
             evi_interp = '—'
 
         # ── NDCI interpretation ──
-        ndci_m = d.get('ndci_mean', 0) or 0
+        ndci_m = d.get('ndci_mean') or 0
         if ndci_m >= 0.3:
             ndci_interp = 'Clorofila adecuada'
         elif ndci_m >= 0.2:
@@ -856,44 +941,74 @@ class MuOrbitaPDFGenerator:
         d = self.d
         s = self.styles
 
-        # Buscar datos en múltiples ubicaciones posibles
-        tmax = d.get('weather_tmax_mean') or self.narratives.get('weather_tmax_mean')
-        precip = d.get('weather_precip_total') or self.narratives.get('weather_precip_total')
-        balance = d.get('weather_water_balance') or self.narratives.get('weather_water_balance')
-        gdd = d.get('weather_gdd') or d.get('weather_gdd_base10')
-        heat = d.get('weather_heat_days', 0)
+        tmax  = d.get('weather_tmax_mean')
+        tmin  = d.get('weather_tmin_mean')
+        tmin_min = d.get('weather_tmin_min')
+        precip = d.get('weather_precip_total')
+        balance = d.get('weather_water_balance')
+        gdd   = d.get('weather_gdd') or d.get('weather_gdd_base10')
+        heat  = d.get('weather_heat_days', 0)
         frost = d.get('weather_frost_days', 0)
-        et = d.get('weather_et_total')
+        et    = d.get('weather_et_total')
         rain_days = d.get('weather_rain_days', 0)
-        lst = d.get('lst_mean_c', 0)
+        lst   = d.get('lst_mean_c')
+        soil_moisture = d.get('weather_soil_moisture')
 
-        # Si no hay ningún dato ERA5, solo mostrar LST
         has_era5 = any(v is not None and v != 0 for v in [tmax, precip, balance, gdd])
+
+        # v8.0: Si no hay ERA5 ni LST, no mostrar tabla vacía
+        if not has_era5 and not lst:
+            return None
 
         rows_data = [
             ['Parámetro', 'Valor', 'Interpretación'],
         ]
 
-        if lst:
-            rows_data.append(['LST media (MODIS)', f'{lst:.1f} ºC', 'Temperatura superficial del cultivo'])
-
         if has_era5:
-            if tmax:
-                rows_data.append(['Tmax media (ERA5)', f'{float(tmax):.1f} ºC', 'Temperatura máxima promedio aire'])
-            if precip:
-                rows_data.append(['Precipitación total', f'{float(precip):.1f} mm ({rain_days} días)', 'Aporte hídrico del período'])
-            if et:
-                rows_data.append(['Evapotranspiración', f'{float(et):.1f} mm', 'Demanda hídrica del cultivo'])
+            if tmax is not None:
+                rows_data.append(['Tmax media (ERA5)', f'{float(tmax):.1f} ºC',
+                                  'Temperatura máxima promedio aire'])
+            # v8.0 NEW: Tmin
+            if tmin is not None:
+                tmin_str = f'{float(tmin):.1f} ºC'
+                if tmin_min is not None:
+                    tmin_str += f' (mín: {float(tmin_min):.1f} ºC)'
+                rows_data.append(['Tmin media (ERA5)', tmin_str,
+                                  'Temperatura mínima promedio aire'])
+            if precip is not None:
+                rows_data.append(['Precipitación total',
+                                  f'{float(precip):.1f} mm ({rain_days} días)',
+                                  'Aporte hídrico del período'])
+            if et is not None:
+                rows_data.append(['Evapotranspiración',
+                                  f'{float(et):.1f} mm',
+                                  'Demanda hídrica del cultivo'])
             if balance is not None:
                 bal_val = float(balance)
                 bal_interp = 'Superávit hídrico' if bal_val > 0 else 'Déficit hídrico'
-                rows_data.append(['Balance hídrico (P-ET)', f'{bal_val:+.1f} mm', bal_interp])
+                rows_data.append(['Balance hídrico (P-ET)',
+                                  f'{bal_val:+.1f} mm', bal_interp])
             if heat > 0:
-                rows_data.append(['Días Tmax ≥ 35 ºC', str(heat), 'Estrés térmico acumulado'])
+                rows_data.append(['Días Tmax >= 35 ºC', str(heat),
+                                  'Estrés térmico acumulado'])
             if frost > 0:
-                rows_data.append(['Días helada (Tmin ≤ 0 ºC)', str(frost), 'Riesgo de daño por frío'])
-            if gdd:
-                rows_data.append(['GDD acumulados (base 10 ºC)', f'{float(gdd):.0f}', 'Desarrollo fenológico acumulado'])
+                rows_data.append(['Días helada (Tmin <= 0 ºC)', str(frost),
+                                  'Riesgo de daño por frío'])
+            if gdd is not None:
+                rows_data.append(['GDD acumulados (base 10 ºC)',
+                                  f'{float(gdd):.0f}',
+                                  'Desarrollo fenológico acumulado'])
+            # v8.0: Humedad del suelo con unidad
+            if soil_moisture is not None and float(soil_moisture) > 0:
+                rows_data.append(['Humedad del suelo (ERA5)',
+                                  f'{float(soil_moisture):.2f} m³/m³',
+                                  'Contenido volumétrico medio'])
+
+        # LST solo si tiene valor real (>0)
+        if lst is not None and float(lst) > 0:
+            rows_data.append(['LST media (MODIS)',
+                              f'{float(lst):.1f} ºC',
+                              'Temperatura superficial del cultivo'])
 
         if len(rows_data) < 2:
             return None
@@ -902,7 +1017,8 @@ class MuOrbitaPDFGenerator:
         for r_idx, row in enumerate(rows_data):
             tr = []
             for c_idx, cell in enumerate(row):
-                st = s['TableHeader'] if r_idx == 0 else (s['TableCellLeft'] if c_idx in [0, 2] else s['TableCell'])
+                st = s['TableHeader'] if r_idx == 0 else (
+                    s['TableCellLeft'] if c_idx in [0, 2] else s['TableCell'])
                 tr.append(Paragraph(str(cell), st))
             data.append(tr)
 
@@ -922,28 +1038,26 @@ class MuOrbitaPDFGenerator:
         tbl.setStyle(TableStyle(style_cmds))
         return tbl
 
-    # ── v6.0: Risk Table with narrative texts ──
+    # ── v6.0 → v8.0: Risk Table with narrative texts ──
     def _risk_table(self) -> Table:
         d = self.d
         s = self.styles
 
         ndwi_m = d.get('ndwi_mean', 0)
         ndvi_m = d.get('ndvi_mean', 0)
-        hetero = d.get('ndvi_p90', 0) - d.get('ndvi_p10', 0)
+        hetero = (d.get('ndvi_p90', 0) or 0) - (d.get('ndvi_p10', 0) or 0)
 
-        # Get levels from Claude narratives or auto-calculate
-        h_lvl = self._get_narrative('risk_hydric_level', '')
-        t_lvl = self._get_narrative('risk_thermal_level', '')
+        h_lvl  = self._get_narrative('risk_hydric_level', '')
+        t_lvl  = self._get_narrative('risk_thermal_level', '')
         hh_lvl = self._get_narrative('risk_heterogeneity_level', '')
 
-        # Auto-calculate if no narratives
         if not h_lvl:
             if ndwi_m < 0:    h_lvl = 'Alto'
             elif ndwi_m<0.10: h_lvl = 'Moderado'
             else:             h_lvl = 'Bajo'
 
         if not t_lvl:
-            heat = d.get('weather_heat_days', 0)
+            heat = d.get('weather_heat_days', 0) or 0
             if heat > 5:      t_lvl = 'Alto'
             elif heat > 0:    t_lvl = 'Moderado'
             else:             t_lvl = 'Bajo'
@@ -969,16 +1083,35 @@ class MuOrbitaPDFGenerator:
                 Paragraph(detail_text if detail_text else '—', s['TableCellWrap']),
             ]
 
-        h_text = self._get_narrative('risk_hydric_text', f'NDWI: {ndwi_m:.2f}')
-        t_text = self._get_narrative('risk_thermal_text', f'LST: {d.get("lst_mean_c",0):.1f} ºC')
-        hh_text = self._get_narrative('risk_heterogeneity_text', f'ΔP90-P10: {hetero:.2f}')
+        h_text = self._get_narrative('risk_hydric_text', f'NDWI medio: {ndwi_m:.2f}')
 
-        header = [Paragraph(h, s['TableHeader']) for h in ['Riesgo', 'Nivel', 'Indicador', 'Evaluación']]
+        # ════════════════════════════════════════════
+        # v8.0 FIX: LST indicator — fallback a ERA5 Tmax si LST es 0/None
+        # ════════════════════════════════════════════
+        lst_val = d.get('lst_mean_c')
+        tmax_val = d.get('weather_tmax_mean')
+        if lst_val is not None and float(lst_val) > 0:
+            thermal_indicator = f'LST: {float(lst_val):.1f} ºC'
+        elif tmax_val is not None and float(tmax_val) > 0:
+            thermal_indicator = f'Tmax: {float(tmax_val):.1f} ºC (ERA5)'
+        else:
+            thermal_indicator = 'N/D'
+
+        t_text = self._get_narrative('risk_thermal_text', '')
+        if not t_text:
+            heat = d.get('weather_heat_days', 0) or 0
+            frost = d.get('weather_frost_days', 0) or 0
+            t_text = f'{thermal_indicator}. {heat} días calor extremo, {frost} días helada.'
+
+        hh_text = self._get_narrative('risk_heterogeneity_text', f'Rango P90-P10: {hetero:.2f}')
+
+        header = [Paragraph(h, s['TableHeader'])
+                  for h in ['Riesgo', 'Nivel', 'Indicador', 'Evaluación']]
         data = [
             header,
-            risk_row('Estrés hídrico', h_lvl, f'NDWI: {ndwi_m:.2f}', h_text),
-            risk_row('Estrés térmico', t_lvl, f'LST: {d.get("lst_mean_c",0):.1f} ºC', t_text),
-            risk_row('Heterogeneidad', hh_lvl, f'Δ: {hetero:.2f}', hh_text),
+            risk_row('Estrés hídrico',  h_lvl,  f'NDWI: {ndwi_m:.2f}',  h_text),
+            risk_row('Estrés térmico',  t_lvl,  thermal_indicator,        t_text),
+            risk_row('Heterogeneidad',  hh_lvl, f'Δ: {hetero:.2f}',      hh_text),
         ]
 
         cw = [30*mm, 24*mm, 28*mm, 88*mm]
@@ -1018,13 +1151,11 @@ class MuOrbitaPDFGenerator:
                     ))
                     elements.append(Spacer(1, 3*mm))
         else:
-            # Fallback: generar recomendaciones automáticas
             elements.extend(self._auto_recommendations())
 
         return elements
 
     def _auto_recommendations(self) -> List:
-        """Recomendaciones automáticas cuando Claude no devuelve JSON."""
         d = self.d
         s = self.styles
         elements = []
@@ -1076,7 +1207,6 @@ class MuOrbitaPDFGenerator:
 
     # ── VRA Analysis ──
     def _vra_section(self) -> List:
-        """Sección VRA con tabla + narrativa."""
         d = self.d
         s = self.styles
         elements = []
@@ -1090,7 +1220,8 @@ class MuOrbitaPDFGenerator:
         elements.append(Paragraph('Zonificación VRA (Aplicación Variable)', s['SubsectionTitle']))
 
         if vra_stats and isinstance(vra_stats, list) and len(vra_stats) > 0:
-            header = [Paragraph(h, s['TableHeader']) for h in ['Zona', 'Superficie', 'NDVI medio', 'NDWI medio', 'Recomendación']]
+            header = [Paragraph(h, s['TableHeader'])
+                      for h in ['Zona', 'Superficie', 'NDVI medio', 'NDWI medio', 'Recomendación']]
             data = [header]
             zone_colors = {'Bajo vigor': 'red', 'Vigor medio': 'yellow', 'Alto vigor': 'green'}
             for z in vra_stats:
@@ -1138,7 +1269,8 @@ class MuOrbitaPDFGenerator:
             f'<b>Fuentes de datos</b><br/>'
             f'• Sentinel-2 SR Harmonized: {d.get("images_processed",0)} escenas procesadas<br/>'
             f'• Última imagen válida: {fmt_date(d.get("latest_image_date"))}<br/>'
-            f'• MODIS LST: Temperatura superficial media {"N/D" if not d.get("lst_mean_c") else str(round(d["lst_mean_c"], 1)) + " ºC"}<br/>'
+            f'• MODIS LST: Temperatura superficial media '
+            f'{"N/D" if not d.get("lst_mean_c") else str(round(d["lst_mean_c"], 1)) + " ºC"}<br/>'
             f'• ERA5-Land: Datos meteorológicos del período analizado<br/>'
             f'• Resolución: 10 m (S2), 30 m (Landsat), 1 km (MODIS)<br/><br/>'
             f'<b>Umbrales de referencia ({ct})</b><br/>'
@@ -1160,20 +1292,26 @@ class MuOrbitaPDFGenerator:
         return elements
 
     # ════════════════════════════════════════════════════════
-    # v7.0: MÉTODOS BISEMANALES (no afectan baseline)
+    # v7.0 → v8.0: MÉTODOS BISEMANALES
     # ════════════════════════════════════════════════════════
 
     def _delta_table(self) -> Optional[Table]:
         """
-        Tabla de cambios vs período anterior para informes bisemanales.
-        Retorna None si no hay datos de período anterior.
+        v8.0 FIX: Tabla de cambios vs período anterior.
+        - _sanitize_index() captura bug ×1000 de upstream
+        - delta_fmt maneja prev==0 sin dividir por cero
+        - Fila extra de comparativa vs baseline original
         """
         d = self.d
         s = self.styles
 
-        prev_ndvi   = d.get('prev_ndvi_mean')
-        prev_ndwi   = d.get('prev_ndwi_mean')
+        # ════════════════════════════════════════════
+        # v8.0 FIX: Sanitizar valores previos (×1000 bug)
+        # ════════════════════════════════════════════
+        prev_ndvi   = _sanitize_index(d.get('prev_ndvi_mean'),  'ndvi')
+        prev_ndwi   = _sanitize_index(d.get('prev_ndwi_mean'),  'ndwi')
         prev_stress = d.get('prev_stress_pct')
+        prev_evi    = _sanitize_index(d.get('prev_evi_mean'),   'evi')
 
         if prev_ndvi is None and prev_ndwi is None and prev_stress is None:
             return None
@@ -1185,13 +1323,17 @@ class MuOrbitaPDFGenerator:
         area_ha     = d.get('area_hectares', 0)
 
         def delta_fmt(curr, prev, decimals=2, is_pct=False):
-            if prev is None or prev == 0:
+            """v8.0 FIX: No divide por 0; maneja prev==0 correctamente."""
+            if prev is None:
                 return '—', '—', 'black'
-            delta     = curr - prev
-            delta_pct = (delta / abs(prev)) * 100 if prev != 0 else 0
-            sign      = '+' if delta >= 0 else ''
-            trend     = '⬆' if delta > 0.005 else ('⬇' if delta < -0.005 else '➡')
-            color     = 'green' if delta >= 0 else 'red'
+            delta = curr - prev
+            if abs(prev) > 0.0001:
+                delta_pct = (delta / abs(prev)) * 100
+            else:
+                delta_pct = 0.0
+            sign   = '+' if delta >= 0 else ''
+            trend  = '⬆' if delta > 0.005 else ('⬇' if delta < -0.005 else '➡')
+            color  = 'green' if delta >= 0 else 'red'
             if is_pct:
                 color = 'red' if delta > 0.5 else ('green' if delta < -0.5 else 'black')
             fmt_delta = f"{sign}{delta:.{decimals}f} ({sign}{delta_pct:.1f}%)"
@@ -1200,11 +1342,7 @@ class MuOrbitaPDFGenerator:
         ndvi_delta,   ndvi_trend,   ndvi_color   = delta_fmt(curr_ndvi,   prev_ndvi)
         ndwi_delta,   ndwi_trend,   ndwi_color   = delta_fmt(curr_ndwi,   prev_ndwi, 3)
         stress_delta, stress_trend, stress_color = delta_fmt(curr_stress, prev_stress, 1, is_pct=True)
-
-        def fv(val, decimals=2):
-            if val is None: return '—'
-            try: return f"{float(val):.{decimals}f}"
-            except: return '—'
+        evi_delta,    evi_trend,    evi_color    = delta_fmt(curr_evi,    prev_evi, 3)
 
         rows_data = [
             ['Métrica', 'Período Anterior', 'Período Actual', 'Cambio', ''],
@@ -1213,10 +1351,37 @@ class MuOrbitaPDFGenerator:
             ['NDWI (Agua)',
              fv(prev_ndwi, 3), fv(curr_ndwi, 3), ndwi_delta, ndwi_trend],
             [f'Área estrés ({area_ha:.0f} ha)',
-             f"{fv(prev_stress, 1)}%", f"{fv(curr_stress, 1)}%", stress_delta, stress_trend],
+             f"{fv(prev_stress, 1)}%"  if prev_stress is not None else '—',
+             f"{fv(curr_stress, 1)}%", stress_delta, stress_trend],
             ['EVI (Productiv.)',
-             '—', fv(curr_evi, 3), '—', '—'],
+             fv(prev_evi, 3), fv(curr_evi, 3), evi_delta, evi_trend],
         ]
+
+        # v8.0 NEW: Fila de comparativa vs baseline original
+        baseline_ndvi = _sanitize_index(d.get('baseline_ndvi'), 'ndvi')
+        if baseline_ndvi is not None and abs(baseline_ndvi) <= 1.0:
+            bl_delta = curr_ndvi - baseline_ndvi
+            bl_pct   = (bl_delta / baseline_ndvi * 100) if baseline_ndvi > 0.0001 else 0
+            sign     = '+' if bl_delta >= 0 else ''
+            bl_color = 'green' if bl_delta >= 0 else 'red'
+            bl_trend = '⬆' if bl_delta > 0.005 else ('⬇' if bl_delta < -0.005 else '➡')
+            rows_data.append([
+                'NDVI vs Baseline',
+                fv(baseline_ndvi),
+                fv(curr_ndvi),
+                f'{sign}{bl_delta:.2f} ({sign}{bl_pct:.1f}%)',
+                bl_trend,
+            ])
+
+        # Color mapping for delta column per row
+        color_per_row = {
+            1: ndvi_color,
+            2: ndwi_color,
+            3: stress_color,
+            4: evi_color,
+        }
+        if baseline_ndvi is not None:
+            color_per_row[5] = bl_color
 
         data = []
         for r_idx, row in enumerate(rows_data):
@@ -1226,14 +1391,13 @@ class MuOrbitaPDFGenerator:
                     st = s['TableHeader']
                 elif c_idx == 0:
                     st = s['TableCellLeft']
-                elif c_idx == 3:
-                    color_map = {1: ndvi_color, 2: ndwi_color, 3: stress_color}
-                    color = color_map.get(r_idx, 'black')
+                elif c_idx == 3 and r_idx in color_per_row:
+                    color = color_per_row[r_idx]
                     st = ParagraphStyle('DeltaCell',
                         parent=s['TableCell'],
-                        textColor=colors.HexColor('#228B22') if color == 'green'
-                                  else (colors.HexColor('#CC3300') if color == 'red'
-                                  else colors.HexColor('#3E2B1D')),
+                        textColor=(colors.HexColor('#228B22') if color == 'green'
+                                   else (colors.HexColor('#CC3300') if color == 'red'
+                                   else colors.HexColor('#3E2B1D'))),
                         fontName='Helvetica-Bold',
                         fontSize=9, alignment=1
                     )
@@ -1256,14 +1420,15 @@ class MuOrbitaPDFGenerator:
         ]
         for r in range(2, len(data), 2):
             style_cmds.append(('BACKGROUND', (0, r), (-1, r), hex_color('cream')))
+        # v8.0: Baseline row con fondo diferenciado
+        if baseline_ndvi is not None and len(data) > 5:
+            style_cmds.append(('BACKGROUND', (0, 5), (-1, 5),
+                               colors.HexColor('#F0EDE5')))
         tbl.setStyle(TableStyle(style_cmds))
         return tbl
 
     def _forecast_alert_box(self) -> Optional[CalloutBox]:
-        """
-        Callout de alertas meteorológicas para los próximos 7 días.
-        Retorna None si no hay alertas activas.
-        """
+        """Callout de alertas meteorológicas para los próximos 7 días."""
         d = self.d
         s = self.styles
 
@@ -1283,22 +1448,116 @@ class MuOrbitaPDFGenerator:
         tmax    = forecast.get('temp_max_7d', 'N/A')
         tmin    = forecast.get('temp_min_7d', 'N/A')
         precip  = forecast.get('precip_7d_mm', 0)
-        summary = forecast.get('summary', '')
 
+        # v8.0 FIX: Siempre "PRÓXIMOS 7 DÍAS" — no depende de days_ahead upstream
         text = (
             f'<b>ALERTAS METEOROLÓGICAS — PRÓXIMOS 7 DÍAS:</b> '
             + ' | '.join(alerts)
             + f'  ·  Tmax: {tmax} ºC · Tmin: {tmin} ºC · Precip: {precip} mm'
         )
-        if summary:
-            text += f'<br/>{summary}'
-
         return CalloutBox(text, s, accent='red', width=self.content_w)
+
+    def _forecast_table(self) -> Optional[Table]:
+        """
+        v8.0 NEW: Tabla estructurada de previsión meteorológica 7 días.
+        Separa Tmax pico vs Tmax media para evitar confusión.
+        """
+        d = self.d
+        s = self.styles
+
+        forecast = d.get('forecast_summary')
+        if not forecast:
+            return None
+
+        tmax_7d = forecast.get('temp_max_7d', 'N/A')
+        tmin_7d = forecast.get('temp_min_7d', 'N/A')
+        precip  = forecast.get('precip_7d_mm', 0)
+
+        alerts = []
+        if forecast.get('heat_wave_risk'):  alerts.append('Ola de calor')
+        if forecast.get('frost_risk'):      alerts.append('Helada')
+        if forecast.get('drought_risk'):    alerts.append('Sequía')
+        if forecast.get('heavy_rain_risk'): alerts.append('Lluvias intensas')
+        alert_str = ', '.join(alerts) if alerts else 'Sin alertas'
+        alert_color = C['red'] if alerts else C['green']
+
+        rows_data = [
+            ['Parámetro', 'Próximos 7 días'],
+            ['Tmax prevista', f'{tmax_7d} ºC'],
+            ['Tmin prevista', f'{tmin_7d} ºC'],
+            ['Precipitación acumulada', f'{precip} mm'],
+            ['Alertas activas', alert_str],
+        ]
+
+        data = []
+        for r_idx, row in enumerate(rows_data):
+            tr = []
+            for c_idx, cell in enumerate(row):
+                if r_idx == 0:
+                    st = s['TableHeader']
+                elif r_idx == 4 and c_idx == 1:
+                    # Color the alert cell
+                    st = ParagraphStyle('AlertCell', parent=s['TableCell'],
+                         textColor=colors.HexColor(alert_color),
+                         fontName='Helvetica-Bold', fontSize=9, alignment=1)
+                elif c_idx == 0:
+                    st = s['TableCellLeft']
+                else:
+                    st = s['TableCell']
+                tr.append(Paragraph(str(cell), st))
+            data.append(tr)
+
+        cw = [55*mm, 55*mm]
+        tbl = Table(data, colWidths=cw)
+        tbl.setStyle(TableStyle([
+            ('BACKGROUND',(0,0),(-1,0), hex_color('table_header')),
+            ('TEXTCOLOR',(0,0),(-1,0), hex_color('white')),
+            ('GRID',(0,0),(-1,-1), 0.5, hex_color('cream_dark')),
+            ('BOX',(0,0),(-1,-1), 1, hex_color('table_header')),
+            ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+            ('TOPPADDING',(0,0),(-1,-1), 5),
+            ('BOTTOMPADDING',(0,0),(-1,-1), 5),
+            ('BACKGROUND',(0,2),(-1,2), hex_color('cream')),
+            ('BACKGROUND',(0,4),(-1,4), hex_color('cream')),
+        ]))
+        return tbl
+
+    def _biweekly_executive_bullets(self) -> List:
+        """
+        v8.0 NEW: Executive summary bisemanal como lista de bullets
+        en vez de párrafo continuo. Más escaneable.
+        """
+        s = self.styles
+        elements = []
+
+        exec_text = self._get_narrative('executive_summary', '')
+        if not exec_text:
+            return elements
+
+        # Dividir por frases (. seguido de espacio y mayúscula, o salto de línea)
+        sentences = re.split(r'(?<=[.!])\s+', exec_text.strip())
+        sentences = [sent.strip() for sent in sentences if sent.strip()]
+
+        if len(sentences) <= 1:
+            # Si es una sola frase, usar callout normal
+            elements.append(CalloutBox(
+                f'<b>Resumen ejecutivo:</b> {exec_text}',
+                s, accent='gold', width=self.content_w
+            ))
+        else:
+            # Múltiples frases → bullets con callout contenedor
+            bullet_html = '<b>Resumen ejecutivo:</b><br/>'
+            for sent in sentences[:7]:  # Máximo 7 bullets
+                bullet_html += f'• {sent}<br/>'
+            elements.append(CalloutBox(bullet_html.rstrip('<br/>'),
+                                       s, accent='gold', width=self.content_w))
+
+        return elements
 
     def _biweekly_changes_section(self) -> List:
         """
-        Sección completa de cambios bisemanales:
-        tabla de deltas + interpretación de Claude + nuevos riesgos + forecast.
+        v8.0: Sección de cambios bisemanales — SOLO tabla + interpretación.
+        Forecast y nuevos riesgos se mueven a su propia sección.
         """
         d = self.d
         s = self.styles
@@ -1308,7 +1567,6 @@ class MuOrbitaPDFGenerator:
         elements.append(Paragraph('Cambios vs Período Anterior', s['SubsectionTitle']))
         elements.append(Spacer(1, 2*mm))
 
-        # Tabla de deltas
         delta_tbl = self._delta_table()
         if delta_tbl:
             elements.append(delta_tbl)
@@ -1320,7 +1578,6 @@ class MuOrbitaPDFGenerator:
             ))
             elements.append(Spacer(1, 3*mm))
 
-        # Interpretación de cambios (Claude)
         changes_text = self._get_narrative('changes_interpretation', '')
         if changes_text:
             elements.append(CalloutBox(
@@ -1329,7 +1586,46 @@ class MuOrbitaPDFGenerator:
             ))
             elements.append(Spacer(1, 3*mm))
 
-        # Nuevos riesgos
+        return elements
+
+    def _biweekly_forecast_risks_section(self) -> List:
+        """
+        v8.0 NEW: Sección separada para forecast + nuevos riesgos.
+        Antes estaba todo apretado en _biweekly_changes_section.
+        """
+        d = self.d
+        s = self.styles
+        elements = []
+
+        # ── Previsión meteorológica ──
+        forecast = d.get('forecast_summary')
+        if forecast:
+            elements.append(Paragraph('Previsión Meteorológica — Próximos 7 días',
+                                      s['SubsectionTitle']))
+            elements.append(Spacer(1, 2*mm))
+
+            # Tabla de forecast
+            fc_tbl = self._forecast_table()
+            if fc_tbl:
+                elements.append(fc_tbl)
+                elements.append(Spacer(1, 2*mm))
+
+            # Alert box (solo si hay alertas)
+            forecast_box = self._forecast_alert_box()
+            if forecast_box:
+                elements.append(forecast_box)
+                elements.append(Spacer(1, 2*mm))
+
+            # Narrativa de impacto
+            forecast_narrative = self._get_narrative('forecast_narrative', '')
+            if forecast_narrative:
+                elements.append(CalloutBox(
+                    f'<b>Impacto agronómico previsto:</b> {forecast_narrative}',
+                    s, accent='yellow', width=self.content_w
+                ))
+            elements.append(Spacer(1, 3*mm))
+
+        # ── Nuevos riesgos ──
         new_risks_text = self._get_narrative('new_risks', '')
         if new_risks_text and 'No se han detectado' not in new_risks_text:
             elements.append(Paragraph('Nuevos Riesgos Detectados', s['SubsectionTitle']))
@@ -1338,43 +1634,24 @@ class MuOrbitaPDFGenerator:
                 f'<b>Nuevos riesgos:</b> {new_risks_text}',
                 s, accent='red', width=self.content_w
             ))
-            elements.append(Spacer(1, 3*mm))
         else:
             elements.append(Paragraph(
-                f'<font color="{C["green"]}">✅ No se han detectado nuevos riesgos significativos en este período.</font>',
+                f'<font color="{C["green"]}">✓ No se han detectado nuevos riesgos '
+                f'significativos en este período.</font>',
                 s['Body']
             ))
-            elements.append(Spacer(1, 3*mm))
-
-        # Forecast alert
-        forecast_box = self._forecast_alert_box()
-        if forecast_box:
-            elements.append(Paragraph('Previsión Meteorológica — Próximos 7 días', s['SubsectionTitle']))
-            elements.append(Spacer(1, 1*mm))
-            elements.append(forecast_box)
-
-            forecast_narrative = self._get_narrative('forecast_narrative', '')
-            if forecast_narrative:
-                elements.append(Spacer(1, 2*mm))
-                elements.append(CalloutBox(
-                    f'<b>Impacto agronómico previsto:</b> {forecast_narrative}',
-                    s, accent='yellow', width=self.content_w
-                ))
-            elements.append(Spacer(1, 3*mm))
+        elements.append(Spacer(1, 3*mm))
 
         return elements
 
     # =====================================================
-    # MAIN BUILD METHOD — v7.0
-    # Baseline path idéntico a v6.0. Biweekly añade
-    # sección de cambios en página 2 y omite VRA.
+    # MAIN BUILD METHOD — v8.0
     # =====================================================
     def generate(self) -> bytes:
         """
-        v7.0: Layout diferenciado por analysis_type.
-        - BASELINE:  estructura completa idéntica a v6.0
-        - BIWEEKLY:  página 2 incluye sección de cambios y forecast;
-                     página 5 omite VRA
+        v8.0: Layout mejorado.
+        BASELINE: estructura idéntica a v6.0/v7.0
+        BIWEEKLY: mejor flujo de páginas, forecast separado, bullets en summary
         """
         d = self.d
         s = self.styles
@@ -1393,7 +1670,7 @@ class MuOrbitaPDFGenerator:
         ct = crop_label(d.get('crop_type', ''))
 
         # ════════════════════════════════════════════════════
-        # PAGE 2: RESUMEN EJECUTIVO
+        # PAGE 2: KPIs + RESUMEN EJECUTIVO
         # ════════════════════════════════════════════════════
         elements.append(Spacer(1, 3*mm))
         elements.append(Paragraph('Indicadores Clave de Rendimiento', s['SectionTitle']))
@@ -1402,20 +1679,35 @@ class MuOrbitaPDFGenerator:
         elements.append(self._kpi_cards())
         elements.append(Spacer(1, 4*mm))
 
-        exec_summary = self._get_narrative('executive_summary', '')
-        if exec_summary:
-            elements.append(CalloutBox(
-                f'<b>Resumen ejecutivo:</b> {exec_summary}',
-                s, accent='gold', width=self.content_w
-            ))
-            elements.append(Spacer(1, 3*mm))
-
         if is_biweekly:
-            # ── BIWEEKLY: sección de cambios justo tras el resumen ──
+            # v8.0: Bullets format para biweekly
+            exec_elements = self._biweekly_executive_bullets()
+            elements.extend(exec_elements)
+            elements.append(Spacer(1, 2*mm))
+
+            # Tabla de cambios (sin forecast — va aparte)
             elements.extend(self._biweekly_changes_section())
-            elements.append(PageBreak())
+
+            # Detalle de Índices en la misma página si cabe
+            elements.append(Paragraph('Detalle de Índices Vegetativos', s['SubsectionTitle']))
+            elements.append(self._detail_table())
+            elements.append(Spacer(1, 4*mm))
+
+            # Gauge
+            gauge_bytes = generate_ndvi_gauge(
+                d.get('ndvi_mean', 0.3), d.get('ndvi_p10', 0.2), d.get('ndvi_p90', 0.4))
+            elements.append(self._real_or_generated('NDVI_DISTRIBUTION', gauge_bytes, 155, 42))
+
         else:
-            # ── BASELINE: interpretación integrada (igual que v6.0) ──
+            # ── BASELINE: igual que v6.0 ──
+            exec_summary = self._get_narrative('executive_summary', '')
+            if exec_summary:
+                elements.append(CalloutBox(
+                    f'<b>Resumen ejecutivo:</b> {exec_summary}',
+                    s, accent='gold', width=self.content_w
+                ))
+                elements.append(Spacer(1, 3*mm))
+
             integrated = self._get_narrative('integrated_interpretation', '')
             if integrated:
                 elements.append(CalloutBox(
@@ -1423,10 +1715,9 @@ class MuOrbitaPDFGenerator:
                     s, accent='green', width=self.content_w
                 ))
             else:
-                # Fallback auto-generado — idéntico a v6.0
-                ndvi_m    = d.get('ndvi_mean', 0)
-                stress_pct= d.get('stress_area_pct', 0)
-                hetero    = d.get('ndvi_p90', 0) - d.get('ndvi_p10', 0)
+                ndvi_m     = d.get('ndvi_mean', 0)
+                stress_pct = d.get('stress_area_pct', 0)
+                hetero     = d.get('ndvi_p90', 0) - d.get('ndvi_p10', 0)
 
                 if stress_pct > 40:
                     interp_text = (
@@ -1454,18 +1745,18 @@ class MuOrbitaPDFGenerator:
 
             elements.append(Spacer(1, 4*mm))
 
-        # Detalle de Índices (ambos tipos)
-        elements.append(Paragraph('Detalle de Índices Vegetativos', s['SubsectionTitle']))
-        elements.append(self._detail_table())
-        elements.append(Spacer(1, 4*mm))
+            # Detalle de Índices (baseline)
+            elements.append(Paragraph('Detalle de Índices Vegetativos', s['SubsectionTitle']))
+            elements.append(self._detail_table())
+            elements.append(Spacer(1, 4*mm))
 
-        # Gauge NDVI (ambos tipos)
-        gauge_bytes = generate_ndvi_gauge(
-            d.get('ndvi_mean', 0.3), d.get('ndvi_p10', 0.2), d.get('ndvi_p90', 0.4))
-        elements.append(self._real_or_generated('NDVI_DISTRIBUTION', gauge_bytes, 155, 42))
+            # Gauge NDVI (baseline)
+            gauge_bytes = generate_ndvi_gauge(
+                d.get('ndvi_mean', 0.3), d.get('ndvi_p10', 0.2), d.get('ndvi_p90', 0.4))
+            elements.append(self._real_or_generated('NDVI_DISTRIBUTION', gauge_bytes, 155, 42))
 
         # ════════════════════════════════════════════════════
-        # PAGE 3: MAPAS CON INTERPRETACIÓN
+        # PAGE: MAPAS CON INTERPRETACIÓN
         # ════════════════════════════════════════════════════
         elements.append(PageBreak())
         elements.append(Spacer(1, 3*mm))
@@ -1487,24 +1778,16 @@ class MuOrbitaPDFGenerator:
         ]))
         elements.append(maps_row1)
 
-        # Interpretación inline NDVI + NDWI
         map_ndvi_text = self._get_narrative('map_ndvi', '')
         map_ndwi_text = self._get_narrative('map_ndwi', '')
         if map_ndvi_text or map_ndwi_text:
-            captions_row1 = []
-            captions_row1.append(
-                Paragraph(f'<b>NDVI:</b> {map_ndvi_text}' if map_ndvi_text else '',
-                          s['MapCaption'])
-            )
-            captions_row1.append(
-                Paragraph(f'<b>NDWI:</b> {map_ndwi_text}' if map_ndwi_text else '',
-                          s['MapCaption'])
-            )
+            captions_row1 = [
+                Paragraph(f'<b>NDVI:</b> {map_ndvi_text}' if map_ndvi_text else '', s['MapCaption']),
+                Paragraph(f'<b>NDWI:</b> {map_ndwi_text}' if map_ndwi_text else '', s['MapCaption']),
+            ]
             cap_tbl1 = Table([captions_row1], colWidths=[83*mm, 83*mm])
-            cap_tbl1.setStyle(TableStyle([
-                ('VALIGN',(0,0),(-1,-1),'TOP'),
-                ('TOPPADDING',(0,0),(-1,-1), 1),
-            ]))
+            cap_tbl1.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),
+                                          ('TOPPADDING',(0,0),(-1,-1), 1)]))
             elements.append(cap_tbl1)
 
         elements.append(Spacer(1, 3*mm))
@@ -1523,44 +1806,44 @@ class MuOrbitaPDFGenerator:
         ]))
         elements.append(maps_row2)
 
-        # Interpretación inline EVI + NDCI
         map_evi_text  = self._get_narrative('map_evi', '')
         map_ndci_text = self._get_narrative('map_ndci', '')
         if map_evi_text or map_ndci_text:
-            captions_row2 = []
-            captions_row2.append(
-                Paragraph(f'<b>EVI:</b> {map_evi_text}'   if map_evi_text  else '', s['MapCaption'])
-            )
-            captions_row2.append(
-                Paragraph(f'<b>NDCI:</b> {map_ndci_text}' if map_ndci_text else '', s['MapCaption'])
-            )
+            captions_row2 = [
+                Paragraph(f'<b>EVI:</b> {map_evi_text}'   if map_evi_text  else '', s['MapCaption']),
+                Paragraph(f'<b>NDCI:</b> {map_ndci_text}' if map_ndci_text else '', s['MapCaption']),
+            ]
             cap_tbl2 = Table([captions_row2], colWidths=[83*mm, 83*mm])
-            cap_tbl2.setStyle(TableStyle([
-                ('VALIGN',(0,0),(-1,-1),'TOP'),
-                ('TOPPADDING',(0,0),(-1,-1), 1),
-            ]))
+            cap_tbl2.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),
+                                          ('TOPPADDING',(0,0),(-1,-1), 1)]))
             elements.append(cap_tbl2)
 
         elements.append(Spacer(1, 2*mm))
 
-        # Map source note
-        has_real_maps = any(
-            alias in self.png_map
-            for aliases in [self.KEY_ALIASES.get('NDVI_MAP', []), self.KEY_ALIASES.get('NDWI_MAP', [])]
-            for alias in aliases
-        )
-        map_note = (
-            '<b>Nota:</b> Mapas generados por Google Earth Engine sobre imagen satelital Sentinel-2 '
-            'con la geometría real de la parcela.'
-            if has_real_maps else
-            '<b>Nota:</b> Mapas sintéticos de distribución espacial estimada. '
-            'Contacte a soporte si no aparecen las imágenes satelitales reales.'
-        )
+        # v8.0: Nota de mapa — distingue real vs sintético por índice
+        has_ndvi_real = self._has_real_map('NDVI_MAP')
+        has_evi_real  = self._has_real_map('EVI_MAP')
+
+        if has_ndvi_real and has_evi_real:
+            map_note = (
+                '<b>Nota:</b> Mapas generados por Google Earth Engine sobre imagen satelital '
+                'Sentinel-2 con la geometría real de la parcela.'
+            )
+        elif has_ndvi_real:
+            map_note = (
+                '<b>Nota:</b> NDVI y NDWI: mapas satelitales reales (GEE + Sentinel-2). '
+                'EVI y NDCI: distribución espacial estimada — imágenes satelitales en desarrollo.'
+            )
+        else:
+            map_note = (
+                '<b>Nota:</b> Mapas sintéticos de distribución espacial estimada. '
+                'Contacte a soporte si no aparecen las imágenes satelitales reales.'
+            )
         elements.append(Paragraph(f'<font size="8" color="{C["text_muted"]}">{map_note}</font>',
                                   s['Footnote']))
 
         # ════════════════════════════════════════════════════
-        # PAGE 4: EVOLUCIÓN TEMPORAL + CLIMA
+        # PAGE: EVOLUCIÓN TEMPORAL + CLIMA
         # ════════════════════════════════════════════════════
         elements.append(PageBreak())
         elements.append(Spacer(1, 3*mm))
@@ -1605,7 +1888,14 @@ class MuOrbitaPDFGenerator:
             ))
 
         # ════════════════════════════════════════════════════
-        # PAGE 5: RIESGOS + VRA (VRA solo en baseline)
+        # BIWEEKLY: FORECAST + NUEVOS RIESGOS (en su propia sección)
+        # ════════════════════════════════════════════════════
+        if is_biweekly:
+            elements.append(Spacer(1, 3*mm))
+            elements.extend(self._biweekly_forecast_risks_section())
+
+        # ════════════════════════════════════════════════════
+        # PAGE: RIESGOS + VRA (VRA solo en baseline)
         # ════════════════════════════════════════════════════
         elements.append(PageBreak())
         elements.append(Spacer(1, 3*mm))
@@ -1616,14 +1906,13 @@ class MuOrbitaPDFGenerator:
         elements.append(Spacer(1, 5*mm))
 
         if not is_biweekly:
-            # VRA solo en baseline
             vra_elements = self._vra_section()
             if vra_elements:
                 elements.extend(vra_elements)
                 elements.append(Spacer(1, 5*mm))
 
         # ════════════════════════════════════════════════════
-        # PAGE 6: RECOMENDACIONES
+        # RECOMENDACIONES
         # ════════════════════════════════════════════════════
         elements.append(Paragraph('Recomendaciones Prioritarias', s['SectionTitle']))
         elements.append(SectionDivider(self.content_w))
@@ -1652,9 +1941,11 @@ class MuOrbitaPDFGenerator:
             elements.append(Spacer(1, 3*mm))
 
         # ════════════════════════════════════════════════════
-        # LAST PAGE: ANEXO TÉCNICO
+        # ANEXO TÉCNICO
+        # v8.0 FIX: CondPageBreak en vez de PageBreak forzado
+        #           para evitar página en blanco
         # ════════════════════════════════════════════════════
-        elements.append(PageBreak())
+        elements.append(CondPageBreak(80*mm))
         elements.append(Spacer(1, 3*mm))
         elements.append(Paragraph('Anexo Técnico', s['SectionTitle']))
         elements.append(SectionDivider(self.content_w))
@@ -1703,7 +1994,7 @@ def generate_muorbita_report(data: Dict[str, Any]) -> Dict[str, Any]:
             'pdf_size': len(pdf_bytes),
             'job_id': job_id,
             'generated_at': datetime.now().isoformat(),
-            'version': '7.1',
+            'version': '8.0',
             'images_used': list(generator.png_map.keys()) if generator.png_map else ['matplotlib_fallback'],
             'has_narratives': bool(generator.narratives),
             'narrative_fields': list(generator.narratives.keys()) if generator.narratives else [],
@@ -1727,105 +2018,117 @@ if __name__ == '__main__':
     import sys
 
     test_data = {
-        "job_id": "MUORBITA_TEST_V7",
+        "job_id": "BW_TEST_V8",
         "client_name": "Jairo Mejías Reyes",
-        "crop_type": "viñedo",
-        "analysis_type": "baseline",
-        "area_hectares": 16.5,
-        "start_date": "2025-09-14",
-        "end_date": "2026-03-14",
-        "images_processed": 43,
-        "latest_image_date": "2026-03-11",
-        "ndvi_mean": 0.60, "ndvi_p10": 0.50, "ndvi_p50": 0.60,
-        "ndvi_p90": 0.68, "ndvi_stddev": 0.076, "ndvi_zscore": 2.27,
-        "ndwi_mean": 0.08, "ndwi_p10": 0.024, "ndwi_p90": 0.138,
-        "evi_mean": 0.31, "evi_p10": 0.259, "evi_p90": 0.363,
-        "ndci_mean": 0.28, "savi_mean": 0.32,
-        "stress_area_ha": 0.1, "stress_area_pct": 0.4,
-        "lst_mean_c": 13.8, "lst_min_c": 13.7, "lst_max_c": 13.8,
-        "heterogeneity": 0.18,
+        "crop_type": "olivar",
+        "analysis_type": "biweekly",
+        "area_hectares": 20.0,
+        "start_date": "2026-02-17",
+        "end_date": "2026-03-19",
+        "images_processed": 16,
+        "latest_image_date": "2026-03-18",
+        "ndvi_mean": 0.58, "ndvi_p10": 0.44, "ndvi_p50": 0.60,
+        "ndvi_p90": 0.68, "ndvi_stddev": 0.076, "ndvi_zscore": 0.5,
+        "ndwi_mean": 0.123, "ndwi_p10": 0.011, "ndwi_p50": 0.142, "ndwi_p90": 0.204,
+        "evi_mean": 0.383, "evi_p10": 0.274, "evi_p50": 0.397, "evi_p90": 0.464,
+        "ndci_mean": 0.278, "savi_mean": 0.383,
+        "stress_area_ha": 0.14, "stress_area_pct": 0.7,
+        "lst_mean_c": 0,  # ← BUG: MODIS no devolvió dato
+        "heterogeneity": 0.24,
 
         # Weather ERA5
-        "weather_tmax_mean": 18.5,
-        "weather_tmin_mean": 6.2,
+        "weather_tmax_mean": 18.8,
+        "weather_tmax_max": 24.8,
+        "weather_tmin_mean": 7.9,
+        "weather_tmin_min": 3.2,
         "weather_heat_days": 0,
-        "weather_frost_days": 3,
-        "weather_gdd": 842.5,
-        "weather_precip_total": 285.0,
-        "weather_et_total": 195.0,
-        "weather_water_balance": 90.0,
-        "weather_rain_days": 28,
+        "weather_frost_days": 0,
+        "weather_gdd": 80,
+        "weather_precip_total": 24.3,
+        "weather_et_total": 48.1,
+        "weather_water_balance": -23.9,
+        "weather_rain_days": 6,
+        "weather_soil_moisture": 0.39,
 
-        # VRA stats
-        "vra_stats": [
-            {"zone": 0, "label": "Bajo vigor", "recommendation": "Dosis alta", "area_ha": 3.2, "ndvi_mean": 0.52, "ndwi_mean": 0.04, "evi_mean": 0.26},
-            {"zone": 1, "label": "Vigor medio", "recommendation": "Dosis media", "area_ha": 7.8, "ndvi_mean": 0.60, "ndwi_mean": 0.08, "evi_mean": 0.31},
-            {"zone": 2, "label": "Alto vigor", "recommendation": "Dosis baja", "area_ha": 5.5, "ndvi_mean": 0.68, "ndwi_mean": 0.12, "evi_mean": 0.36},
-        ],
+        # Deltas — simula el bug ×1000 para verificar fix
+        "prev_ndvi_mean": 0.588,  # era 588 antes del fix upstream
+        "prev_ndwi_mean": 0.124,
+        "prev_stress_pct": 0.7,
+        "prev_evi_mean": None,
+        "baseline_ndvi": 0.59,
+
+        # Forecast
+        "forecast_summary": {
+            "temp_max_7d": "24.8",
+            "temp_min_7d": "10.2",
+            "precip_7d_mm": "12.2",
+            "heat_wave_risk": False,
+            "frost_risk": False,
+            "drought_risk": True,
+            "heavy_rain_risk": False,
+            "summary": "Tmax prevista 20.8 ºC, precip 12.2 mm en 7 días",
+            "days_ahead": 16,  # ← BUG upstream, pero PDF siempre dice "7 días"
+        },
 
         # Claude narratives
         "narratives": {
-            "executive_summary": "El viñedo de 16.5 ha presenta un estado vegetativo excelente con NDVI de 0.60, en el límite superior del rango típico para viñedo (0.40–0.60). Solo 0.1 ha (0.4%) muestra estrés. El NDWI de 0.08 indica déficit hídrico moderado que requiere ajuste de riego antes de primavera. Acción prioritaria: revisión del sistema de riego en los sectores con NDWI más bajo.",
-            "integrated_interpretation": "Todos los índices son coherentes: el NDVI alto (0.60) se confirma con EVI robusto (0.31) y buen contenido de clorofila (NDCI 0.28). La única discrepancia es el NDWI moderado (0.08), que sugiere que pese al buen vigor actual, el contenido hídrico foliar empieza a descender. Con un balance hídrico positivo de +90 mm en el período, la reserva del suelo ha sido suficiente, pero la evapotranspiración creciente de primavera podría invertir esta situación.",
-            "map_ndvi": "El vigor se distribuye de forma relativamente homogénea, con las zonas de mayor NDVI (0.68) concentradas en el sector central-norte de la parcela. El sector sur muestra valores más bajos (P10: 0.50), posiblemente asociados a diferencias de suelo o exposición.",
-            "map_ndwi": "El estado hídrico muestra un patrón espacial similar al NDVI pero más marcado: las zonas con menor contenido de agua (NDWI 0.024) coinciden con las de menor vigor en el sector sur. No se detectan zonas con déficit severo (NDWI < 0).",
-            "map_evi": "La productividad fotosintética (EVI 0.31) confirma el patrón de vigor del NDVI. Las zonas con EVI más alto (0.36) coinciden con las de mayor NDVI, confirmando un viñedo con buena capacidad productiva.",
-            "map_ndci": "El contenido de clorofila (NDCI 0.28) es adecuado para la fase actual. No se detectan patrones de deficiencia nutricional significativa.",
-            "temporal_analysis": "La serie temporal de 43 observaciones muestra una tendencia estable-ascendente desde septiembre 2025. El NDVI pasó de 0.55 en otoño a 0.60 actual, coherente con la activación vegetativa post-parada invernal.",
-            "climate_assessment": "El período analizado acumuló 285 mm de precipitación frente a 195 mm de evapotranspiración, dejando un balance hídrico positivo de +90 mm. Se registraron 3 días de helada, sin impacto visible en el vigor.",
+            "executive_summary": "El olivar mantiene un vigor normal con NDVI de 0.58, sin cambios significativos respecto al período anterior. El área bajo estrés permanece mínima (0.7%). El balance hídrico negativo de -23.9 mm y la previsión de riesgo de sequía requieren atención al manejo del riego. Las condiciones térmicas han sido favorables sin días de calor extremo ni heladas.",
+            "changes_interpretation": "El NDVI se mantiene prácticamente estable con una variación mínima de -0.006 (-1.0%) respecto al período anterior, dentro del rango normal esperado para olivar. Esta estabilidad en el índice de vigor es coherente con las condiciones climáticas moderadas del período bisemanal.",
+            "new_risks": "Se identifica riesgo de sequía en la previsión meteorológica próxima, con balance hídrico deficitario sostenido que podría intensificarse. No se detectan otros nuevos riesgos significativos en este período.",
+            "forecast_narrative": "La previsión de 7 días indica temperaturas máximas de 24.8 ºC y precipitaciones limitadas de 12.2 mm, insuficientes para compensar el déficit hídrico acumulado. El riesgo de sequía confirmado requiere ajustar la estrategia de riego antes de que se intensifique el estrés hídrico en las próximas semanas.",
+            "map_ndvi": "La distribución espacial del vigor muestra un patrón homogéneo con NDVI medio de 0.58 y baja heterogeneidad. La concentración del 80% de valores entre 0.44-0.68 indica uniformidad en el estado vegetativo sin cambios significativos respecto al anterior.",
+            "map_ndwi": "El estado hídrico con NDWI de 0.12 refleja coherentemente el balance hídrico negativo. La distribución P10-P90 de 0.01-0.20 sugiere variabilidad moderada en el contenido de humedad foliar.",
+            "map_evi": "La productividad fotosintética con EVI de 0.38 confirma la tendencia del NDVI, indicando actividad metabólica normal para olivar en esta época.",
+            "map_ndci": "El NDCI de 0.28 sugiere niveles adecuados de clorofila, coherentes con el NDVI observado.",
+            "temporal_analysis": "Durante el período bisemanal se registraron 16 imágenes válidas con tendencia estable del NDVI entre 0.46-0.62. El máximo de 0.62 el 11 de marzo indica buena respuesta vegetativa, con ligero descenso al final del período asociado al balance hídrico.",
+            "climate_assessment": "Las condiciones climáticas han sido moderadas con Tmax de 18.8 ºC y Tmin de 7.9 ºC, sin eventos extremos. Los 80 GDD acumulados son apropiados para la época, aunque el déficit hídrico de -23.9 mm requiere compensación mediante riego.",
             "risk_hydric_level": "Moderado",
-            "risk_hydric_text": "NDWI de 0.08 por debajo del umbral óptimo (0.20). Balance hídrico positivo (+90 mm) pero contenido hídrico foliar en descenso.",
+            "risk_hydric_text": "El NDWI de 0.12 y balance hídrico negativo indican inicio de estrés hídrico moderado. La previsión de sequía con precipitaciones limitadas (12.2 mm) agravará esta situación si no se incrementa el aporte hídrico artificial.",
             "risk_thermal_level": "Bajo",
-            "risk_thermal_text": "Sin días de calor extremo y solo 3 heladas leves. LST media de 13.8 ºC normal para la época.",
-            "risk_heterogeneity_level": "Media",
-            "risk_heterogeneity_text": "Rango P10-P90 de 0.18 indica heterogeneidad moderada. Zona sur con menor vigor (NDVI 0.52) requiere atención diferenciada.",
-            "vra_analysis": "Tres zonas: 5.5 ha alto vigor (sector norte, NDVI 0.68), 7.8 ha vigor medio (central, NDVI 0.60), 3.2 ha bajo vigor (sur, NDVI 0.52). La zona sur coincide con menor NDWI (0.04).",
+            "risk_thermal_text": "Sin días de calor extremo ni heladas en el período analizado. Las temperaturas previstas de 24.8 ºC máximas se mantienen en rangos favorables.",
+            "risk_heterogeneity_level": "Baja",
+            "risk_heterogeneity_text": "La heterogeneidad P90-P10 de 0.24 indica uniformidad espacial adecuada. Esta homogeneidad facilita el manejo y sugiere condiciones equilibradas en toda la parcela.",
             "recommendations": [
                 {
-                    "title": "Revisión y ajuste del riego en sector sur",
+                    "title": "Incrementar frecuencia de riego preventivo",
+                    "priority": "Alta",
+                    "deadline_days": 3,
+                    "trigger": "Balance hídrico -23.9 mm y previsión de riesgo de sequía",
+                    "zone": "Toda la parcela",
+                    "justification": "El déficit hídrico sostenido requiere compensación antes de que se intensifique el estrés"
+                },
+                {
+                    "title": "Monitoreo semanal de humedad del suelo",
                     "priority": "Media",
                     "deadline_days": 7,
-                    "trigger": "NDWI = 0.04 en zona de bajo vigor (3.2 ha, sector sur)",
-                    "zone": "Sector sur — zona VRA 'Bajo vigor'",
-                    "justification": "El déficit hídrico moderado puede agravarse con el aumento de temperaturas primaverales"
+                    "trigger": "Humedad del suelo de 0.39 m³/m³ con tendencia descendente",
+                    "zone": "Zonas representativas de la parcela",
+                    "justification": "Control preventivo para optimizar la programación del riego"
                 },
                 {
-                    "title": "Fertilización diferenciada según zonificación VRA",
-                    "priority": "Media",
-                    "deadline_days": 14,
-                    "trigger": "Heterogeneidad P90-P10 = 0.18 con 3 zonas diferenciadas",
-                    "zone": "Toda la parcela — dosis según mapa VRA",
-                    "justification": "Maximizar eficiencia del fertilizante según vigor diferencial"
-                },
-                {
-                    "title": "Monitorización de brotación y estado hídrico",
+                    "title": "Planificar análisis foliar nutricional",
                     "priority": "Baja",
                     "deadline_days": 14,
-                    "trigger": "Inicio de fase vegetativa activa (842 GDD acumulados)",
-                    "zone": "Toda la parcela",
-                    "justification": "La transición a brotación es período crítico donde el vigor debe mantenerse"
+                    "trigger": "NDCI 0.28 estable — ventana de evaluación nutricional",
+                    "zone": "Muestreo representativo",
+                    "justification": "Aprovechar condiciones estables para evaluación nutricional de base"
                 }
             ],
-            "conclusion": "El viñedo está en excelente estado para afrontar la campaña 2026. Principal punto de atención: déficit hídrico moderado en sector sur. Próxima revisión en 14 días."
+            "conclusion": "El olivar presenta condiciones estables con vigor normal, requiriendo principalmente atención al manejo hídrico preventivo. Recomendamos revisión en 15 días para evaluar respuesta a las medidas de riego implementadas."
         },
 
         "time_series": [
-            {"date": "2025-04-01", "ndvi": 0.35, "ndwi": 0.05, "evi": 0.20},
-            {"date": "2025-05-01", "ndvi": 0.50, "ndwi": 0.10, "evi": 0.28},
-            {"date": "2025-06-01", "ndvi": 0.62, "ndwi": 0.15, "evi": 0.33},
-            {"date": "2025-07-01", "ndvi": 0.70, "ndwi": 0.18, "evi": 0.36},
-            {"date": "2025-08-01", "ndvi": 0.65, "ndwi": 0.12, "evi": 0.34},
-            {"date": "2025-09-01", "ndvi": 0.55, "ndwi": 0.08, "evi": 0.29},
-            {"date": "2025-10-01", "ndvi": 0.48, "ndwi": 0.06, "evi": 0.25},
-            {"date": "2025-11-01", "ndvi": 0.42, "ndwi": 0.05, "evi": 0.22},
-            {"date": "2025-12-01", "ndvi": 0.40, "ndwi": 0.04, "evi": 0.21},
-            {"date": "2026-01-01", "ndvi": 0.45, "ndwi": 0.06, "evi": 0.24},
-            {"date": "2026-02-01", "ndvi": 0.55, "ndwi": 0.07, "evi": 0.28},
-            {"date": "2026-03-11", "ndvi": 0.60, "ndwi": 0.08, "evi": 0.31},
+            {"date": "2026-02-21", "ndvi": 0.48, "ndwi": 0.10, "evi": 0.30},
+            {"date": "2026-02-25", "ndvi": 0.50, "ndwi": 0.11, "evi": 0.32},
+            {"date": "2026-03-01", "ndvi": 0.54, "ndwi": 0.12, "evi": 0.35},
+            {"date": "2026-03-05", "ndvi": 0.56, "ndwi": 0.12, "evi": 0.36},
+            {"date": "2026-03-09", "ndvi": 0.60, "ndwi": 0.13, "evi": 0.38},
+            {"date": "2026-03-11", "ndvi": 0.62, "ndwi": 0.14, "evi": 0.39},
+            {"date": "2026-03-13", "ndvi": 0.60, "ndwi": 0.13, "evi": 0.38},
+            {"date": "2026-03-17", "ndvi": 0.58, "ndwi": 0.12, "evi": 0.37},
         ],
 
         "png_images": [],
-        "markdown_analysis": ""
     }
 
     if len(sys.argv) > 1:
@@ -1838,7 +2141,7 @@ if __name__ == '__main__':
         out_path = f"/tmp/{result['filename']}"
         with open(out_path, 'wb') as f:
             f.write(base64.b64decode(result['pdf_base64']))
-        print(f"✅ PDF v7.0 generado: {out_path} ({result['pdf_size']:,} bytes)")
+        print(f"✅ PDF v8.0 generado: {out_path} ({result['pdf_size']:,} bytes)")
         print(f"   Imágenes: {result['images_used']}")
         print(f"   Narrativas: {result['has_narratives']} ({len(result['narrative_fields'])} campos)")
     else:
