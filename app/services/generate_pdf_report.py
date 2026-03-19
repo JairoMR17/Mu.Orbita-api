@@ -1,5 +1,5 @@
 """
-Mu.Orbita PDF Report Generator v7.0
+Mu.Orbita PDF Report Generator v7.1
 ====================================
 v7.0: Soporte bisemanal completo. Layout diferenciado por analysis_type.
       Tabla de cambios vs período anterior, forecast alert, nuevos riesgos.
@@ -377,12 +377,14 @@ def generate_ts_chart(time_series: List[Dict], crop_type: str = 'olivar',
     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=10))
     plt.xticks(rotation=30, ha='right')
     ax.set_ylim(-0.15, 1.0)
-    ax.legend(loc='upper right', fontsize=8, framealpha=0.9, edgecolor=C['cream_dark'])
+    ax.legend(loc='lower center', bbox_to_anchor=(0.5, 1.02), ncol=3,
+              fontsize=8, framealpha=0.9, edgecolor=C['cream_dark'],
+              borderpad=0.4, columnspacing=1.5)
     ax.grid(True, alpha=0.3)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#F9F7F2', dpi=180)
     plt.close(fig)
@@ -774,8 +776,8 @@ class MuOrbitaPDFGenerator:
 
         # ── Helper: format value or show '—' if missing/zero ──
         def fv(val, decimals=2):
-            """Format value: show number or '—' if None/0/missing."""
-            if val is None or val == 0 or val == '—':
+            """Format value: show number or '—' if None/missing (0.0 IS valid)."""
+            if val is None or val == '—':
                 return '—'
             try:
                 return f"{float(val):.{decimals}f}"
@@ -863,7 +865,7 @@ class MuOrbitaPDFGenerator:
         frost = d.get('weather_frost_days', 0)
         et = d.get('weather_et_total')
         rain_days = d.get('weather_rain_days', 0)
-        lst = d.get('lst_mean_c')
+        lst = d.get('lst_mean_c', 0)
 
         # Si no hay ningún dato ERA5, solo mostrar LST
         has_era5 = any(v is not None and v != 0 for v in [tmax, precip, balance, gdd])
@@ -872,8 +874,8 @@ class MuOrbitaPDFGenerator:
             ['Parámetro', 'Valor', 'Interpretación'],
         ]
 
-        if lst is not None and lst != 0:
-          rows_data.append(['LST media (MODIS)', f'{lst:.1f} ºC', 'Temperatura superficial del cultivo'])
+        if lst:
+            rows_data.append(['LST media (MODIS)', f'{lst:.1f} ºC', 'Temperatura superficial del cultivo'])
 
         if has_era5:
             if tmax:
@@ -968,16 +970,14 @@ class MuOrbitaPDFGenerator:
             ]
 
         h_text = self._get_narrative('risk_hydric_text', f'NDWI: {ndwi_m:.2f}')
-        lst_val = d.get('lst_mean_c')
-        lst_str = f'{lst_val:.1f} ºC' if lst_val and lst_val != 0 else 'N/D'
-        t_text = self._get_narrative('risk_thermal_text', f'LST: {lst_str}')
+        t_text = self._get_narrative('risk_thermal_text', f'LST: {d.get("lst_mean_c",0):.1f} ºC')
         hh_text = self._get_narrative('risk_heterogeneity_text', f'ΔP90-P10: {hetero:.2f}')
 
         header = [Paragraph(h, s['TableHeader']) for h in ['Riesgo', 'Nivel', 'Indicador', 'Evaluación']]
         data = [
             header,
             risk_row('Estrés hídrico', h_lvl, f'NDWI: {ndwi_m:.2f}', h_text),
-            risk_row('Estrés térmico', t_lvl, f'LST: {lst_str}', t_text),
+            risk_row('Estrés térmico', t_lvl, f'LST: {d.get("lst_mean_c",0):.1f} ºC', t_text),
             risk_row('Heterogeneidad', hh_lvl, f'Δ: {hetero:.2f}', hh_text),
         ]
 
@@ -1138,7 +1138,7 @@ class MuOrbitaPDFGenerator:
             f'<b>Fuentes de datos</b><br/>'
             f'• Sentinel-2 SR Harmonized: {d.get("images_processed",0)} escenas procesadas<br/>'
             f'• Última imagen válida: {fmt_date(d.get("latest_image_date"))}<br/>'
-            f'• MODIS LST: Temperatura superficial media {d.get("lst_mean_c",0):.1f} ºC<br/>'
+            f'• MODIS LST: Temperatura superficial media {"N/D" if not d.get("lst_mean_c") else str(round(d["lst_mean_c"], 1)) + " ºC"}<br/>'
             f'• ERA5-Land: Datos meteorológicos del período analizado<br/>'
             f'• Resolución: 10 m (S2), 30 m (Landsat), 1 km (MODIS)<br/><br/>'
             f'<b>Umbrales de referencia ({ct})</b><br/>'
@@ -1272,10 +1272,10 @@ class MuOrbitaPDFGenerator:
             return None
 
         alerts = []
-        if forecast.get('heat_wave_risk'):  alerts.append('🌡️ Ola de calor prevista')
-        if forecast.get('frost_risk'):      alerts.append('❄️ Riesgo de helada')
-        if forecast.get('drought_risk'):    alerts.append('🏜️ Condiciones de sequía')
-        if forecast.get('heavy_rain_risk'): alerts.append('🌧️ Lluvias intensas previstas')
+        if forecast.get('heat_wave_risk'):  alerts.append('OLA DE CALOR prevista')
+        if forecast.get('frost_risk'):      alerts.append('RIESGO DE HELADA')
+        if forecast.get('drought_risk'):    alerts.append('CONDICIONES DE SEQUÍA')
+        if forecast.get('heavy_rain_risk'): alerts.append('LLUVIAS INTENSAS previstas')
 
         if not alerts:
             return None
@@ -1286,7 +1286,7 @@ class MuOrbitaPDFGenerator:
         summary = forecast.get('summary', '')
 
         text = (
-            f'<b>⚠️ ALERTAS METEOROLÓGICAS — PRÓXIMOS 7 DÍAS:</b> '
+            f'<b>ALERTAS METEOROLÓGICAS — PRÓXIMOS 7 DÍAS:</b> '
             + ' | '.join(alerts)
             + f'  ·  Tmax: {tmax} ºC · Tmin: {tmin} ºC · Precip: {precip} mm'
         )
@@ -1335,7 +1335,7 @@ class MuOrbitaPDFGenerator:
             elements.append(Paragraph('Nuevos Riesgos Detectados', s['SubsectionTitle']))
             elements.append(Spacer(1, 1*mm))
             elements.append(CalloutBox(
-                f'<b>⚠️ Nuevos riesgos:</b> {new_risks_text}',
+                f'<b>Nuevos riesgos:</b> {new_risks_text}',
                 s, accent='red', width=self.content_w
             ))
             elements.append(Spacer(1, 3*mm))
@@ -1634,7 +1634,7 @@ class MuOrbitaPDFGenerator:
             if forecast and (forecast.get('heat_wave_risk') or forecast.get('frost_risk')
                              or forecast.get('drought_risk') or forecast.get('heavy_rain_risk')):
                 elements.append(Paragraph(
-                    f'<font color="{C["yellow"]}"><b>ℹ️ Las recomendaciones siguientes incorporan '
+                    f'<font color="{C["yellow"]}"><b>Las recomendaciones siguientes incorporan '
                     f'la previsión meteorológica de los próximos 7 días.</b></font>',
                     s['Body']
                 ))
@@ -1703,7 +1703,7 @@ def generate_muorbita_report(data: Dict[str, Any]) -> Dict[str, Any]:
             'pdf_size': len(pdf_bytes),
             'job_id': job_id,
             'generated_at': datetime.now().isoformat(),
-            'version': '7.0',
+            'version': '7.1',
             'images_used': list(generator.png_map.keys()) if generator.png_map else ['matplotlib_fallback'],
             'has_narratives': bool(generator.narratives),
             'narrative_fields': list(generator.narratives.keys()) if generator.narratives else [],
