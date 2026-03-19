@@ -1,11 +1,13 @@
 """
 Mu.Orbita API - Webhooks Router
 Endpoints para recibir datos de n8n
-VERSIÓN 4.2 - Añade /resolve-parcel para n8n KPI batch
+VERSIÓN 4.3 - Añade analysis_type a WebhookJobCompletedV2
 
-CAMBIOS vs v4.1:
-  1. Nuevo endpoint GET /resolve-parcel?email=... para resolver parcel_id desde n8n
-  2. Resto del archivo idéntico a v4.1
+CAMBIOS vs v4.2:
+  1. WebhookJobCompletedV2 ahora acepta analysis_type
+  2. Job se crea con analysis_type del payload (no solo 'baseline')
+  3. analysis_type se actualiza si viene en el payload
+  → Dashboard muestra "Biweekly" en vez de "Baseline" para reportes bisemanales
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Header
@@ -32,13 +34,8 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def verify_webhook(x_webhook_secret: Optional[str] = Header(None)):
-    """
-    Verifica el secret del webhook.
-    n8n debe enviar el header X-Webhook-Secret con el valor correcto.
-    """
     if not settings.n8n_webhook_secret:
         return True
-    
     if x_webhook_secret != settings.n8n_webhook_secret:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -48,9 +45,6 @@ def verify_webhook(x_webhook_secret: Optional[str] = Header(None)):
 
 
 def parse_roi_geojson(roi_data):
-    """
-    Parsea roi_geojson que puede venir como string o dict.
-    """
     if roi_data is None:
         return None
     if isinstance(roi_data, dict):
@@ -64,22 +58,15 @@ def parse_roi_geojson(roi_data):
 
 
 def resolve_client_and_parcel(db: Session, email: str):
-    """
-    Dado un email, resuelve client_id y parcel_id.
-    Retorna (client_id, parcel_id) o (None, None).
-    """
     if not email:
         return None, None
-    
     client = db.query(Client).filter(Client.email == email).first()
     if not client:
         return None, None
-    
     parcel = db.query(Parcel).filter(
         Parcel.client_id == client.id,
         Parcel.is_active == True
     ).first()
-    
     return client.id, (parcel.id if parcel else None)
 
 
@@ -93,12 +80,7 @@ async def webhook_job_started(
     db: Session = Depends(get_db),
     _: bool = Depends(verify_webhook)
 ):
-    """
-    n8n notifica que un job ha comenzado.
-    Crea el job en la BD si no existe.
-    """
     client = db.query(Client).filter(Client.email == payload.client_email).first()
-    
     if not client:
         client = Client(
             email=payload.client_email,
@@ -109,13 +91,13 @@ async def webhook_job_started(
         db.add(client)
         db.commit()
         db.refresh(client)
-    
+
     parcel = None
     if payload.parcel_id:
         parcel = db.query(Parcel).filter(Parcel.id == payload.parcel_id).first()
-    
+
     roi_geojson = parse_roi_geojson(payload.roi_geojson)
-    
+
     if not parcel and roi_geojson:
         parcel = Parcel(
             client_id=client.id,
@@ -127,10 +109,10 @@ async def webhook_job_started(
         db.add(parcel)
         db.commit()
         db.refresh(parcel)
-    
+
     import time
     job_id = f"JOB_{int(time.time() * 1000)}"
-    
+
     job = Job(
         job_id=job_id,
         client_id=client.id,
@@ -146,21 +128,19 @@ async def webhook_job_started(
         status="processing",
         started_at=datetime.utcnow()
     )
-    
     db.add(job)
     db.commit()
-    
+
     return MessageResponse(message=f"Job {job_id} registrado")
 
 
 # ============================================================
-# JOB-COMPLETED v4.1
-# Con auto-creación de Report + Kpi + resolución por email
+# JOB-COMPLETED v4.3
 # ============================================================
 
 class WebhookJobCompletedV2(BaseModel):
     """
-    Payload para webhook job-completed v4.1.
+    Payload para webhook job-completed v4.3.
     Incluye client_email para resolución automática de client_id/parcel_id,
     campos fenológicos, y datos para auto-crear Report y Kpi.
     """
@@ -169,11 +149,11 @@ class WebhookJobCompletedV2(BaseModel):
     pdf_url: Optional[str] = None
     google_drive_folder_id: Optional[str] = None
     error_message: Optional[str] = None
-    
-    # Identificación del cliente (v4.1 — para resolver client_id/parcel_id)
+
+    # Identificación del cliente
     client_email: Optional[str] = None
     client_name: Optional[str] = None
-    
+
     # KPIs básicos
     ndvi_mean: Optional[float] = None
     ndvi_p10: Optional[float] = None
@@ -182,16 +162,19 @@ class WebhookJobCompletedV2(BaseModel):
     evi_mean: Optional[float] = None
     stress_area_ha: Optional[float] = None
     stress_area_pct: Optional[float] = None
-    
-    # Campos fenológicos (v3.2)
+
+    # Campos fenológicos
     doy: Optional[int] = None
     pheno_phase: Optional[str] = None
     pheno_status: Optional[str] = None
     ndvi_expected: Optional[float] = None
     ndvi_deviation_pct: Optional[float] = None
     ndvi_zscore_seasonal: Optional[float] = None
-    
-    # Campos opcionales para Report (v4.0)
+
+    # ══ v4.3: analysis_type para que el dashboard distinga baseline/biweekly ══
+    analysis_type: Optional[str] = None
+
+    # Campos opcionales para Report
     main_findings: Optional[list] = None
     priority_actions: Optional[list] = None
 
@@ -202,41 +185,34 @@ async def webhook_job_completed(
     db: Session = Depends(get_db),
     _: bool = Depends(verify_webhook)
 ):
-    """
-    n8n notifica que un job ha terminado.
-    
-    VERSIÓN 4.1 — Además de actualizar el job, ahora:
-    1. Resuelve client_id y parcel_id desde client_email si faltan
-    2. Crea automáticamente un registro Report (para /dashboard/reports)
-    3. Crea/actualiza un registro Kpi (para /dashboard/summary y /dashboard/alerts)
-    """
     job = db.query(Job).filter(Job.job_id == payload.job_id).first()
-    
-    # ── 0. Si no existe el job, crearlo resolviendo client/parcel por email ──
+
+    # ── 0. Si no existe el job, crearlo ──
     if not job:
         resolved_client_id, resolved_parcel_id = resolve_client_and_parcel(
             db, payload.client_email
         )
-        
+        # ══ v4.3: analysis_type del payload ══
         job = Job(
             job_id=payload.job_id,
             client_id=resolved_client_id,
             parcel_id=resolved_parcel_id,
             client_email=payload.client_email,
             client_name=payload.client_name,
+            analysis_type=payload.analysis_type or 'baseline',
             status=payload.status,
             completed_at=datetime.utcnow() if payload.status == "completed" else None
         )
         db.add(job)
         db.commit()
         db.refresh(job)
-        
+
         if resolved_client_id:
             print(f"✅ Job {payload.job_id} creado con client={resolved_client_id}, parcel={resolved_parcel_id}")
         else:
             print(f"⚠️ Job {payload.job_id} creado sin client_id (email: {payload.client_email})")
-    
-    # ── 0b. Si el job existe pero no tiene client_id, resolverlo ahora ──
+
+    # ── 0b. Resolver client_id si falta ──
     if not job.client_id and payload.client_email:
         resolved_client_id, resolved_parcel_id = resolve_client_and_parcel(
             db, payload.client_email
@@ -248,11 +224,11 @@ async def webhook_job_completed(
             db.commit()
             db.refresh(job)
             print(f"🔗 Job {payload.job_id} vinculado a client={resolved_client_id}, parcel={resolved_parcel_id}")
-    
-    # ── 1. Actualizar campos del Job ──────────────────────────
+
+    # ── 1. Actualizar campos del Job ──
     job.status = payload.status
     job.completed_at = datetime.utcnow() if payload.status == "completed" else None
-    
+
     if payload.pdf_url:
         job.report_url = payload.pdf_url
     if payload.google_drive_folder_id:
@@ -263,8 +239,11 @@ async def webhook_job_completed(
         job.client_email = payload.client_email
     if payload.client_name and not job.client_name:
         job.client_name = payload.client_name
-    
-    # KPIs básicos en la tabla jobs
+    # ══ v4.3: actualizar analysis_type si viene ══
+    if payload.analysis_type:
+        job.analysis_type = payload.analysis_type
+
+    # KPIs básicos
     if payload.ndvi_mean is not None:
         job.ndvi_mean = payload.ndvi_mean
     if payload.ndvi_p10 is not None:
@@ -277,7 +256,7 @@ async def webhook_job_completed(
         job.stress_area_ha = payload.stress_area_ha
     if payload.stress_area_pct is not None:
         job.stress_area_pct = payload.stress_area_pct
-    
+
     # Campos fenológicos
     if payload.doy is not None:
         job.doy = payload.doy
@@ -291,23 +270,23 @@ async def webhook_job_completed(
         job.ndvi_deviation_pct = payload.ndvi_deviation_pct
     if payload.ndvi_zscore_seasonal is not None:
         job.ndvi_zscore_seasonal = payload.ndvi_zscore_seasonal
-    
+
     db.commit()
     db.refresh(job)
-    
-    # ── 2. Auto-crear Report (v4.0) ──────────────────────────
+
+    # ── 2. Auto-crear Report ──
     report_created = False
     if payload.status == "completed" and job.client_id:
         try:
             existing_report = db.query(Report).filter(
                 Report.job_id == job.id
             ).first()
-            
+
             if not existing_report:
                 new_report = Report(
                     job_id=job.id,
                     client_id=job.client_id,
-                    report_type=getattr(job, 'analysis_type', 'baseline') or 'baseline',
+                    report_type=job.analysis_type or payload.analysis_type or 'baseline',
                     pdf_url=payload.pdf_url,
                     period_start=getattr(job, 'start_date', None),
                     period_end=getattr(job, 'end_date', None),
@@ -319,31 +298,34 @@ async def webhook_job_completed(
                 db.add(new_report)
                 db.commit()
                 report_created = True
-                print(f"✅ Report auto-creado para job {payload.job_id}")
+                print(f"✅ Report auto-creado para job {payload.job_id} (type={job.analysis_type})")
             else:
                 if payload.pdf_url:
                     existing_report.pdf_url = payload.pdf_url
                 if payload.ndvi_mean is not None:
                     existing_report.ndvi_current = round(payload.ndvi_mean, 2)
+                # ══ v4.3: actualizar report_type si cambió ══
+                if payload.analysis_type:
+                    existing_report.report_type = payload.analysis_type
                 db.commit()
                 print(f"📝 Report existente actualizado para job {payload.job_id}")
-                
+
         except Exception as e:
             print(f"⚠️ Error creando Report para job {payload.job_id}: {e}")
             print(traceback.format_exc())
             db.rollback()
-    
-    # ── 3. Auto-crear/actualizar Kpi (v4.0) ──────────────────
+
+    # ── 3. Auto-crear/actualizar Kpi ──
     kpi_created = False
     if payload.status == "completed" and job.parcel_id:
         try:
             obs_date = getattr(job, 'end_date', None) or date_type.today()
-            
+
             existing_kpi = db.query(Kpi).filter(
                 Kpi.parcel_id == job.parcel_id,
                 Kpi.observation_date == obs_date
             ).first()
-            
+
             if existing_kpi:
                 if payload.ndvi_mean is not None:
                     existing_kpi.ndvi_mean = payload.ndvi_mean
@@ -379,19 +361,19 @@ async def webhook_job_completed(
                 db.commit()
                 kpi_created = True
                 print(f"✅ KPI auto-creado para parcela {job.parcel_id} fecha {obs_date}")
-                
+
         except Exception as e:
             print(f"⚠️ Error creando KPI para job {payload.job_id}: {e}")
             print(traceback.format_exc())
             db.rollback()
-    
-    # ── 4. Construir mensaje de respuesta ─────────────────────
+
+    # ── 4. Respuesta ──
     pheno_info = ""
     if payload.pheno_status:
         pheno_info = f" | Fenología: {payload.pheno_status}"
         if payload.pheno_phase:
             pheno_info += f" ({payload.pheno_phase})"
-    
+
     extras = []
     if report_created:
         extras.append("Report creado")
@@ -401,15 +383,17 @@ async def webhook_job_completed(
         extras.append(f"client={str(job.client_id)[:8]}")
     if job.parcel_id:
         extras.append(f"parcel={str(job.parcel_id)[:8]}")
+    if payload.analysis_type:
+        extras.append(f"type={payload.analysis_type}")
     extras_str = f" | {', '.join(extras)}" if extras else ""
-    
+
     return MessageResponse(
         message=f"Job {payload.job_id} actualizado a {payload.status}{pheno_info}{extras_str}"
     )
 
 
 # ============================================================
-# RESOLVE-PARCEL (v4.2 — para n8n KPI batch)
+# RESOLVE-PARCEL
 # ============================================================
 
 @router.get("/resolve-parcel")
@@ -418,32 +402,16 @@ async def resolve_parcel_by_email(
     db: Session = Depends(get_db),
     _: bool = Depends(verify_webhook)
 ):
-    """
-    Resuelve parcel_id a partir de client_email.
-    Usado por n8n cuando parcel_id no está disponible en el job metadata.
-    """
     client_id, parcel_id = resolve_client_and_parcel(db, email)
-    
     if not client_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Cliente no encontrado: {email}"
-        )
-    
+        raise HTTPException(status_code=404, detail=f"Cliente no encontrado: {email}")
     if not parcel_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Sin parcela activa para {email}"
-        )
-    
-    return {
-        "client_id": str(client_id),
-        "parcel_id": str(parcel_id)
-    }
+        raise HTTPException(status_code=404, detail=f"Sin parcela activa para {email}")
+    return {"client_id": str(client_id), "parcel_id": str(parcel_id)}
 
 
 # ============================================================
-# KPIS BATCH (para time_series completa desde n8n)
+# KPIS BATCH
 # ============================================================
 
 @router.post("/kpis", response_model=MessageResponse)
@@ -452,33 +420,25 @@ async def webhook_kpis(
     db: Session = Depends(get_db),
     _: bool = Depends(verify_webhook)
 ):
-    """
-    n8n envía batch de KPIs calculados (serie temporal completa).
-    Maneja duplicados intra-batch con flush() progresivo.
-    """
     parcel = db.query(Parcel).filter(Parcel.id == payload.parcel_id).first()
     if not parcel:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Parcela {payload.parcel_id} no encontrada"
-        )
-    
-    # Resolver job_id string → UUID del job en BD
+        raise HTTPException(status_code=404, detail=f"Parcela {payload.parcel_id} no encontrada")
+
     job_uuid = None
     if payload.job_id:
         job = db.query(Job).filter(Job.job_id == payload.job_id).first()
         if job:
             job_uuid = job.id
-    
+
     inserted = 0
     updated = 0
-    
+
     for kpi_data in payload.kpis:
         existing = db.query(Kpi).filter(
             Kpi.parcel_id == payload.parcel_id,
             Kpi.observation_date == kpi_data.observation_date
         ).first()
-        
+
         if existing:
             for field, value in kpi_data.model_dump().items():
                 if value is not None:
@@ -494,16 +454,16 @@ async def webhook_kpis(
             )
             db.add(kpi)
             inserted += 1
-        
-        # Flush después de cada operación para que el siguiente
-        # item duplicado lo detecte como "existing"
+
         db.flush()
-    
+
     db.commit()
-    
+
     return MessageResponse(
         message=f"KPIs procesados: {inserted} insertados, {updated} actualizados"
     )
+
+
 # ============================================================
 # REPORT-SENT
 # ============================================================
@@ -519,21 +479,15 @@ async def webhook_report_sent(
     db: Session = Depends(get_db),
     _: bool = Depends(verify_webhook)
 ):
-    """
-    n8n notifica que el reporte fue enviado por email.
-    Marca el Report como enviado (si existe).
-    """
     job = db.query(Job).filter(Job.job_id == payload.job_id).first()
     if job:
         job.report_sent = True
         db.commit()
-    
         report = db.query(Report).filter(Report.job_id == job.id).first()
         if report:
             report.sent_at = datetime.utcnow()
             report.sent_to = payload.sent_to
             db.commit()
-    
     return MessageResponse(message=f"Report {payload.job_id} marcado como enviado")
 
 
@@ -560,21 +514,14 @@ async def webhook_client_created(
     db: Session = Depends(get_db),
     _: bool = Depends(verify_webhook)
 ):
-    """
-    n8n notifica que un nuevo cliente se registró (desde el formulario web).
-    Hashea la contraseña y crea cliente + parcela.
-    """
-    # Verificar si ya existe
     existing = db.query(Client).filter(Client.email == payload.email).first()
     if existing:
         return MessageResponse(message=f"Cliente {payload.email} ya existe")
-    
-    # Hashear contraseña
+
     password_hash = None
     if payload.password:
         password_hash = pwd_context.hash(payload.password)
-    
-    # Crear cliente
+
     client = Client(
         email=payload.email,
         client_name=payload.client_name,
@@ -588,16 +535,15 @@ async def webhook_client_created(
         status="active",
         source="n8n_webhook"
     )
-    
+
     roi_geojson = parse_roi_geojson(payload.roi_geojson)
     if roi_geojson:
         client.roi_geojson = roi_geojson
-    
+
     db.add(client)
     db.commit()
     db.refresh(client)
-    
-    # Crear parcela si hay ROI
+
     if roi_geojson:
         parcel = Parcel(
             client_id=client.id,
@@ -608,116 +554,85 @@ async def webhook_client_created(
         )
         db.add(parcel)
         db.commit()
-    
-    return MessageResponse(
-        message=f"Cliente {payload.email} creado con éxito"
-    )
+
+    return MessageResponse(message=f"Cliente {payload.email} creado con éxito")
 
 
-# ── Pydantic models for PAC ──
- 
+# ── PAC Models ──
+
 class PacAlert(BaseModel):
-    condition_id: str          # "abandono" | "eco_cubierta" | "hidrico"
+    condition_id: str
     condition_name: str
-    level: str                 # "low" | "high"
+    level: str
     ndvi_value: Optional[float] = None
     ndwi_value: Optional[float] = None
     observation_date: Optional[str] = None
     detail: str
     suggested_action: str
- 
- 
+
+
 class PacCheckResponse(BaseModel):
     parcel_id: str
     parcel_name: str
     crop_type: str
     client_email: str
-    risk_level: str            # "none" | "low" | "high"
+    risk_level: str
     alerts: List[PacAlert]
     kpis_evaluated: int
     checked_at: str
- 
- 
+
+
 @router.get("/pac-check", response_model=PacCheckResponse)
 async def pac_check(
     parcel_id: str = Query(..., description="UUID de la parcela a evaluar"),
     db: Session = Depends(get_db)
 ):
-    """
-    Evalúa 3 condiciones PAC para una parcela usando los últimos 2 KPIs almacenados.
- 
-    Condición 1 — Riesgo abandono de cultivo:
-      NDVI < 0.25. Si los 2 últimos registros están por debajo → nivel HIGH.
- 
-    Condición 2 — Eco-esquema cubierta vegetal (solo olivar):
-      NDVI < 0.30 en parcela de olivar → ausencia de cubierta entre filas.
- 
-    Condición 3 — Anomalía hídrica en período de riego:
-      NDWI < 0.10 → estrés hídrico severo.
- 
-    Requiere parcel_id con KPIs almacenados (observation_date + ndvi_mean + ndwi_mean).
-    """
     from app.models.kpi import Kpi
     from app.models.parcel import Parcel
     from app.models.client import Client
     from sqlalchemy import desc
- 
-    # ── Fetch parcel + client ──
+
     parcel = db.query(Parcel).filter(
         Parcel.id == parcel_id,
         Parcel.is_active == True
     ).first()
- 
+
     if not parcel:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Parcela no encontrada o inactiva: {parcel_id}"
-        )
- 
+        raise HTTPException(status_code=404, detail=f"Parcela no encontrada o inactiva: {parcel_id}")
+
     client = db.query(Client).filter(Client.id == parcel.client_id).first()
     client_email = client.email if client else "desconocido@muorbita.com"
- 
-    # ── Fetch last 2 KPIs ordered by observation_date desc ──
+
     recent_kpis = (
         db.query(Kpi)
-        .filter(
-            Kpi.parcel_id == parcel_id,
-            Kpi.ndvi_mean.isnot(None)
-        )
+        .filter(Kpi.parcel_id == parcel_id, Kpi.ndvi_mean.isnot(None))
         .order_by(desc(Kpi.observation_date))
         .limit(2)
         .all()
     )
- 
+
     if not recent_kpis:
-        # No hay KPIs — no se puede evaluar, devolver sin alertas
         return PacCheckResponse(
-            parcel_id=str(parcel_id),
-            parcel_name=parcel.parcel_name,
-            crop_type=parcel.crop_type,
-            client_email=client_email,
-            risk_level="none",
-            alerts=[],
-            kpis_evaluated=0,
+            parcel_id=str(parcel_id), parcel_name=parcel.parcel_name,
+            crop_type=parcel.crop_type, client_email=client_email,
+            risk_level="none", alerts=[], kpis_evaluated=0,
             checked_at=datetime.utcnow().isoformat()
         )
- 
-    latest_kpi  = recent_kpis[0]
+
+    latest_kpi = recent_kpis[0]
     previous_kpi = recent_kpis[1] if len(recent_kpis) > 1 else None
- 
-    ndvi_latest  = float(latest_kpi.ndvi_mean) if latest_kpi.ndvi_mean else None
-    ndwi_latest  = float(latest_kpi.ndwi_mean) if latest_kpi.ndwi_mean else None
-    ndvi_prev    = float(previous_kpi.ndvi_mean) if previous_kpi and previous_kpi.ndvi_mean else None
+
+    ndvi_latest = float(latest_kpi.ndvi_mean) if latest_kpi.ndvi_mean else None
+    ndwi_latest = float(latest_kpi.ndwi_mean) if latest_kpi.ndwi_mean else None
+    ndvi_prev = float(previous_kpi.ndvi_mean) if previous_kpi and previous_kpi.ndvi_mean else None
     obs_date_str = str(latest_kpi.observation_date) if latest_kpi.observation_date else "—"
- 
+
     crop = parcel.crop_type.lower() if parcel.crop_type else ""
     is_olivar = any(x in crop for x in ["oliv", "olive"])
- 
+
     alerts: List[PacAlert] = []
- 
-    # ── Condición 1: Riesgo abandono (NDVI < 0.25) ──
+
     if ndvi_latest is not None and ndvi_latest < 0.25:
-        # HIGH si los 2 últimos registros están por debajo del umbral
         two_consecutive = (ndvi_prev is not None and ndvi_prev < 0.25)
         level = "high" if two_consecutive else "low"
         detail = (
@@ -726,71 +641,44 @@ async def pac_check(
                else f"Primera detección — vigilar evolución.")
         )
         alerts.append(PacAlert(
-            condition_id="abandono",
-            condition_name="Riesgo abandono de cultivo",
-            level=level,
-            ndvi_value=ndvi_latest,
-            observation_date=obs_date_str,
+            condition_id="abandono", condition_name="Riesgo abandono de cultivo",
+            level=level, ndvi_value=ndvi_latest, observation_date=obs_date_str,
             detail=detail,
-            suggested_action=(
-                "Verificar en campo que el cultivo sigue activo. "
-                "Documentar con fotografías georreferenciadas antes de la próxima revisión PAC."
-            )
+            suggested_action="Verificar en campo que el cultivo sigue activo. Documentar con fotografías georreferenciadas antes de la próxima revisión PAC."
         ))
- 
-    # ── Condición 2: Eco-esquema cubierta vegetal (solo olivar, NDVI < 0.30) ──
+
     if is_olivar and ndvi_latest is not None and ndvi_latest < 0.30:
         alerts.append(PacAlert(
-            condition_id="eco_cubierta",
-            condition_name="Eco-esquema cubierta vegetal (olivar)",
-            level="low",
-            ndvi_value=ndvi_latest,
-            observation_date=obs_date_str,
-            detail=(
-                f"NDVI {ndvi_latest:.3f} indica ausencia o insuficiencia de cubierta vegetal "
-                f"entre filas. Umbral mínimo eco-esquema: 0.30."
-            ),
-            suggested_action=(
-                "Revisar estado de la cubierta vegetal entre filas. "
-                "Si no se ha sembrado, valorar establecimiento antes del próximo control PAC."
-            )
+            condition_id="eco_cubierta", condition_name="Eco-esquema cubierta vegetal (olivar)",
+            level="low", ndvi_value=ndvi_latest, observation_date=obs_date_str,
+            detail=f"NDVI {ndvi_latest:.3f} indica ausencia o insuficiencia de cubierta vegetal entre filas. Umbral mínimo eco-esquema: 0.30.",
+            suggested_action="Revisar estado de la cubierta vegetal entre filas. Si no se ha sembrado, valorar establecimiento antes del próximo control PAC."
         ))
- 
-    # ── Condición 3: Anomalía hídrica (NDWI < 0.10) ──
+
     if ndwi_latest is not None and ndwi_latest < 0.10:
         level = "high" if ndwi_latest < 0.00 else "low"
         alerts.append(PacAlert(
-            condition_id="hidrico",
-            condition_name="Anomalía hídrica en período de riego",
-            level=level,
-            ndwi_value=ndwi_latest,
-            observation_date=obs_date_str,
+            condition_id="hidrico", condition_name="Anomalía hídrica en período de riego",
+            level=level, ndwi_value=ndwi_latest, observation_date=obs_date_str,
             detail=(
                 f"NDWI {ndwi_latest:.3f} indica estrés hídrico "
                 + ("severo (< 0.00)." if ndwi_latest < 0.00 else "significativo (< 0.10).")
                 + " Puede comprometer justificación de riego en declaración PAC."
             ),
-            suggested_action=(
-                "Revisar sistema de riego y registros de consumo de agua. "
-                "Conservar albaranes de suministro como documentación de respaldo PAC."
-            )
+            suggested_action="Revisar sistema de riego y registros de consumo de agua. Conservar albaranes de suministro como documentación de respaldo PAC."
         ))
- 
-    # ── Risk level summary ──
+
     if any(a.level == "high" for a in alerts):
         risk_level = "high"
     elif alerts:
         risk_level = "low"
     else:
         risk_level = "none"
- 
+
     return PacCheckResponse(
-        parcel_id=str(parcel_id),
-        parcel_name=parcel.parcel_name,
-        crop_type=parcel.crop_type,
-        client_email=client_email,
-        risk_level=risk_level,
-        alerts=alerts,
+        parcel_id=str(parcel_id), parcel_name=parcel.parcel_name,
+        crop_type=parcel.crop_type, client_email=client_email,
+        risk_level=risk_level, alerts=alerts,
         kpis_evaluated=len(recent_kpis),
         checked_at=datetime.utcnow().isoformat()
     )
@@ -802,18 +690,14 @@ class PacInternalRequest(BaseModel):
     report_type: str = "pac_anual"
     request_signature: bool = False
     year: Optional[int] = None
- 
- 
+
+
 @router.post("/generate-pac-internal")
 async def generate_pac_internal(
     req: PacInternalRequest,
     x_internal_key: str = "",
     db: Session = Depends(get_db)
 ):
-    """
-    Genera un informe PAC para ser usado por el workflow n8n annual.
-    Protegido por X-Internal-Key (no requiere JWT de cliente).
-    """
     import os, base64 as _b64
     from datetime import date
     from app.models.kpi import Kpi
@@ -823,81 +707,70 @@ async def generate_pac_internal(
     from app.models.report import Report
     from app.services.generate_pac_report import generate_pac_report
     from sqlalchemy import desc
- 
+
     internal_key = os.getenv('INTERNAL_API_KEY', 'muorbita-internal-2026')
     if x_internal_key != internal_key:
         raise HTTPException(status_code=403, detail="No autorizado")
- 
-    # Fetch parcel and client
-    parcel = db.query(Parcel).filter(
-        Parcel.id == req.parcel_id,
-        Parcel.is_active == True
-    ).first()
+
+    parcel = db.query(Parcel).filter(Parcel.id == req.parcel_id, Parcel.is_active == True).first()
     if not parcel:
         raise HTTPException(status_code=404, detail=f"Parcela no encontrada: {req.parcel_id}")
- 
+
     client = db.query(Client).filter(Client.email == req.client_email).first()
     if not client:
         raise HTTPException(status_code=404, detail=f"Cliente no encontrado: {req.client_email}")
- 
+
     year = req.year or datetime.utcnow().year
     period_start = date(year - 1, 3, 1)
-    period_end   = date(year, 2, 28)
- 
+    period_end = date(year, 2, 28)
+
     kpi_records_raw = (
         db.query(Kpi)
-        .filter(
-            Kpi.parcel_id == req.parcel_id,
-            Kpi.observation_date >= period_start,
-            Kpi.observation_date <= period_end,
-            Kpi.ndvi_mean.isnot(None)
-        )
+        .filter(Kpi.parcel_id == req.parcel_id, Kpi.observation_date >= period_start,
+                Kpi.observation_date <= period_end, Kpi.ndvi_mean.isnot(None))
         .order_by(Kpi.observation_date)
         .all()
     )
- 
+
     kpi_records = [
         {
             'observation_date': str(k.observation_date),
-            'ndvi_mean':        float(k.ndvi_mean)       if k.ndvi_mean       else None,
-            'ndwi_mean':        float(k.ndwi_mean)       if k.ndwi_mean       else None,
-            'stress_area_pct':  float(k.stress_area_pct) if k.stress_area_pct else None,
+            'ndvi_mean': float(k.ndvi_mean) if k.ndvi_mean else None,
+            'ndwi_mean': float(k.ndwi_mean) if k.ndwi_mean else None,
+            'stress_area_pct': float(k.stress_area_pct) if k.stress_area_pct else None,
             'satellite_source': k.satellite_source or 'Sentinel-2',
         }
         for k in kpi_records_raw
     ]
- 
-    ts  = datetime.utcnow().strftime('%Y%m%d%H%M')
+
+    ts = datetime.utcnow().strftime('%Y%m%d%H%M')
     ref = f"PAC-{str(client.id)[:8].upper()}-{ts}"
- 
+
     pdf_data = {
-        'client_name':      client.name,
-        'parcel_name':      parcel.parcel_name,
-        'crop_type':        parcel.crop_type,
-        'area_hectares':    float(parcel.hectares) if parcel.hectares else 0,
-        'municipality':     parcel.municipality or parcel.province or 'Andalucía, España',
-        'province':         parcel.province or 'Andalucía',
-        'period_start':     period_start,
-        'period_end':       period_end,
-        'year':             year,
-        'report_type':      req.report_type,
-        'report_ref':       ref,
+        'client_name': client.name,
+        'parcel_name': parcel.parcel_name,
+        'crop_type': parcel.crop_type,
+        'area_hectares': float(parcel.hectares) if parcel.hectares else 0,
+        'municipality': parcel.municipality or parcel.province or 'Andalucía, España',
+        'province': parcel.province or 'Andalucía',
+        'period_start': period_start,
+        'period_end': period_end,
+        'year': year,
+        'report_type': req.report_type,
+        'report_ref': ref,
         'signature_status': 'not_requested',
-        'kpi_records':      kpi_records,
+        'kpi_records': kpi_records,
     }
- 
+
     result = generate_pac_report(pdf_data)
     if not result['success']:
         raise HTTPException(status_code=500, detail=f"PDF error: {result.get('error')}")
- 
-    # Register in DB
+
     last_job = (
-        db.query(Job)
-        .filter(Job.parcel_id == req.parcel_id)
-        .order_by(desc(Job.created_at))
-        .first()
+        db.query(Job).filter(Job.parcel_id == req.parcel_id)
+        .order_by(desc(Job.created_at)).first()
     )
- 
+
     new_report = Report(
         job_id=last_job.id if last_job else None,
         client_id=client.id,
@@ -905,29 +778,29 @@ async def generate_pac_internal(
         period_start=period_start,
         period_end=period_end,
         report_metadata={
-            'pac_ref':           ref,
-            'pac_status':        result['pac_status'],
-            'signature_status':  'not_requested',
-            'agronomist_name':   None,
-            'conditions_count':  result['conditions_count'],
+            'pac_ref': ref,
+            'pac_status': result['pac_status'],
+            'signature_status': 'not_requested',
+            'agronomist_name': None,
+            'conditions_count': result['conditions_count'],
             'no_conforme_count': result['no_conforme_count'],
-            'year':              year,
-            'kpi_count':         len(kpi_records),
+            'year': year,
+            'kpi_count': len(kpi_records),
         }
     )
     db.add(new_report)
     db.commit()
     db.refresh(new_report)
- 
+
     return {
-        'success':      True,
-        'report_id':    str(new_report.id),
-        'report_ref':   ref,
-        'pac_status':   result['pac_status'],
-        'pdf_base64':   result['pdf_base64'],
-        'filename':     result['filename'],
-        'pdf_size':     result['pdf_size'],
-        'kpi_count':    len(kpi_records),
+        'success': True,
+        'report_id': str(new_report.id),
+        'report_ref': ref,
+        'pac_status': result['pac_status'],
+        'pdf_base64': result['pdf_base64'],
+        'filename': result['filename'],
+        'pdf_size': result['pdf_size'],
+        'kpi_count': len(kpi_records),
         'generated_at': result['generated_at'],
     }
 
@@ -937,48 +810,42 @@ async def get_active_clients_for_pac(
     x_internal_key: str = Query(""),
     db: Session = Depends(get_db)
 ):
-    """
-    Devuelve todos los clientes activos con su primera parcela activa.
-    Usado por el workflow n8n de informe PAC anual.
-    Protegido por X-Internal-Key via query param.
-    """
     import os
     from app.models.parcel import Parcel
     from app.models.client import Client
- 
+
     internal_key = os.getenv('INTERNAL_API_KEY', 'muorbita-internal-2026')
     if x_internal_key != internal_key:
         raise HTTPException(status_code=403, detail="No autorizado")
- 
+
     clients = db.query(Client).filter(Client.is_active == True).all()
- 
+
     result = []
     for client in clients:
         parcel = db.query(Parcel).filter(
-            Parcel.client_id == client.id,
-            Parcel.is_active == True
+            Parcel.client_id == client.id, Parcel.is_active == True
         ).first()
- 
         if not parcel:
             continue
- 
         result.append({
-            "client_id":    str(client.id),
-            "client_name":  client.name,
-            "email":        client.email,
-            "parcel_id":    str(parcel.id),
-            "parcel_name":  parcel.parcel_name,
-            "crop_type":    parcel.crop_type,
-            "hectares":     float(parcel.hectares) if parcel.hectares else 0,
-            "province":     parcel.province or "",
+            "client_id": str(client.id),
+            "client_name": client.name,
+            "email": client.email,
+            "parcel_id": str(parcel.id),
+            "parcel_name": parcel.parcel_name,
+            "crop_type": parcel.crop_type,
+            "hectares": float(parcel.hectares) if parcel.hectares else 0,
+            "province": parcel.province or "",
             "municipality": parcel.municipality or "",
         })
- 
+
     return result
+
+
 # ============================================================
 # HEALTH CHECK
 # ============================================================
 
 @router.get("/health")
 async def webhooks_health():
-    return {"status": "ok", "service": "webhooks", "version": "4.2"}
+    return {"status": "ok", "service": "webhooks", "version": "4.3"}
