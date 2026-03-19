@@ -1,15 +1,13 @@
 """
 Mu.Orbita API - Report Model
+v2.0 - Añadido recommendations_json (JSONB) para seguimiento biweekly
 """
-
 from sqlalchemy import Column, String, DateTime, Date, Text, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import uuid
-
 from app.database import Base
-
 
 class Report(Base):
     __tablename__ = "reports"
@@ -39,6 +37,10 @@ class Report(Base):
     ndvi_change = Column(String(10), nullable=True)
     main_findings = Column(ARRAY(Text), nullable=True)
     priority_actions = Column(ARRAY(Text), nullable=True)
+    
+    # v2.0: Recomendaciones estructuradas de Claude (array de dicts)
+    # Formato: [{"title":..., "priority":..., "deadline_days":..., "trigger":..., "zone":..., "justification":...}]
+    recommendations_json = Column(JSONB, nullable=True)
     
     # Entrega
     sent_at = Column(DateTime(timezone=True), nullable=True)
