@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
 """
-Mu.Orbita GEE Automation Script v5.8b
+Mu.Orbita GEE Automation Script v5.9
 =============================================================
+
+CAMBIOS V5.9 (BIWEEKLY IMAGE + LST FIXES):
+🐛 FIX: Biweekly ahora genera 4 mapas (NDVI+NDWI+EVI+NDCI)
+   Antes solo generaba NDVI+NDWI → EVI/NDCI caían a fallback
+   matplotlib en el PDF (heatmap sintético sin basemap).
+   Impacto en tiempo: +20-30s (overlays ya calculados, solo
+   falta composición cartográfica que reutiliza el basemap).
+🐛 FIX: LST biweekly siempre devolvía None/0.
+   Causa: ee.Reducer.mean() solo (sin .combine()) NO añade
+   sufijo '_mean' al key. El código hacía .get('LST_C_mean')
+   pero el key real era 'LST_C'. Ahora usa combined reducer
+   igual que baseline para consistencia.
+🐛 FIX: Biweekly kpis ahora incluyen lst_min_c y lst_max_c
+   (antes solo tenía lst_mean_c, y ese era None por el bug).
 
 CAMBIOS V5.8b (BIWEEKLY PERFORMANCE):
 ⚡ OPT: Biweekly ya NO recomputa serie temporal de 1 año
    Solo procesa el período actual (30 días, ~4-8 imágenes)
    La serie histórica ya está en PostgreSQL desde el baseline
    y se acumula con cada biweekly vía el webhook job-completed
-⚡ OPT: Biweekly genera solo NDVI+NDWI (2 imágenes, no 4)
-   Tiempo estimado: 2-4 min en vez de 10+
 ⚡ OPT: Z-score usa solo colección actual (no 1 año)
 
 CAMBIOS V5.8 (FIXES BIWEEKLY):
@@ -121,7 +133,7 @@ VIZ_PALETTES = {
 # ============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.8b')
+    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.9')
     parser.add_argument('--mode', required=True,
                         choices=['execute','check-status','download-results','start-tasks'])
     parser.add_argument('--job-id', required=True)
@@ -179,7 +191,7 @@ def get_leaflet_overlay_png(index_image_unclipped, roi, viz_params, dimensions=5
             'region': region_coords, 'dimensions': dimensions, 'format': 'png'
         })
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.8b')
+        req.add_header('User-Agent', 'MuOrbita/5.9')
         png_bytes = urllib.request.urlopen(req, timeout=60).read()
         if len(png_bytes) < 100:
             return None
@@ -220,7 +232,7 @@ def _fetch_tile(x, y, z):
     url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
     try:
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'MuOrbita/5.8b')
+        req.add_header('User-Agent', 'MuOrbita/5.9')
         req.add_header('Referer', 'https://muorbita.com')
         return urllib.request.urlopen(req, timeout=15).read()
     except Exception as e:
@@ -876,13 +888,14 @@ def persist_images_to_db(job_id, images_base64, bounds=None):
 
 
 # ############################################################################
-#  ANÁLISIS BIWEEKLY — v5.8b INCREMENTAL (solo período actual)
+#  ANÁLISIS BIWEEKLY — v5.9 (4 mapas + LST fix)
 # ############################################################################
 
 def execute_biweekly_analysis(args):
     print("=" * 60)
-    print("  Mu.Orbita GEE v5.8b — BIWEEKLY ANALYSIS")
+    print("  Mu.Orbita GEE v5.9 — BIWEEKLY ANALYSIS")
     print("  Incremental — solo período actual (no recomputa 1 año)")
+    print("  4 mapas: NDVI + NDWI + EVI + NDCI")
     print("=" * 60)
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
@@ -936,12 +949,30 @@ def execute_biweekly_analysis(args):
     print("Fetching ERA5...")
     weather_kpis, weather_daily = get_era5_weather(roi, args.start_date, args.end_date)
 
+    # ════════════════════════════════════════════════════════════
+    # v5.9 FIX: LST — usar combined reducer (igual que baseline)
+    # ee.Reducer.mean() solo → key = 'LST_C' (sin sufijo)
+    # ee.Reducer.mean().combine(minMax()) → keys = 'LST_C_mean', 'LST_C_min', 'LST_C_max'
+    # v5.8b usaba .mean() solo y luego .get('LST_C_mean') → siempre None
+    # ════════════════════════════════════════════════════════════
     try:
         lst_unclipped = get_modis_lst(roi, args.start_date, args.end_date)
         lst_clipped = lst_unclipped.clip(roi)
-        lst_mean = lst_clipped.reduceRegion(ee.Reducer.mean(), roi, 1000, maxPixels=1e9).getInfo().get('LST_C_mean')
-    except:
-        lst_unclipped, lst_mean = None, None
+        lst_stats = lst_clipped.reduceRegion(
+            ee.Reducer.mean().combine(ee.Reducer.minMax(), sharedInputs=True),
+            roi, 1000, maxPixels=1e9
+        ).getInfo()
+        lst_mean = lst_stats.get('LST_C_mean')
+        lst_min  = lst_stats.get('LST_C_min')
+        lst_max  = lst_stats.get('LST_C_max')
+        if lst_mean is not None:
+            print(f"  MODIS LST: mean={lst_mean:.1f} ºC, min={lst_min:.1f}, max={lst_max:.1f}")
+        else:
+            print("  MODIS LST: no data for period (may need wider date range)")
+    except Exception as e:
+        print(f"  MODIS LST failed: {e}")
+        lst_unclipped = None
+        lst_mean = lst_min = lst_max = None
 
     # ── Serie temporal: SOLO período actual (~4-8 imágenes, no 80+) ──
     print("Computing time series (current period only)...")
@@ -995,7 +1026,10 @@ def execute_biweekly_analysis(args):
         'savi_mean': round(stats.get('SAVI_mean',0) or 0, 3),
         'stress_area_ha': round(stress_ha, 2),
         'stress_area_pct': round(stress_pct, 1),
+        # v5.9 FIX: lst ahora tiene valores reales (no siempre None)
         'lst_mean_c': round(lst_mean, 1) if lst_mean else None,
+        'lst_min_c':  round(lst_min, 1) if lst_min else None,
+        'lst_max_c':  round(lst_max, 1) if lst_max else None,
         'bounds_south': bounds['south'] if bounds else None,
         'bounds_west': bounds['west'] if bounds else None,
         'bounds_north': bounds['north'] if bounds else None,
@@ -1003,10 +1037,17 @@ def execute_biweekly_analysis(args):
     }
     kpis.update(weather_kpis)
 
-    # ── Solo NDVI + NDWI (rápido, ~2 min total) ──
+    # ════════════════════════════════════════════════════════════
+    # v5.9 FIX: 4 mapas — NDVI + NDWI + EVI + NDCI
+    # Antes era solo ['NDVI','NDWI'] → EVI/NDCI caían a fallback
+    # matplotlib en el PDF (heatmap sin basemap real).
+    # El composite ya tiene todas las bandas calculadas, así que
+    # el coste adicional es solo 2 overlays GEE + 2 composiciones
+    # PIL (~20-30 segundos extra, reutiliza el basemap Esri).
+    # ════════════════════════════════════════════════════════════
     print("\nGenerating all images...")
     all_images = generate_all_images(composite_viz, roi, bounds, kpis,
-                                      index_list=['NDVI','NDWI'])
+                                      index_list=['NDVI', 'NDWI', 'EVI', 'NDCI'])
     stored = persist_images_to_db(job_id, all_images, bounds)
 
     return {
@@ -1017,7 +1058,7 @@ def execute_biweekly_analysis(args):
         'images_stored': stored, 'images_available': list(all_images.keys()),
         'images_base64': {} if stored else all_images,
         'tasks': [], 'task_count': 0,
-        'message': f'Biweekly v5.8b complete. {len(stored)} images in DB.'
+        'message': f'Biweekly v5.9 complete. {len(stored)} images in DB.'
     }
 
 
@@ -1027,7 +1068,7 @@ def execute_biweekly_analysis(args):
 
 def execute_analysis(args):
     print("=" * 60)
-    print("  Mu.Orbita GEE v5.7 — BASELINE ANALYSIS")
+    print("  Mu.Orbita GEE v5.9 — BASELINE ANALYSIS")
     print("  VRA determinista + serie temporal 1 año")
     print("=" * 60)
     roi = create_roi(args.roi, args.buffer)
@@ -1181,7 +1222,7 @@ def execute_analysis(args):
         'images_stored': stored, 'images_available': list(all_images.keys()),
         'images_base64': {} if stored else all_images,
         'tasks': [], 'task_count': 0,
-        'message': f'Baseline v5.8 complete. {len(stored)} images in DB.'
+        'message': f'Baseline v5.9 complete. {len(stored)} images in DB.'
     }
 
 
@@ -1190,11 +1231,11 @@ def execute_analysis(args):
 # ############################################################################
 
 def check_status(args):
-    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100, 'message': 'v5.8b: Sync.'}
+    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100, 'message': 'v5.9: Sync.'}
 def download_results(args):
-    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True, 'message': 'v5.8b: In response.'}
+    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True, 'message': 'v5.9: In response.'}
 def start_tasks(args):
-    return {'job_id': args.job_id, 'started': 0, 'message': 'v5.8b: No tasks.'}
+    return {'job_id': args.job_id, 'started': 0, 'message': 'v5.9: No tasks.'}
 
 def main():
     args = parse_args()
