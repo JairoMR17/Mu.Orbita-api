@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 """
-Mu.Orbita GEE Automation Script v5.9
+Mu.Orbita GEE Automation Script v6.0
 =============================================================
 
-CAMBIOS V5.9 (BIWEEKLY IMAGE + LST FIXES):
-🐛 FIX: Biweekly ahora genera 4 mapas (NDVI+NDWI+EVI+NDCI)
-   Antes solo generaba NDVI+NDWI → EVI/NDCI caían a fallback
-   matplotlib en el PDF (heatmap sintético sin basemap).
-   Impacto en tiempo: +20-30s (overlays ya calculados, solo
-   falta composición cartográfica que reutiliza el basemap).
-🐛 FIX: LST biweekly siempre devolvía None/0.
-   Causa: ee.Reducer.mean() solo (sin .combine()) NO añade
-   sufijo '_mean' al key. El código hacía .get('LST_C_mean')
-   pero el key real era 'LST_C'. Ahora usa combined reducer
-   igual que baseline para consistencia.
-🐛 FIX: Biweekly kpis ahora incluyen lst_min_c y lst_max_c
-   (antes solo tenía lst_mean_c, y ese era None por el bug).
+CAMBIOS V6.0 (BIWEEKLY VRA + LST EN IMÁGENES):
+✅ NEW: Biweekly ahora calcula VRA (calculate_vra_zones) igual que baseline
+   Permite mostrar mapa VRA en el PDF bisemanal para comparar con baseline.
+   Coste: +3-5 reduceRegion calls (~15-20s extra).
+✅ NEW: Biweekly pasa lst_unclipped a generate_all_images()
+   → se genera mapa LST cartográfico también en biweekly.
+✅ FIX: vra_stats ya no es siempre [] en biweekly.
 
 CAMBIOS V5.8b (BIWEEKLY PERFORMANCE):
 ⚡ OPT: Biweekly ya NO recomputa serie temporal de 1 año
@@ -133,7 +127,7 @@ VIZ_PALETTES = {
 # ============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v5.9')
+    parser = argparse.ArgumentParser(description='Mu.Orbita GEE v6.0')
     parser.add_argument('--mode', required=True,
                         choices=['execute','check-status','download-results','start-tasks'])
     parser.add_argument('--job-id', required=True)
@@ -888,19 +882,18 @@ def persist_images_to_db(job_id, images_base64, bounds=None):
 
 
 # ############################################################################
-#  ANÁLISIS BIWEEKLY — v5.9 (4 mapas + LST fix)
+#  ANÁLISIS BIWEEKLY — v6.0 (4 mapas + LST fix)
 # ############################################################################
 
 def execute_biweekly_analysis(args):
     print("=" * 60)
-    print("  Mu.Orbita GEE v5.9 — BIWEEKLY ANALYSIS")
+    print("  Mu.Orbita GEE v6.0 — BIWEEKLY ANALYSIS")
     print("  Incremental — solo período actual (no recomputa 1 año)")
-    print("  4 mapas: NDVI + NDWI + EVI + NDCI")
+    print("  4 mapas + VRA + LST con basemap Esri")
     print("=" * 60)
     roi = create_roi(args.roi, args.buffer)
     job_id = args.job_id
     bounds = get_bounds(roi)
-    vra_stats = []
 
     # ══════════════════════════════════════════════════════════════
     #  v5.8b: UNA SOLA colección — solo el período del job (30 días)
@@ -950,7 +943,7 @@ def execute_biweekly_analysis(args):
     weather_kpis, weather_daily = get_era5_weather(roi, args.start_date, args.end_date)
 
     # ════════════════════════════════════════════════════════════
-    # v5.9 FIX: LST — usar combined reducer (igual que baseline)
+    # v6.0 FIX: LST — usar combined reducer (igual que baseline)
     # ee.Reducer.mean() solo → key = 'LST_C' (sin sufijo)
     # ee.Reducer.mean().combine(minMax()) → keys = 'LST_C_mean', 'LST_C_min', 'LST_C_max'
     # v5.8b usaba .mean() solo y luego .get('LST_C_mean') → siempre None
@@ -1026,7 +1019,7 @@ def execute_biweekly_analysis(args):
         'savi_mean': round(stats.get('SAVI_mean',0) or 0, 3),
         'stress_area_ha': round(stress_ha, 2),
         'stress_area_pct': round(stress_pct, 1),
-        # v5.9 FIX: lst ahora tiene valores reales (no siempre None)
+        # v6.0 FIX: lst ahora tiene valores reales (no siempre None)
         'lst_mean_c': round(lst_mean, 1) if lst_mean else None,
         'lst_min_c':  round(lst_min, 1) if lst_min else None,
         'lst_max_c':  round(lst_max, 1) if lst_max else None,
@@ -1038,16 +1031,23 @@ def execute_biweekly_analysis(args):
     kpis.update(weather_kpis)
 
     # ════════════════════════════════════════════════════════════
-    # v5.9 FIX: 4 mapas — NDVI + NDWI + EVI + NDCI
-    # Antes era solo ['NDVI','NDWI'] → EVI/NDCI caían a fallback
-    # matplotlib en el PDF (heatmap sin basemap real).
-    # El composite ya tiene todas las bandas calculadas, así que
-    # el coste adicional es solo 2 overlays GEE + 2 composiciones
-    # PIL (~20-30 segundos extra, reutiliza el basemap Esri).
+    # v6.0 NEW: VRA en biweekly — mismo cálculo que baseline
+    # Permite comparar zonificación entre informes sucesivos.
+    # Coste: +3-5 reduceRegion (~15-20s extra)
+    # ════════════════════════════════════════════════════════════
+    print("Computing VRA (deterministic score)...")
+    vra_image, vra_stats = calculate_vra_zones(composite_clipped, roi)
+
+    # ════════════════════════════════════════════════════════════
+    # v6.0: 4 mapas + VRA + LST — todos con basemap Esri
+    # v5.9 ya generaba NDVI+NDWI+EVI+NDCI pero sin VRA ni LST.
+    # Ahora pasa vra_image y lst_unclipped para mapas completos.
     # ════════════════════════════════════════════════════════════
     print("\nGenerating all images...")
     all_images = generate_all_images(composite_viz, roi, bounds, kpis,
-                                      index_list=['NDVI', 'NDWI', 'EVI', 'NDCI'])
+                                      index_list=['NDVI', 'NDWI', 'EVI', 'NDCI'],
+                                      vra_image=vra_image,
+                                      lst_unclipped=lst_unclipped)
     stored = persist_images_to_db(job_id, all_images, bounds)
 
     return {
@@ -1058,7 +1058,7 @@ def execute_biweekly_analysis(args):
         'images_stored': stored, 'images_available': list(all_images.keys()),
         'images_base64': {} if stored else all_images,
         'tasks': [], 'task_count': 0,
-        'message': f'Biweekly v5.9 complete. {len(stored)} images in DB.'
+        'message': f'Biweekly v6.0 complete. {len(stored)} images in DB.'
     }
 
 
@@ -1068,7 +1068,7 @@ def execute_biweekly_analysis(args):
 
 def execute_analysis(args):
     print("=" * 60)
-    print("  Mu.Orbita GEE v5.9 — BASELINE ANALYSIS")
+    print("  Mu.Orbita GEE v6.0 — BASELINE ANALYSIS")
     print("  VRA determinista + serie temporal 1 año")
     print("=" * 60)
     roi = create_roi(args.roi, args.buffer)
@@ -1222,7 +1222,7 @@ def execute_analysis(args):
         'images_stored': stored, 'images_available': list(all_images.keys()),
         'images_base64': {} if stored else all_images,
         'tasks': [], 'task_count': 0,
-        'message': f'Baseline v5.9 complete. {len(stored)} images in DB.'
+        'message': f'Baseline v6.0 complete. {len(stored)} images in DB.'
     }
 
 
@@ -1231,11 +1231,11 @@ def execute_analysis(args):
 # ############################################################################
 
 def check_status(args):
-    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100, 'message': 'v5.9: Sync.'}
+    return {'job_id': args.job_id, 'all_complete': True, 'progress_pct': 100, 'message': 'v6.0: Sync.'}
 def download_results(args):
-    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True, 'message': 'v5.9: In response.'}
+    return {'job_id': args.job_id, 'status': 'ready', 'download_ready': True, 'message': 'v6.0: In response.'}
 def start_tasks(args):
-    return {'job_id': args.job_id, 'started': 0, 'message': 'v5.9: No tasks.'}
+    return {'job_id': args.job_id, 'started': 0, 'message': 'v6.0: No tasks.'}
 
 def main():
     args = parse_args()
