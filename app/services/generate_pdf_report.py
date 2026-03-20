@@ -1,13 +1,16 @@
 """
-Mu.Orbita PDF Report Generator v8.1
+Mu.Orbita PDF Report Generator v8.2
 ====================================
-Changelog vs v8.0:
+Changelog vs v8.1:
 ───────────────────
-NEW:  _followup_section() — renderiza "Seguimiento de Recomendaciones Anteriores"
-      con cards coloreadas por estado (Completada/En curso/No iniciada/No evaluable).
-      Se inserta en biweekly entre Riesgos y Recomendaciones nuevas.
-NEW:  FollowupCard flowable — card visual para cada recomendación con seguimiento.
-NEW:  'prev_actions_followup' añadido a narratives key list.
+FIX:  Chart legend overlap — title removed (redundant with SectionTitle), bbox/rect adjusted
+NEW:  VRA map image in _vra_section() when available from GEE
+NEW:  VRA section renders in BOTH baseline and biweekly (was baseline-only)
+NEW:  _reading_guide() — "Guía de Lectura" for non-technical readers after Annex
+NEW:  _signature_block() — professional technical signature + improved disclaimer
+NEW:  Cover page includes parcel_name and sigpac_ref when available
+NEW:  Delta table header shows date of previous report
+IMPROVED: Map note per-index (real vs synthetic) in both report types
 
 Changelog v8.0 vs v7.1:
 ───────────────────
@@ -475,8 +478,8 @@ def generate_ts_chart(time_series: List[Dict], crop_type: str = 'olivar',
     ax.text(dates[-1], 0.17, ' Estrés', fontsize=7, color=C['red'], alpha=0.5, va='center')
     ax.text(dates[-1], 0.55, ' Óptimo', fontsize=7, color=C['green'], alpha=0.5, va='center')
 
-ax.set_ylabel('Valor del índice')
-    # Título eliminado — el PDF ya tiene SectionTitle "Evolución Temporal de Índices"
+    ax.set_ylabel('Valor del índice')
+    # v8.2: Título eliminado — el PDF ya tiene SectionTitle
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=10))
     plt.xticks(rotation=30, ha='right')
@@ -621,9 +624,9 @@ class MuOrbitaPDFGenerator:
                     self.narratives[key] = data[key]
 
         if self.narratives:
-            print(f"✅ PDF v8.1: {len(self.narratives)} narrative fields from Claude")
+            print(f"✅ PDF v8.2: {len(self.narratives)} narrative fields from Claude")
         else:
-            print("⚠️ PDF v8.1: No narratives — using auto-generated text")
+            print("⚠️ PDF v8.2: No narratives — using auto-generated text")
 
         # ── Build png_map con PRIORIDAD BD ──
         self.png_map = {}
@@ -645,9 +648,9 @@ class MuOrbitaPDFGenerator:
                         self.png_map[name] = b64
 
         if self.png_map:
-            print(f"✅ PDF v8.1: png_map con {len(self.png_map)} imágenes: {list(self.png_map.keys())}")
+            print(f"✅ PDF v8.2: png_map con {len(self.png_map)} imágenes: {list(self.png_map.keys())}")
         else:
-            print("⚠️ PDF v8.1: png_map VACÍO — se usarán gráficos matplotlib")
+            print("⚠️ PDF v8.2: png_map VACÍO — se usarán gráficos matplotlib")
 
     def _load_images_from_db(self, job_id: str):
         try:
@@ -783,9 +786,26 @@ class MuOrbitaPDFGenerator:
                  self.M + 50*mm, band_y + band_h - 40*mm)
 
         # ── Metadata card ──
+        meta = [
+            ('Cliente', self.d.get('client_name', 'N/A')),
+            ('Cultivo', crop_label(self.d.get('crop_type', ''))),
+            ('Superficie', f"{self.d.get('area_hectares', 0):.1f} hectáreas"),
+            ('Período analizado', f"{fmt_date(self.d.get('start_date'))}  →  {fmt_date(self.d.get('end_date'))}"),
+            ('Referencia', self.d.get('job_id', 'N/A')),
+        ]
+        # v8.2: Añadir parcela y SIGPAC si disponibles
+        parcel_name = self.d.get('parcel_name', '')
+        if parcel_name:
+            meta.insert(2, ('Parcela', parcel_name))
+        sigpac = self.d.get('sigpac_ref', '')
+        if sigpac:
+            idx = 3 if parcel_name else 2
+            meta.insert(idx, ('Ref. SIGPAC', sigpac))
+
         card_x = self.M + 8*mm
         card_w = self.W - 2*self.M - 16*mm
-        card_h = 80*mm
+        # v8.2: Dynamic height based on number of meta fields
+        card_h = max(80*mm, (len(meta) * 12 + 18) * mm)
         card_y = band_y - 15*mm - card_h
 
         cvs.setFillColor(hex_color('white'))
@@ -801,14 +821,6 @@ class MuOrbitaPDFGenerator:
         cvs.setLineWidth(0.4)
         cvs.line(card_x + 10*mm, card_y + card_h - 18*mm,
                  card_x + card_w - 10*mm, card_y + card_h - 18*mm)
-
-        meta = [
-            ('Cliente', self.d.get('client_name', 'N/A')),
-            ('Cultivo', crop_label(self.d.get('crop_type', ''))),
-            ('Superficie', f"{self.d.get('area_hectares', 0):.1f} hectáreas"),
-            ('Período analizado', f"{fmt_date(self.d.get('start_date'))}  →  {fmt_date(self.d.get('end_date'))}"),
-            ('Referencia', self.d.get('job_id', 'N/A')),
-        ]
 
         row_y = card_y + card_h - 28*mm
         for label, value in meta:
@@ -1261,6 +1273,7 @@ class MuOrbitaPDFGenerator:
 
     # ── VRA Analysis ──
     def _vra_section(self) -> List:
+        """v8.2: VRA con mapa real de GEE + tabla + narrativa. Ambos tipos de informe."""
         d = self.d
         s = self.styles
         elements = []
@@ -1272,6 +1285,12 @@ class MuOrbitaPDFGenerator:
             return elements
 
         elements.append(Paragraph('Zonificación VRA (Aplicación Variable)', s['SubsectionTitle']))
+
+        # v8.2 NEW: Mapa VRA real de GEE si existe
+        if self._has_real_map('VRA_MAP'):
+            vra_fallback = generate_heatmap('VRA (Zonas)', 1.0, 'RdYlGn')
+            elements.append(self._real_or_generated('VRA_MAP', vra_fallback, 155, 55))
+            elements.append(Spacer(1, 3*mm))
 
         if vra_stats and isinstance(vra_stats, list) and len(vra_stats) > 0:
             header = [Paragraph(h, s['TableHeader'])
@@ -1345,6 +1364,109 @@ class MuOrbitaPDFGenerator:
         elements.append(Paragraph(annex, s['BodySmall']))
         return elements
 
+    # ── v8.2: Guía de Lectura del Informe ──
+    def _reading_guide(self) -> List:
+        """
+        v8.2 NEW: Explicación divulgativa de todos los indicadores para
+        lectores no técnicos (agricultores, cooperativas, gestores).
+        Colocada después del Anexo Técnico.
+        """
+        s = self.styles
+        elements = []
+
+        ct = crop_label(self.d.get('crop_type', '')).lower()
+
+        guide_text = (
+            f'<b>¿Qué es el NDVI?</b><br/>'
+            f'El NDVI (Índice de Vegetación) mide la "salud verde" de su cultivo usando '
+            f'imágenes de satélite. Un valor alto (>0.60) indica plantas vigorosas y sanas. '
+            f'Un valor bajo (&lt;0.35) señala problemas: sequía, enfermedad o suelo desnudo. '
+            f'Para {ct}, el rango normal es {crop_ndvi_range(self.d.get("crop_type",""))}.<br/><br/>'
+
+            f'<b>¿Qué es el NDWI?</b><br/>'
+            f'El NDWI (Índice de Agua) indica cuánta agua tienen las hojas de sus plantas. '
+            f'Valores por encima de 0.20 significan buen estado hídrico. Por debajo de 0.10, '
+            f'sus plantas empiezan a "tener sed" y necesitan más riego.<br/><br/>'
+
+            f'<b>¿Qué es el EVI?</b><br/>'
+            f'El EVI (Índice de Vegetación Mejorado) mide la productividad fotosintética: '
+            f'cuánta energía están produciendo sus plantas. Es similar al NDVI pero más '
+            f'preciso en zonas con mucha o poca vegetación.<br/><br/>'
+
+            f'<b>¿Qué es el NDCI?</b><br/>'
+            f'El NDCI (Índice de Clorofila) detecta la cantidad de clorofila en las hojas. '
+            f'Valores bajos pueden indicar falta de nutrientes (especialmente nitrógeno) '
+            f'y ayudan a decidir cuándo y dónde fertilizar.<br/><br/>'
+
+            f'<b>¿Qué es la Zonificación VRA?</b><br/>'
+            f'El mapa VRA (Aplicación de Tasa Variable) divide su parcela en zonas según '
+            f'su vigor: alto, medio y bajo. Esto permite aplicar fertilizante, riego o '
+            f'tratamientos de forma diferenciada — más donde se necesita, menos donde sobra. '
+            f'Resultado: ahorra insumos y mejora rendimiento.<br/><br/>'
+
+            f'<b>¿Qué es el Balance Hídrico?</b><br/>'
+            f'Es la diferencia entre el agua que recibe su cultivo (lluvia) y el agua que '
+            f'pierde (evaporación + transpiración de las plantas). Si es negativo, su cultivo '
+            f'está consumiendo más agua de la que recibe y necesita riego adicional.<br/><br/>'
+
+            f'<b>¿Qué son los GDD (Grados-Día)?</b><br/>'
+            f'Los Grados-Día de Desarrollo acumulan el calor que recibe el cultivo '
+            f'por encima de 10 ºC. Cada cultivo necesita un número concreto de GDD para '
+            f'alcanzar cada fase de crecimiento (brotación, floración, maduración). '
+            f'Sirven para predecir cuándo llegará cada fase.<br/><br/>'
+
+            f'<b>¿Qué es el Área de Estrés?</b><br/>'
+            f'Es el porcentaje de su parcela donde el NDVI es muy bajo (&lt;0.35), indicando '
+            f'que las plantas están sufriendo. Si supera el 15%, se recomienda inspección '
+            f'de campo urgente para identificar la causa (sequía, plaga, enfermedad, etc.).<br/><br/>'
+
+            f'<b>¿Cómo leer los mapas?</b><br/>'
+            f'Los mapas muestran su parcela vista desde el satélite con colores que indican '
+            f'el valor de cada índice. En el mapa NDVI: verde intenso = plantas sanas, '
+            f'amarillo/rojo = zonas con problemas. En el mapa NDWI: azul = buena hidratación, '
+            f'marrón/claro = plantas con sed. Compare las zonas entre mapas para entender '
+            f'si un problema de vigor está relacionado con falta de agua o con otra causa.'
+        )
+
+        elements.append(Paragraph(guide_text, s['BodySmall']))
+        return elements
+
+    # ── v8.2: Bloque de Firma Técnica ──
+    def _signature_block(self) -> List:
+        """v8.2 NEW: Firma técnica profesional + disclaimer mejorado."""
+        s = self.styles
+        elements = []
+
+        job_id = self.d.get('job_id', 'N/A')
+        at = self.d.get('analysis_type', 'baseline')
+        freq = 'quincenal' if at == 'biweekly' else 'inicial (baseline)'
+
+        # Disclaimer mejorado con referencia y frecuencia
+        disclaimer = (
+            f'<i>Este informe (Ref. {job_id}) ha sido generado automáticamente por '
+            f'Mu.Orbita mediante análisis de imágenes satelitales Sentinel-2 y datos '
+            f'meteorológicos ERA5-Land. Frecuencia de monitorización: {freq}. '
+            f'Las recomendaciones deben ser validadas por un técnico agrónomo cualificado '
+            f'antes de su implementación. Los datos satelitales están sujetos a '
+            f'disponibilidad y condiciones atmosféricas.</i>'
+        )
+        elements.append(Paragraph(
+            f'<font size="7.5" color="{C["text_muted"]}">{disclaimer}</font>',
+            s['Footnote']))
+        elements.append(Spacer(1, 6*mm))
+
+        # Firma técnica
+        sig = (
+            f'<font size="8" color="{C["brown"]}">'
+            f'<b>Revisado por el equipo técnico de Mu.Orbita</b><br/>'
+            f'Servicio de Agricultura de Precisión Satelital<br/>'
+            f'info@muorbita.com · www.muorbita.com'
+            f'</font>'
+        )
+        elements.append(Paragraph(sig, s['Footnote']))
+
+        return elements
+
     # ════════════════════════════════════════════════════════
     # v7.0 → v8.0: MÉTODOS BISEMANALES
     # ════════════════════════════════════════════════════════
@@ -1398,8 +1520,12 @@ class MuOrbitaPDFGenerator:
         stress_delta, stress_trend, stress_color = delta_fmt(curr_stress, prev_stress, 1, is_pct=True)
         evi_delta,    evi_trend,    evi_color    = delta_fmt(curr_evi,    prev_evi, 3)
 
+        # v8.2: Fecha del período anterior en header si disponible
+        prev_date = fmt_date(d.get('last_report_date', ''))
+        prev_header = f'Anterior ({prev_date})' if prev_date != '—' else 'Período Anterior'
+
         rows_data = [
-            ['Métrica', 'Período Anterior', 'Período Actual', 'Cambio', ''],
+            ['Métrica', prev_header, 'Período Actual', 'Cambio', ''],
             ['NDVI (Vigor)',
              fv(prev_ndvi), fv(curr_ndvi), ndvi_delta, ndvi_trend],
             ['NDWI (Agua)',
@@ -1995,11 +2121,11 @@ class MuOrbitaPDFGenerator:
         elements.append(self._risk_table())
         elements.append(Spacer(1, 5*mm))
 
-        if not is_biweekly:
-            vra_elements = self._vra_section()
-            if vra_elements:
-                elements.extend(vra_elements)
-                elements.append(Spacer(1, 5*mm))
+        # v8.2: VRA en AMBOS tipos de informe (antes solo baseline)
+        vra_elements = self._vra_section()
+        if vra_elements:
+            elements.extend(vra_elements)
+            elements.append(Spacer(1, 5*mm))
 
         # ════════════════════════════════════════════════════
         # v8.1: SEGUIMIENTO DE RECOMENDACIONES ANTERIORES (solo biweekly)
@@ -2050,16 +2176,25 @@ class MuOrbitaPDFGenerator:
         elements.append(SectionDivider(self.content_w))
         elements.append(Spacer(1, 2*mm))
         elements.extend(self._annex())
-        elements.append(Spacer(1, 8*mm))
+        elements.append(Spacer(1, 5*mm))
 
-        disclaimer = (
-            '<i>Este informe ha sido generado automáticamente mediante análisis de imágenes '
-            'satelitales. Las recomendaciones deben ser validadas por un técnico agrónomo antes '
-            'de su implementación. Los datos satelitales están sujetos a disponibilidad y '
-            'condiciones atmosféricas.</i>'
-        )
-        elements.append(Paragraph(f'<font size="7.5" color="{C["text_muted"]}">{disclaimer}</font>',
-                                  s['Footnote']))
+        # ════════════════════════════════════════════════════
+        # v8.2: GUÍA DE LECTURA (para lectores no técnicos)
+        # ════════════════════════════════════════════════════
+        elements.append(CondPageBreak(60*mm))
+        elements.append(Spacer(1, 3*mm))
+        elements.append(Paragraph('Guía de Lectura del Informe', s['SectionTitle']))
+        elements.append(SectionDivider(self.content_w))
+        elements.append(Spacer(1, 2*mm))
+        elements.extend(self._reading_guide())
+        elements.append(Spacer(1, 5*mm))
+
+        # ════════════════════════════════════════════════════
+        # v8.2: FIRMA TÉCNICA + DISCLAIMER MEJORADO
+        # ════════════════════════════════════════════════════
+        elements.append(SectionDivider(self.content_w))
+        elements.append(Spacer(1, 3*mm))
+        elements.extend(self._signature_block())
 
         # ── Build ──
         def first_page(cvs, doc):
@@ -2093,7 +2228,7 @@ def generate_muorbita_report(data: Dict[str, Any]) -> Dict[str, Any]:
             'pdf_size': len(pdf_bytes),
             'job_id': job_id,
             'generated_at': datetime.now().isoformat(),
-            'version': '8.1',
+            'version': '8.2',
             'images_used': list(generator.png_map.keys()) if generator.png_map else ['matplotlib_fallback'],
             'has_narratives': bool(generator.narratives),
             'narrative_fields': list(generator.narratives.keys()) if generator.narratives else [],
@@ -2245,7 +2380,7 @@ if __name__ == '__main__':
         out_path = f"/tmp/{result['filename']}"
         with open(out_path, 'wb') as f:
             f.write(base64.b64decode(result['pdf_base64']))
-        print(f"✅ PDF v8.1 generado: {out_path} ({result['pdf_size']:,} bytes)")
+        print(f"✅ PDF v8.2 generado: {out_path} ({result['pdf_size']:,} bytes)")
         print(f"   Imágenes: {result['images_used']}")
         print(f"   Narrativas: {result['has_narratives']} ({len(result['narrative_fields'])} campos)")
     else:
