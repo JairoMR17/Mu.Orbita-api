@@ -1,13 +1,14 @@
 """
 Mu.Orbita API - Webhooks Router
 Endpoints para recibir datos de n8n
-VERSIÓN 4.4 - Soporte recommendations_json + endpoint latest-recommendations
+VERSIÓN 4.5 - Soporte parcel_name, sigpac_ref, last_report_date
 
-CAMBIOS vs v4.3:
-  1. WebhookJobCompletedV2 ahora acepta recommendations_json (list de dicts)
-  2. webhook_job_completed guarda recommendations_json en Report (crear y update)
-  3. Nuevo endpoint GET /webhooks/latest-recommendations — devuelve las
-     recomendaciones del último informe de un cliente (para seguimiento biweekly)
+CAMBIOS vs v4.4:
+  1. WebhookJobCompletedV2 acepta parcel_name y sigpac_ref opcionales
+  2. Ambos se guardan en report_metadata para uso del PDF
+  3. /latest-recommendations ahora devuelve last_report_date (fecha del informe
+     anterior) para que el PDF muestre la fecha en la columna de delta table
+  4. Health check version bump
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Header
@@ -182,6 +183,10 @@ class WebhookJobCompletedV2(BaseModel):
     # ══ v4.4: recomendaciones estructuradas de Claude (array de dicts) ══
     recommendations_json: Optional[list] = None
 
+    # ══ v4.5: datos de parcela para portada del PDF ══
+    parcel_name: Optional[str] = None
+    sigpac_ref: Optional[str] = None
+
 
 @router.post("/job-completed", response_model=MessageResponse)
 async def webhook_job_completed(
@@ -300,6 +305,11 @@ async def webhook_job_completed(
                     priority_actions=payload.priority_actions,
                     # ══ v4.4: guardar recomendaciones estructuradas ══
                     recommendations_json=payload.recommendations_json,
+                    # ══ v4.5: metadata con datos de parcela para PDF ══
+                    report_metadata={
+                        'parcel_name': payload.parcel_name,
+                        'sigpac_ref': payload.sigpac_ref,
+                    } if (payload.parcel_name or payload.sigpac_ref) else {},
                 )
                 db.add(new_report)
                 db.commit()
@@ -317,6 +327,14 @@ async def webhook_job_completed(
                 # ══ v4.4: actualizar recomendaciones si vienen ══
                 if payload.recommendations_json:
                     existing_report.recommendations_json = payload.recommendations_json
+                # ══ v4.5: actualizar metadata con datos de parcela ══
+                if payload.parcel_name or payload.sigpac_ref:
+                    meta = existing_report.report_metadata or {}
+                    if payload.parcel_name:
+                        meta['parcel_name'] = payload.parcel_name
+                    if payload.sigpac_ref:
+                        meta['sigpac_ref'] = payload.sigpac_ref
+                    existing_report.report_metadata = meta
                 db.commit()
                 print(f"📝 Report existente actualizado para job {payload.job_id}")
 
@@ -455,6 +473,9 @@ async def get_latest_recommendations(
         "recommendations": latest_report.recommendations_json,
         "report_type": latest_report.report_type,
         "report_date": latest_report.generated_at.isoformat() if latest_report.generated_at else None,
+        # v4.5: fecha fin del período analizado (para header de delta table en PDF)
+        "last_report_date": latest_report.period_end.isoformat() if latest_report.period_end else (
+            latest_report.generated_at.isoformat() if latest_report.generated_at else None),
         "report_id": str(latest_report.id),
         "message": f"{len(latest_report.recommendations_json)} recomendaciones del informe {latest_report.report_type}"
     }
@@ -914,4 +935,4 @@ async def get_active_clients_for_pac(
 
 @router.get("/health")
 async def webhooks_health():
-    return {"status": "ok", "service": "webhooks", "version": "4.4"}
+    return {"status": "ok", "service": "webhooks", "version": "4.5"}
