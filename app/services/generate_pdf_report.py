@@ -475,20 +475,20 @@ def generate_ts_chart(time_series: List[Dict], crop_type: str = 'olivar',
     ax.text(dates[-1], 0.17, ' Estrés', fontsize=7, color=C['red'], alpha=0.5, va='center')
     ax.text(dates[-1], 0.55, ' Óptimo', fontsize=7, color=C['green'], alpha=0.5, va='center')
 
-    ax.set_ylabel('Valor del índice')
-    ax.set_title('Evolución Temporal de Índices', pad=10)
+ax.set_ylabel('Valor del índice')
+    # Título eliminado — el PDF ya tiene SectionTitle "Evolución Temporal de Índices"
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=10))
     plt.xticks(rotation=30, ha='right')
     ax.set_ylim(-0.15, 1.0)
-    ax.legend(loc='lower center', bbox_to_anchor=(0.5, 1.02), ncol=3,
+    ax.legend(loc='lower center', bbox_to_anchor=(0.5, 1.0), ncol=3,
               fontsize=8, framealpha=0.9, edgecolor=C['cream_dark'],
               borderpad=0.4, columnspacing=1.5)
     ax.grid(True, alpha=0.3)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#F9F7F2', dpi=180)
     plt.close(fig)
