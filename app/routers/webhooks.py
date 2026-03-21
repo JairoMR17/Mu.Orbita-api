@@ -1,14 +1,17 @@
 """
 Mu.Orbita API - Webhooks Router
 Endpoints para recibir datos de n8n
-VERSIÓN 4.5 - Soporte parcel_name, sigpac_ref, last_report_date
+VERSIÓN 4.6 - Risk levels en report_metadata para dashboard v2
 
-CAMBIOS vs v4.4:
-  1. WebhookJobCompletedV2 acepta parcel_name y sigpac_ref opcionales
-  2. Ambos se guardan en report_metadata para uso del PDF
-  3. /latest-recommendations ahora devuelve last_report_date (fecha del informe
-     anterior) para que el PDF muestre la fecha en la columna de delta table
-  4. Health check version bump
+CAMBIOS vs v4.5:
+  1. WebhookJobCompletedV2 acepta risk_hydric_level, risk_thermal_level,
+     risk_heterogeneity_level (del análisis de Claude)
+  2. Estos se guardan en report_metadata para el dashboard v2 semáforo de riesgos
+  3. Health check version bump a 4.6
+
+CAMBIOS v4.5 (mantenidos):
+  - parcel_name, sigpac_ref en payload y report_metadata
+  - /latest-recommendations devuelve last_report_date
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Header
@@ -187,6 +190,11 @@ class WebhookJobCompletedV2(BaseModel):
     parcel_name: Optional[str] = None
     sigpac_ref: Optional[str] = None
 
+    # ══ v4.6: risk levels de Claude para dashboard semáforo ══
+    risk_hydric_level: Optional[str] = None          # "Bajo" | "Moderado" | "Alto"
+    risk_thermal_level: Optional[str] = None         # "Bajo" | "Moderado" | "Alto"
+    risk_heterogeneity_level: Optional[str] = None   # "Baja" | "Media" | "Alta"
+
 
 @router.post("/job-completed", response_model=MessageResponse)
 async def webhook_job_completed(
@@ -318,11 +326,14 @@ async def webhook_job_completed(
                     priority_actions=payload.priority_actions,
                     # ══ v4.4: guardar recomendaciones estructuradas ══
                     recommendations_json=payload.recommendations_json,
-                    # ══ v4.5: metadata con datos de parcela para PDF ══
+                    # ══ v4.5+4.6: metadata con datos de parcela + risk levels ══
                     report_metadata={
                         'parcel_name': payload.parcel_name,
                         'sigpac_ref': payload.sigpac_ref,
-                    } if (payload.parcel_name or payload.sigpac_ref) else {},
+                        'risk_hydric_level': payload.risk_hydric_level,
+                        'risk_thermal_level': payload.risk_thermal_level,
+                        'risk_heterogeneity_level': payload.risk_heterogeneity_level,
+                    },
                 )
                 db.add(new_report)
                 db.commit()
@@ -340,14 +351,19 @@ async def webhook_job_completed(
                 # ══ v4.4: actualizar recomendaciones si vienen ══
                 if payload.recommendations_json:
                     existing_report.recommendations_json = payload.recommendations_json
-                # ══ v4.5: actualizar metadata con datos de parcela ══
-                if payload.parcel_name or payload.sigpac_ref:
-                    meta = existing_report.report_metadata or {}
-                    if payload.parcel_name:
-                        meta['parcel_name'] = payload.parcel_name
-                    if payload.sigpac_ref:
-                        meta['sigpac_ref'] = payload.sigpac_ref
-                    existing_report.report_metadata = meta
+                # ══ v4.5+4.6: actualizar metadata con parcela + risk levels ══
+                meta = existing_report.report_metadata or {}
+                if payload.parcel_name:
+                    meta['parcel_name'] = payload.parcel_name
+                if payload.sigpac_ref:
+                    meta['sigpac_ref'] = payload.sigpac_ref
+                if payload.risk_hydric_level:
+                    meta['risk_hydric_level'] = payload.risk_hydric_level
+                if payload.risk_thermal_level:
+                    meta['risk_thermal_level'] = payload.risk_thermal_level
+                if payload.risk_heterogeneity_level:
+                    meta['risk_heterogeneity_level'] = payload.risk_heterogeneity_level
+                existing_report.report_metadata = meta
                 db.commit()
                 print(f"📝 Report existente actualizado para job {payload.job_id}")
 
@@ -948,4 +964,4 @@ async def get_active_clients_for_pac(
 
 @router.get("/health")
 async def webhooks_health():
-    return {"status": "ok", "service": "webhooks", "version": "4.5"}
+    return {"status": "ok", "service": "webhooks", "version": "4.6"}
