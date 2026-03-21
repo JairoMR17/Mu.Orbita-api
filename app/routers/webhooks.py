@@ -283,6 +283,19 @@ async def webhook_job_completed(
     db.commit()
     db.refresh(job)
 
+# ══ v4.5: Guardar sigpac_ref en parcela si viene y no lo tiene ══
+    if payload.sigpac_ref and job.parcel_id:
+        try:
+            parcel = db.query(Parcel).filter(Parcel.id == job.parcel_id).first()
+            if parcel and not parcel.parcel_code:
+                parcel.parcel_code = payload.sigpac_ref
+                db.commit()
+                print(f"📝 SIGPAC guardado en parcela: {payload.sigpac_ref}")
+        except Exception as e:
+            print(f"⚠️ No se pudo guardar SIGPAC: {e}")
+
+
+  
     # ── 2. Auto-crear Report ──
     report_created = False
     if payload.status == "completed" and job.client_id:
