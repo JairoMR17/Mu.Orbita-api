@@ -1,6 +1,12 @@
 """
-Mu.Orbita PDF Report Generator v8.2
+Mu.Orbita PDF Report Generator v8.3
 ====================================
+Changelog vs v8.2:
+───────────────────
+FIX:  VRA map image no longer stretches full page width — reduced from 155mm to 115mm
+      with proportional height (45mm) and centered in page to preserve aspect ratio.
+NEW:  crop_label() now handles Spanish values (olivo, viñedo, almendro) from frontend v27+.
+
 Changelog vs v8.1:
 ───────────────────
 FIX:  Chart legend overlap — title removed (redundant with SectionTitle), bbox/rect adjusted
@@ -216,7 +222,8 @@ def hetero_label(p10, p90):
 def crop_label(ct):
     m = {'olive':'Olivar','olivar':'Olivar','olivo':'Olivar',
          'vineyard':'Viñedo','viña':'Viñedo','vid':'Viñedo','viñedo':'Viñedo',
-         'almond':'Almendro','almendro':'Almendro'}
+         'almond':'Almendro','almendro':'Almendro',
+         'other':'Otro','otro':'Otro'}
     return m.get(str(ct).lower(), str(ct).capitalize() if ct else 'Cultivo')
 
 def fmt_date(d):
@@ -624,9 +631,9 @@ class MuOrbitaPDFGenerator:
                     self.narratives[key] = data[key]
 
         if self.narratives:
-            print(f"✅ PDF v8.2: {len(self.narratives)} narrative fields from Claude")
+            print(f"✅ PDF v8.3: {len(self.narratives)} narrative fields from Claude")
         else:
-            print("⚠️ PDF v8.2: No narratives — using auto-generated text")
+            print("⚠️ PDF v8.3: No narratives — using auto-generated text")
 
         # ── Build png_map con PRIORIDAD BD ──
         self.png_map = {}
@@ -648,9 +655,9 @@ class MuOrbitaPDFGenerator:
                         self.png_map[name] = b64
 
         if self.png_map:
-            print(f"✅ PDF v8.2: png_map con {len(self.png_map)} imágenes: {list(self.png_map.keys())}")
+            print(f"✅ PDF v8.3: png_map con {len(self.png_map)} imágenes: {list(self.png_map.keys())}")
         else:
-            print("⚠️ PDF v8.2: png_map VACÍO — se usarán gráficos matplotlib")
+            print("⚠️ PDF v8.3: png_map VACÍO — se usarán gráficos matplotlib")
 
     def _load_images_from_db(self, job_id: str):
         try:
@@ -1273,7 +1280,8 @@ class MuOrbitaPDFGenerator:
 
     # ── VRA Analysis ──
     def _vra_section(self) -> List:
-        """v8.2: VRA con mapa real de GEE + tabla + narrativa. Ambos tipos de informe."""
+        """v8.3: VRA con mapa real de GEE + tabla + narrativa. Ambos tipos de informe.
+        v8.3 FIX: Imagen VRA centrada a 115mm ancho (era 155mm full-width, distorsionaba aspecto)."""
         d = self.d
         s = self.styles
         elements = []
@@ -1286,10 +1294,17 @@ class MuOrbitaPDFGenerator:
 
         elements.append(Paragraph('Zonificación VRA (Aplicación Variable)', s['SubsectionTitle']))
 
-        # v8.2 NEW: Mapa VRA real de GEE si existe
+        # v8.3 FIX: Mapa VRA real de GEE si existe — ancho reducido para preservar aspect ratio
         if self._has_real_map('VRA_MAP'):
             vra_fallback = generate_heatmap('VRA (Zonas)', 1.0, 'RdYlGn')
-            elements.append(self._real_or_generated('VRA_MAP', vra_fallback, 155, 55))
+            vra_img = self._real_or_generated('VRA_MAP', vra_fallback, 115, 45)
+            # Centrar imagen VRA en la página
+            vra_wrapper = Table([[vra_img]], colWidths=[self.content_w])
+            vra_wrapper.setStyle(TableStyle([
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+            elements.append(vra_wrapper)
             elements.append(Spacer(1, 3*mm))
 
         if vra_stats and isinstance(vra_stats, list) and len(vra_stats) > 0:
@@ -2228,7 +2243,7 @@ def generate_muorbita_report(data: Dict[str, Any]) -> Dict[str, Any]:
             'pdf_size': len(pdf_bytes),
             'job_id': job_id,
             'generated_at': datetime.now().isoformat(),
-            'version': '8.2',
+            'version': '8.3',
             'images_used': list(generator.png_map.keys()) if generator.png_map else ['matplotlib_fallback'],
             'has_narratives': bool(generator.narratives),
             'narrative_fields': list(generator.narratives.keys()) if generator.narratives else [],
@@ -2380,7 +2395,7 @@ if __name__ == '__main__':
         out_path = f"/tmp/{result['filename']}"
         with open(out_path, 'wb') as f:
             f.write(base64.b64decode(result['pdf_base64']))
-        print(f"✅ PDF v8.2 generado: {out_path} ({result['pdf_size']:,} bytes)")
+        print(f"✅ PDF v8.3 generado: {out_path} ({result['pdf_size']:,} bytes)")
         print(f"   Imágenes: {result['images_used']}")
         print(f"   Narrativas: {result['has_narratives']} ({len(result['narrative_fields'])} campos)")
     else:
