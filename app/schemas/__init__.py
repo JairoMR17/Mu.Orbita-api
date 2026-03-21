@@ -1,6 +1,10 @@
 """
 Mu.Orbita API - Pydantic Schemas
 Validación de datos de entrada/salida
+
+v2.0 — Dashboard Professional Upgrade
+  1. KpiTimeSeries: añadido evi_mean, lst_mean, tmax_mean, precip_mm
+  2. DashboardSummary: añadido avg_evi, deltas, risk levels
 """
 
 from pydantic import BaseModel, EmailStr, Field
@@ -233,13 +237,18 @@ class KpiResponse(KpiBase):
 
 
 class KpiTimeSeries(BaseModel):
-    """Para gráficas de evolución"""
+    """Para gráficas de evolución — v2.0: añadido evi_mean + campos climáticos"""
     observation_date: date
     ndvi_mean: Optional[float] = None
     ndvi_p10: Optional[float] = None
     ndvi_p90: Optional[float] = None
     ndwi_mean: Optional[float] = None
+    evi_mean: Optional[float] = None            # v2.0: productividad fotosintética
     stress_area_pct: Optional[float] = None
+    # v2.0: campos climáticos (opcionales — solo los que tengan datos)
+    lst_mean: Optional[float] = None            # MODIS LST
+    tmax_mean: Optional[float] = None           # ERA5 Tmax
+    precip_mm: Optional[float] = None           # ERA5 precipitación
 
 
 # ============================================================================
@@ -327,7 +336,7 @@ class ReportResponse(BaseModel):
 
 
 # ============================================================================
-# DASHBOARD SCHEMAS
+# DASHBOARD SCHEMAS — v2.0: ampliado con EVI, deltas, risk levels
 # ============================================================================
 
 class DashboardSummary(BaseModel):
@@ -338,6 +347,7 @@ class DashboardSummary(BaseModel):
     total_reports: int
     avg_ndvi: Optional[float] = None
     avg_ndwi: Optional[float] = None
+    avg_evi: Optional[float] = None                         # v2.0
     stress_area_pct: Optional[float] = None
     ndvi_trend: Optional[str] = None  # "up", "down", "stable"
     last_analysis_date: Optional[datetime] = None
@@ -348,6 +358,16 @@ class DashboardSummary(BaseModel):
     pheno_status: Optional[str] = None
     ndvi_expected: Optional[float] = None
     ndvi_deviation_pct: Optional[float] = None
+    # v2.0: Deltas vs informe anterior
+    ndvi_delta: Optional[float] = None
+    ndvi_delta_pct: Optional[float] = None
+    ndwi_delta: Optional[float] = None
+    evi_delta: Optional[float] = None
+    stress_delta: Optional[float] = None
+    # v2.0: Risk levels del último report
+    risk_hydric_level: Optional[str] = None                 # "Bajo" | "Moderado" | "Alto"
+    risk_thermal_level: Optional[str] = None                # "Bajo" | "Moderado" | "Alto"
+    risk_heterogeneity_level: Optional[str] = None          # "Baja" | "Media" | "Alta"
 
 
 class DashboardAlert(BaseModel):
