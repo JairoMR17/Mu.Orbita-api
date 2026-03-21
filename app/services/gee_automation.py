@@ -454,7 +454,7 @@ def generate_all_images(composite_unclipped, roi, bounds, kpis,
     print("\n  === Step 1: GEE overlays for Leaflet ===")
     web_overlays = {}
 
-   for idx in index_list:
+    for idx in index_list:
         viz = VIZ_PALETTES.get(idx)
         if not viz:
             continue
