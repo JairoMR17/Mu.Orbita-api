@@ -454,15 +454,22 @@ def generate_all_images(composite_unclipped, roi, bounds, kpis,
     print("\n  === Step 1: GEE overlays for Leaflet ===")
     web_overlays = {}
 
-    for idx in index_list:
+   for idx in index_list:
         viz = VIZ_PALETTES.get(idx)
         if not viz:
             continue
+        # v6.0: Retry una vez si falla (GEE transient errors)
         b64 = get_leaflet_overlay_png(composite_unclipped.select(idx), roi, viz)
+        if not b64:
+            print(f"  ⚠ {idx}_WEB failed, retrying...")
+            import time; time.sleep(3)
+            b64 = get_leaflet_overlay_png(composite_unclipped.select(idx), roi, viz)
         if b64:
             web_overlays[idx] = b64
             images[f'{idx}_WEB'] = b64
             print(f"  ✓ {idx}_WEB")
+        else:
+            print(f"  ❌ {idx}_WEB FAILED after retry — will fall to matplotlib in PDF")
 
     if vra_image is not None:
         b64 = get_leaflet_overlay_png(vra_image, roi, VIZ_PALETTES['VRA'])
