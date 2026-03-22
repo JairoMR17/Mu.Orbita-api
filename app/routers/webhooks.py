@@ -1,13 +1,18 @@
 """
 Mu.Orbita API - Webhooks Router
 Endpoints para recibir datos de n8n
-VERSIÓN 4.6 - Risk levels en report_metadata para dashboard v2
+VERSIÓN 4.7 - PAC parcel auto-resolve + client_name fixes
 
-CAMBIOS vs v4.5:
-  1. WebhookJobCompletedV2 acepta risk_hydric_level, risk_thermal_level,
-     risk_heterogeneity_level (del análisis de Claude)
-  2. Estos se guardan en report_metadata para el dashboard v2 semáforo de riesgos
-  3. Health check version bump a 4.6
+CAMBIOS vs v4.6:
+  1. PacInternalRequest.parcel_id ahora opcional (default "")
+  2. generate_pac_internal auto-resuelve parcela desde client si parcel_id vacío
+  3. clients-active usa client.client_name (fix AttributeError)
+  4. Health check version bump a 4.7
+
+CAMBIOS v4.6 (mantenidos):
+  - Risk levels en report_metadata para dashboard v2
+  - WebhookJobCompletedV2 acepta risk_hydric_level, risk_thermal_level,
+    risk_heterogeneity_level
 
 CAMBIOS v4.5 (mantenidos):
   - parcel_name, sigpac_ref en payload y report_metadata
@@ -291,7 +296,7 @@ async def webhook_job_completed(
     db.commit()
     db.refresh(job)
 
-# ══ v4.5: Guardar sigpac_ref en parcela si viene y no lo tiene ══
+    # ══ v4.5: Guardar sigpac_ref en parcela si viene y no lo tiene ══
     if payload.sigpac_ref and job.parcel_id:
         try:
             parcel = db.query(Parcel).filter(Parcel.id == job.parcel_id).first()
@@ -302,8 +307,6 @@ async def webhook_job_completed(
         except Exception as e:
             print(f"⚠️ No se pudo guardar SIGPAC: {e}")
 
-
-  
     # ── 2. Auto-crear Report ──
     report_created = False
     if payload.status == "completed" and job.client_id:
@@ -801,8 +804,12 @@ async def pac_check(
     )
 
 
+# ══════════════════════════════════════════════════════════════
+# PAC INTERNAL — v4.7: parcel_id opcional, auto-resolve
+# ══════════════════════════════════════════════════════════════
+
 class PacInternalRequest(BaseModel):
-    parcel_id: str
+    parcel_id: str = ""           # ← v4.7: opcional, se resuelve desde client_email
     client_email: str
     report_type: str = "pac_anual"
     request_signature: bool = False
@@ -828,13 +835,28 @@ async def generate_pac_internal(
     if x_internal_key != internal_key:
         raise HTTPException(status_code=403, detail="No autorizado")
 
-    parcel = db.query(Parcel).filter(Parcel.id == req.parcel_id, Parcel.is_active == True).first()
-    if not parcel:
-        raise HTTPException(status_code=404, detail=f"Parcela no encontrada: {req.parcel_id}")
-
+    # ── v4.7: Resolver client PRIMERO, luego parcel ──
     client = db.query(Client).filter(Client.email == req.client_email).first()
     if not client:
         raise HTTPException(status_code=404, detail=f"Cliente no encontrado: {req.client_email}")
+
+    if req.parcel_id:
+        parcel = db.query(Parcel).filter(
+            Parcel.id == req.parcel_id,
+            Parcel.is_active == True
+        ).first()
+    else:
+        # Auto-resolve: primera parcela activa del cliente
+        parcel = db.query(Parcel).filter(
+            Parcel.client_id == client.id,
+            Parcel.is_active == True
+        ).first()
+
+    if not parcel:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Parcela no encontrada para cliente: {req.client_email}"
+        )
 
     year = req.year or datetime.utcnow().year
     period_start = date(year - 1, 3, 1)
@@ -842,7 +864,7 @@ async def generate_pac_internal(
 
     kpi_records_raw = (
         db.query(Kpi)
-        .filter(Kpi.parcel_id == req.parcel_id, Kpi.observation_date >= period_start,
+        .filter(Kpi.parcel_id == parcel.id, Kpi.observation_date >= period_start,
                 Kpi.observation_date <= period_end, Kpi.ndvi_mean.isnot(None))
         .order_by(Kpi.observation_date)
         .all()
@@ -883,7 +905,7 @@ async def generate_pac_internal(
         raise HTTPException(status_code=500, detail=f"PDF error: {result.get('error')}")
 
     last_job = (
-        db.query(Job).filter(Job.parcel_id == req.parcel_id)
+        db.query(Job).filter(Job.parcel_id == parcel.id)
         .order_by(desc(Job.created_at)).first()
     )
 
@@ -934,7 +956,7 @@ async def get_active_clients_for_pac(
     if x_internal_key != internal_key:
         raise HTTPException(status_code=403, detail="No autorizado")
 
-    clients = db.query(Client).filter(Client.is_active == True).all()
+    clients = db.query(Client).filter(Client.status == "active").all()
 
     result = []
     for client in clients:
@@ -945,7 +967,7 @@ async def get_active_clients_for_pac(
             continue
         result.append({
             "client_id": str(client.id),
-            "client_name": client.name,
+            "client_name": client.client_name,    # ← v4.7 fix: era client.name
             "email": client.email,
             "parcel_id": str(parcel.id),
             "parcel_name": parcel.parcel_name,
@@ -964,4 +986,4 @@ async def get_active_clients_for_pac(
 
 @router.get("/health")
 async def webhooks_health():
-    return {"status": "ok", "service": "webhooks", "version": "4.6"}
+    return {"status": "ok", "service": "webhooks", "version": "4.7"}
