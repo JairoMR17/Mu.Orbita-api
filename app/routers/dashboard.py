@@ -1320,8 +1320,27 @@ async def generate_pac_report_endpoint(
     db.commit()
     db.refresh(new_report)
 
+    # ── Notificar solicitud de firma PAC vía n8n ──
     if req.request_signature:
         print(f"📝 PAC firma solicitada: report_id={new_report.id} | cliente={current_client.email} | ref={ref}")
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as http:
+                await http.post(
+                    "https://primary-production-c678.up.railway.app/webhook/pac-signature-request",
+                    json={
+                        "client_name": current_client.client_name,
+                        "client_email": current_client.email,
+                        "parcel_name": parcel.parcel_name,
+                        "report_ref": ref,
+                        "report_id": str(new_report.id),
+                        "pac_status": result['pac_status'],
+                        "report_type": req.report_type,
+                        "requested_at": datetime.now().isoformat(),
+                    }
+                )
+        except Exception as e:
+            print(f"⚠️ No se pudo notificar firma PAC: {e}")
 
     return {
         'success': True,
