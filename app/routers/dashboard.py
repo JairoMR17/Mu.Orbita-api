@@ -1268,7 +1268,7 @@ async def generate_pac_report_endpoint(
     sig_status = 'pending' if req.request_signature else 'not_requested'
 
     pdf_data = {
-        'client_name': current_client.name,
+        'client_name': current_client.client_name,
         'parcel_name': parcel.parcel_name,
         'crop_type': parcel.crop_type,
         'area_hectares': float(parcel.hectares) if parcel.hectares else 0,
