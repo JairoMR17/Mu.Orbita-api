@@ -863,7 +863,7 @@ async def generate_pac_internal(
     ref = f"PAC-{str(client.id)[:8].upper()}-{ts}"
 
     pdf_data = {
-        'client_name': client.name,
+        'client_name': client.client_name,
         'parcel_name': parcel.parcel_name,
         'crop_type': parcel.crop_type,
         'area_hectares': float(parcel.hectares) if parcel.hectares else 0,
